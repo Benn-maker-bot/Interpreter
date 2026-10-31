@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Runtime logs written next to interpreter.py
+*.jsonl
+*.jsonl.*.gz
+interpreter.log.summary.json
+logs/
