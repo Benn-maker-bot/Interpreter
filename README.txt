@@ -1,68 +1,109 @@
-Voice Interpreter  (Whisper edition)
-=====================================
-Real-time speech recognition powered by OpenAI Whisper (local AI model).
-Dramatically better accuracy for Russian and all other supported languages.
+Voice Interpreter
+=================
+Listens to speech, shows what was said, and translates it, live, on your own
+PC. Speech recognition uses OpenAI's Whisper models and translation uses
+Opus-MT models, both running locally on your NVIDIA graphics card (GPU).
+Nothing is sent to the internet except for language pairs that have no local
+translation model.
 
-
-WHAT'S NEW vs THE PREVIOUS VERSION
-------------------------------------
-  - Switched from Google Web Speech API to faster-whisper (local Whisper AI)
-  - Custom VAD (voice activity detection) pipeline — ~32 ms audio chunks,
-    auto-calibrated ambient noise threshold, responsive phrase detection
-  - Whisper model selector: Tiny / Small / Medium
-  - Sensitivity slider to tune how quiet a sound triggers recording
-  - Language forced at the Whisper level (no language-detection overhead)
+Typical use: in a Teams or Telemost call, your friend's Russian voice plays
+through your FiiO headphones. In "Friend" mode the app listens to the FiiO,
+shows the Russian text as it is spoken and the English translation beside it.
+"My Voice" mode does the reverse with your microphone (English -> Russian).
 
 
 QUICK START
 -----------
-  1. Install Python 3.9+ from https://python.org
-     (tick "Add Python to PATH")
-  2. Double-click setup_and_run.bat
-  3. On first "Start Listening", the Whisper model downloads once (~450 MB
-     for Small) and is cached for all future sessions.
+  1. Install Python 3.13 from https://python.org (tick "Add Python to PATH").
+  2. In this folder, create the project's virtual environment and install
+     the packages (a virtual environment keeps them separate from other
+     Python projects):
+         py -3.13 -m venv .venv
+         .venv\Scripts\python -m pip install -r requirements.txt
+  3. Start the app:
+         .venv\Scripts\python interpreter.py
+     (or double-click setup_and_run.bat, which uses the Python on your PATH)
+  4. The first start downloads the AI models once (Turbo ~1.6 GB, Small
+     ~480 MB, Opus-MT ~300 MB per direction). Later starts take seconds.
+
+  The app starts listening by itself. In VS Code, press F5 and choose
+  "Interpreter" to run it under the debugger (.vscode/launch.json).
 
 
-WHISPER MODEL GUIDE
--------------------
-  Tiny   ~150 MB  Fastest. Good for clear audio, simple sentences.
-  Small  ~450 MB  Best balance. Recommended for Russian. (default)
-  Medium ~1.5 GB  Most accurate. Use if Small misses words. Slower.
+USING THE WINDOW
+----------------
+  My Voice / Friend   switch mode. Each mode remembers its own audio device.
+                      Devices marked with a speaker icon record what an
+                      OUTPUT device is playing (e.g. the FiiO during a call).
+  Mute                stop listening and release the device; click again to
+                      resume. Changing any setting restarts listening.
+  Speak: On/Off       read each new translation aloud through "Audio output".
+                      (Speaking Russian needs a Russian voice installed in
+                      Windows Settings > Time & language > Speech.)
+  Clear               empty the text boxes.
+  Model               Whisper model for the final text:
+                        Turbo   most accurate, fast on the GPU (recommended)
+                        Medium  accurate, slower
+                        Small   fast, less accurate
+                        Tiny    fastest, many mistakes in Russian
+  Speech sensitivity  higher = also catch quieter or less clear speech;
+                      lower = ignore more background sound.
+  Previews            model for the grey "live" text shown while someone is
+                      still talking: Tiny (instant, rough), Small (balanced,
+                      recommended) or Main model (best, but loads the GPU).
+  Input level         a broadcast-style meter in dBFS: speech should sit
+                      around -30 to -12 dBFS; red near 0 means too loud.
 
 
-SENSITIVITY SLIDER
-------------------
-  The slider adjusts how loud audio needs to be before it is treated as
-  speech.  Default (1.0×) is calibrated automatically at startup.
+FILES IN THIS FOLDER
+--------------------
+  interpreter.py               the application (start reading at the top:
+                               it explains how everything works)
+  log_tools.py                 analysis tool for the logs (see below)
+  requirements.txt             the Python packages needed, with comments
+  setup_and_run.bat            one-click install and start
+  build_exe.bat                build a standalone VoiceInterpreter.exe
+  interpreter.settings.json    your saved choices (created automatically)
+  interpreter.log.jsonl        detailed log, one JSON object per line
+  interpreter.error.log.jsonl  warnings and errors only
+  recordings/                  audio of the newest 400 phrases, kept for
+                               accuracy checks. Contains other people's
+                               voices: add "record_audio": false to
+                               interpreter.settings.json to turn it off.
 
-  Lower value (e.g. 0.5×) — picks up quieter / more distant audio
-  Higher value (e.g. 2.0×) — only reacts to louder sounds; ignores
-                              background noise better
 
-
-VIRTUAL AUDIO CABLE (capture Teams, Zoom, etc.)
--------------------------------------------------
-  1. In Teams/Zoom: Settings → Speaker → CABLE Input (VB-Audio Virtual Cable)
-  2. In Voice Interpreter: Audio source → ★ CABLE Output (auto-selected)
-  3. Press Start Listening
-
-  To still hear audio yourself while capturing:
-  Recording tab → CABLE Output → Properties → Listen tab →
-  "Listen to this device" → playback through your Fiio DAC
+CHECKING SPEED AND ACCURACY
+---------------------------
+  After a session, from this folder:
+      .venv\Scripts\python log_tools.py report
+          time taken by every stage (speech detection, GPU, screen…),
+          resource use, and a list of problems found
+      .venv\Scripts\python log_tools.py accuracy
+          re-checks the saved recordings with a larger model (large-v3,
+          ~3 GB download once) and lists words the app got wrong
+  Add a start time to look at one session only, e.g.
+      .venv\Scripts\python log_tools.py report 2026-10-31T14:00
 
 
 TROUBLESHOOTING
 ---------------
-  "Whisper load error":
-    Run: pip install faster-whisper --upgrade
+  The header shows CPU instead of GPU
+      The NVIDIA libraries did not load. Re-run the pip install command
+      above; check interpreter.error.log.jsonl for "cuda_detection".
 
-  Transcription is slow:
-    Switch to Tiny model. On CPU, Small takes ~1-2 s per phrase.
+  "Waiting for … to reconnect"
+      The audio device stopped responding (unplugged, driver reset). The
+      app resumes by itself when the same device is back.
 
-  Missing words / poor accuracy:
-    Try Medium model. Lower the Sensitivity slider slightly.
-    Ensure audio source is clean (not too compressed).
+  Words are missing or wrong
+      Use the Turbo model. Check the level meter (speech around -30 to
+      -12 dBFS). Run "log_tools.py accuracy" to see exactly what was missed.
 
-  "Audio device error":
-    Another app may have exclusive control. Check Windows Sound settings
-    → set device to Shared mode.
+  Text appears slowly
+      Set Previews to Small or Tiny. "log_tools.py report" shows which
+      stage is slow.
+
+  "Audio device error"
+      Another app may have exclusive control of the device. In Windows
+      Sound settings > device Properties > Advanced, untick "Allow
+      applications to take exclusive control".

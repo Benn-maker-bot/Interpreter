@@ -1,3 +1,42 @@
+"""
+log_tools.py — analyse the Voice Interpreter's log files
+=========================================================
+
+The interpreter writes a detailed log (interpreter.log.jsonl: one JSON object
+per line) and saves the audio of recent phrases in recordings/. This script
+reads them back to answer two questions: "how fast is it?" and "how accurate
+is it?". It does not change anything in the app.
+
+Run it from the project folder with the project's Python, for example:
+
+    .venv\\Scripts\\python log_tools.py                 write interpreter.log.summary.json
+    .venv\\Scripts\\python log_tools.py report          speed breakdown of every stage
+    .venv\\Scripts\\python log_tools.py report 2026-10-31T14:00
+                                                    …only entries from that time on
+    .venv\\Scripts\\python log_tools.py accuracy        check the recognised words
+    .venv\\Scripts\\python log_tools.py accuracy 2026-10-31T14:00 large-v3
+
+report
+    Reads the "phrase_trace" lines (one per finished phrase), "phrase_displayed"
+    lines and the 10-second stats lines, and prints the median (p50), 95th
+    percentile (p95) and maximum time of each stage: waiting in the queue,
+    speech detection, the GPU, getting the text on screen, and so on, plus
+    resource use (CPU, GPU, memory) and a list of findings.
+
+accuracy
+    There is no human transcript of real calls, so a larger, slower model
+    (large-v3 by default) re-transcribes each saved phrase recording with
+    careful settings. Its text is the "reference". The app's text is compared
+    word by word: the word error rate (WER) is the share of reference words
+    that the app got wrong, missed or added. The reference is cached next to
+    each recording (.ref.json) so the big model only runs once per phrase.
+    Results are broken down by model and by error type, and every phrase
+    with differences is listed so you can see exactly what went wrong.
+
+Timestamps in the log look like 2026-10-31T14:00:00.000+00:00; any prefix of
+one (such as 2026-10-31T14) works as a start time.
+"""
+
 import json
 import gzip
 from collections import Counter
@@ -11,6 +50,7 @@ SUMMARY_PATH = APP_DIR / "interpreter.log.summary.json"
 
 
 def iter_log_files(base_path: Path):
+    """List the current log file plus its rotated, gzipped older copies."""
     files = []
     if base_path.exists():
         files.append(base_path)
@@ -19,6 +59,7 @@ def iter_log_files(base_path: Path):
 
 
 def read_jsonl(path: Path):
+    """Yield one dictionary per line of a .jsonl or .jsonl.gz file, skipping bad lines."""
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -32,6 +73,9 @@ def read_jsonl(path: Path):
 
 
 def build_summary():
+    """Count entries by level and event, list recent problems, and write the
+    summary JSON file (same as the app's Export Log Summary button).
+    """
     levels = Counter()
     events = Counter()
     issues = []
@@ -61,6 +105,9 @@ def build_summary():
 
 
 def _pct(values, q):
+    """The value below which a fraction `q` of the values fall (q=0.5 is the
+    median, q=0.95 the 95th percentile). None values are ignored.
+    """
     v = sorted(x for x in values if x is not None)
     if not v:
         return None
@@ -68,6 +115,7 @@ def _pct(values, q):
 
 
 def _row(label, values, unit="ms"):
+    """Format one line of the report: count, median, 95th percentile and maximum."""
     vals = [x for x in values if x is not None]
     if not vals:
         return f"  {label:<34} (no data)"
@@ -187,6 +235,9 @@ def build_report(since=None):
 
 
 def _words(text):
+    """Split text into lower-case words for comparison (ё is treated as е, and
+    punctuation is ignored).
+    """
     import re
     text = (text or "").lower().replace("ё", "е")
     return re.findall(r"\w+", text)

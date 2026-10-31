@@ -1,15 +1,35 @@
-customtkinter>=5.2.0
-requests>=2.31.0
-deep-translator>=1.11.0
-comtypes>=1.4        # Windows SAPI text-to-speech
-pyaudiowpatch>=0.2.12.9   # PyAudio fork with WASAPI loopback (capture output devices)
-faster-whisper>=1.0.3
-numpy>=1.26.0
-scipy>=1.11.0
-ctranslate2>=4.4.0
+# Python packages the Voice Interpreter needs.
+# Install them into the project's virtual environment with:
+#     .venv\Scripts\python -m pip install -r requirements.txt
+# ">=" means "this version or newer".
+
+# ── Window ────────────────────────────────────────────────────────────────
+customtkinter>=5.2.0        # modern-looking widgets on top of Python's Tkinter
+
+# ── Audio ─────────────────────────────────────────────────────────────────
+pyaudiowpatch>=0.2.12.9     # records audio; this PyAudio fork can also record what
+                            # an output device (e.g. FiiO) plays ("WASAPI loopback")
+numpy>=1.26.0               # fast maths on audio samples
+scipy>=1.11.0               # high-quality resampling (48 kHz -> Whisper's 16 kHz)
+
+# ── Speech recognition (Whisper) ─────────────────────────────────────────
+faster-whisper>=1.0.3       # runs OpenAI's Whisper models quickly; also provides
+                            # the Silero VAD speech detector
+ctranslate2>=4.4.0          # the engine faster-whisper and Opus-MT run on
+nvidia-cublas-cu12>=12.4    # NVIDIA CUDA libraries so CTranslate2 can use the GPU
+nvidia-cudnn-cu12>=9,<10    # (Windows; not needed when running on the CPU only)
+
+# ── Translation ──────────────────────────────────────────────────────────
+sentencepiece>=0.2          # splits text into pieces for the local Opus-MT models
+requests>=2.31.0            # web requests for the online translation fallback
+deep-translator>=1.11.0     # MyMemory's list of supported language codes
+
+# ── Text-to-speech ───────────────────────────────────────────────────────
+comtypes>=1.4               # talks to Windows' built-in speech engine (SAPI)
+
+# ── Diagnostics (resource_stats log lines) ───────────────────────────────
+psutil>=5.9                 # CPU and memory use; physical core count
+nvidia-ml-py>=12            # GPU load, memory, clock speed and temperature
+
+# ── Building a standalone .exe (build_exe.bat) ───────────────────────────
 pyinstaller>=6.0.0
-nvidia-cublas-cu12>=12.4    # CUDA libraries for GPU Whisper (Windows)
-nvidia-cudnn-cu12>=9,<10
-psutil>=5.9               # CPU/memory figures for the resource_stats log
-nvidia-ml-py>=12          # GPU load/memory/clock for the resource_stats log
-sentencepiece>=0.2         # tokenizer for the local Opus-MT translation models

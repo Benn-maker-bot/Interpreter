@@ -1,18 +1,111 @@
 """
-Voice Interpreter — optimised for minimum latency.
+Voice Interpreter
+=================
 
-Speed stack:
-  • Auto-detects NVIDIA GPU (CUDA DLLs from the nvidia-* pip packages);
-    falls back to CPU int8 if they are missing.
-  • Speech is cut at natural pauses (relative to the speaker's level) with a
-    5 s cap at the quietest moment, and a live preview is transcribed every
-    0.7 s while someone is still talking.
-  • To-English translation runs in Whisper itself (task=translate) on the
-    GPU; other targets use online services over a keep-alive session.
-  • One inference worker using all physical cores (inference is serialised).
-  • WASAPI loopback: capture what an output device (e.g. FiiO K7) is playing.
-  • Text-to-speech via SAPI on its own thread: toggled on/off, stops
-    instantly, and mutes capture while speaking on the captured device.
+A desktop app that listens to speech, writes down what was said, and
+translates it, live. Typical use: you are on a Teams/Telemost call with a
+Russian-speaking friend whose voice plays through your FiiO headphones; the
+app "listens" to the FiiO, shows the Russian words as they are spoken, and
+shows the English translation next to them. It can also do the reverse
+("My Voice": your microphone, English -> Russian).
+
+This file is the whole application. It is long, so this guide explains the
+big picture first. Every class and function below also has its own comment.
+
+
+HOW A PIECE OF SPEECH TRAVELS THROUGH THE PROGRAM
+-------------------------------------------------
+
+    sound card / FiiO  ──►  AudioCaptureThread  ──►  TranscriptionWorker  ──►  InterpreterApp (window)
+                            (records audio,           (Whisper AI turns            (shows text,
+                             finds speech,             audio into text;             speaks it,
+                             cuts phrases)             Opus-MT translates it)       writes logs)
+
+  1. CAPTURE  AudioCaptureThread reads the sound in small blocks (~32 ms).
+     For "Friend" mode it records what an *output* device is playing (WASAPI
+     "loopback"), so it hears the call audio you hear in your headphones.
+
+  2. DETECT SPEECH  Each block is scored by Silero VAD (a tiny AI model that
+     answers "is this speech?"). Speech blocks are collected into a phrase.
+     A phrase ends at a short pause (0.3 s) or after 7 s at the best gap.
+
+  3. PREVIEW  While someone is still talking, the unfinished phrase is sent
+     every 0.2 s for a quick "preview" transcription, shown in grey, so text
+     appears almost as the words are spoken.
+
+  4. TRANSCRIBE  When the phrase ends, TranscriptionWorker runs Whisper
+     (OpenAI's speech-recognition model, via the fast "faster-whisper" /
+     CTranslate2 engine) on the GPU. The previous sentences are given to
+     Whisper as context, which improves accuracy. Results that look wrong
+     are retried.
+
+  5. TRANSLATE  The text is translated by Opus-MT (a small translation model,
+     also on the GPU). If no local model exists for the language pair, the
+     app falls back to Whisper's own translation, then to online services.
+
+  6. DISPLAY  The window replaces the grey preview with the final text and
+     translation, can read the translation aloud (Speaker), and logs timing
+     and accuracy data for every phrase.
+
+
+THREADS (things that run at the same time)
+------------------------------------------
+  A GUI must never freeze, so slow work runs on background threads that talk
+  to the window through queues (thread-safe mailboxes):
+
+    MainThread            the window (Tk/customtkinter). Only this thread may
+                          touch widgets. It checks result_queue every 15 ms.
+    audio-capture         AudioCaptureThread: records, detects speech.
+    transcription-worker  TranscriptionWorker: Whisper + translation.
+    translation-worker    TranslationWorker: online translation fallback.
+    whisper-loader        WhisperModelLoader: loads AI models without freezing
+                          the window. mt-loader-* does the same for Opus-MT.
+    tts                   Speaker: text-to-speech.
+
+
+FILES THE PROGRAM READS AND WRITES (all next to this file)
+-----------------------------------------------------------
+  interpreter.settings.json    your choices (model, devices, sensitivity…)
+  interpreter.log.jsonl        detailed log, one JSON object per line
+  interpreter.error.log.jsonl  warnings and errors only
+  recordings/                  audio of recent phrases, for accuracy checks
+  log_tools.py                 separate script: `python log_tools.py report`
+                               (speed breakdown) and `... accuracy` (checks
+                               the recognised words against a bigger model)
+
+  AI models are downloaded once into the Hugging Face cache
+  (%USERPROFILE%\\.cache\\huggingface) and reused.
+
+
+GLOSSARY
+--------
+  Whisper      speech-to-text AI model. Sizes: tiny, small, medium, and
+               large-v3-turbo ("Turbo"), the most accurate one used here.
+  VAD          Voice Activity Detection: deciding which audio is speech.
+  dBFS         decibels relative to full scale; 0 dBFS is the loudest a
+               digital signal can be, -20 dBFS is typical speech.
+  AGC          Automatic Gain Control: making quiet audio louder.
+  Loopback     recording what an output device (speakers) is playing.
+  Encoder/     the two halves of Whisper: the encoder "listens" to the
+  decoder      audio, the decoder writes the words one token at a time.
+  Token        a piece of a word that the AI models work with.
+  Context      the previous sentences, fed back so Whisper knows what came
+               before.
+  Hallucination  text a model invents that was never said (Whisper
+               sometimes writes "Спасибо." or YouTube subtitle credits).
+  WER          word error rate: % of words wrong, missing or extra.
+  CUDA         NVIDIA's system for running code on the graphics card (GPU).
+
+
+READING THE CODE
+----------------
+  Sections are marked with banner comments (# ─── ...). In order:
+  settings/constants -> logging -> GPU detection -> online translation ->
+  audio device helpers -> audio capture -> settings file -> model loading ->
+  transcription worker (with the level meter, local translator and speaker
+  helpers just before it) -> the main window (InterpreterApp).
+  Values in CAPITALS near the top are tuning knobs, each with a comment
+  saying what it does and, where it was measured, why it has that value.
 """
 
 import queue
@@ -81,6 +174,8 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 # ── Paths / log config ────────────────────────────────────────────────────────
+# Where the app keeps its files. APP_DIR is the folder containing this
+# script, so logs and settings always sit next to the program.
 APP_DIR               = Path(__file__).resolve().parent
 LOG_PATH              = APP_DIR / "interpreter.log.jsonl"
 ERROR_LOG_PATH        = APP_DIR / "interpreter.error.log.jsonl"
@@ -90,6 +185,8 @@ MAX_LOG_BYTES         = 5 * 1024 * 1024
 LOG_BACKUP_COUNT      = 5
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
+# General limits. A *backlog* is work waiting in a queue; if it grows, the
+# app is falling behind, so a warning is logged.
 MAX_TEXT_HISTORY_CHARS         = 12_000
 PHRASE_QUEUE_BACKLOG_WARN      = 6
 TRANSLATION_QUEUE_BACKLOG_WARN = 16
@@ -99,10 +196,22 @@ TRANSLATION_QUEUE_MAX          = 64
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Structured JSONL logging
+#
+# Everything the app does is recorded with log_event("event_name", key=value).
+# Each entry becomes one line of JSON in interpreter.log.jsonl (warnings and
+# errors also go to interpreter.error.log.jsonl) and a readable line in the
+# console. log_tools.py reads these files to measure speed and accuracy.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JsonLineFormatter(logging.Formatter):
+    """Turns each log message into one line of JSON.
+
+    JSON lines are easy for programs (like log_tools.py) to read back: every
+    line is a dictionary with the time, level, event name and any extra fields
+    passed to log_event().
+    """
     def format(self, record):
+        """Build the JSON text for one log record (called by Python's logging)."""
         payload = {
             "ts":      datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
             "level":   record.levelname,
@@ -121,7 +230,13 @@ class JsonLineFormatter(logging.Formatter):
 
 
 class GZipRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A log file handler that starts a new file when the log gets big.
+
+    When interpreter.log.jsonl passes MAX_LOG_BYTES it is renamed to .1, .2 …
+    and the old copies are compressed with gzip so they take little space.
+    """
     def doRollover(self):
+        """Rotate the log files, then gzip the rotated copies."""
         super().doRollover()
         for i in range(self.backupCount, 0, -1):
             rotated = Path(f"{self.baseFilename}.{i}")
@@ -136,7 +251,9 @@ class GZipRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
 
 class PlaintextFormatter(logging.Formatter):
+    """Formats log messages as short readable lines for the console window."""
     def format(self, record):
+        """Build one readable console line: time, level, thread, event, fields."""
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         event = getattr(record, "event", record.getMessage())
         msg = f"[{ts}] {record.levelname:^7} | {record.threadName[:15]:<15} | {event}"
@@ -152,6 +269,10 @@ class PlaintextFormatter(logging.Formatter):
 
 
 def _build_logger(name: str, path: Path, level=logging.INFO) -> logging.Logger:
+    """Create a logger that writes JSON to `path` and readable text to the console.
+
+    `level` is the minimum importance that gets written (INFO, WARNING …).
+    """
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.handlers.clear()
@@ -177,12 +298,20 @@ ERROR_LOG = _build_logger("interpreter.error", ERROR_LOG_PATH, logging.WARNING)
 
 
 def log_event(level: int, event: str, **fields):
+    """Write one event to the log. This is the function the whole app uses.
+
+    `event` is a short name such as "phrase_trace"; any keyword arguments are
+    stored as extra JSON fields. Warnings and errors also go to the error log.
+    """
     APP_LOG.log(level, event, extra={"event": event, "fields": fields})
     if level >= logging.WARNING:
         ERROR_LOG.log(level, event, extra={"event": event, "fields": fields})
 
 
 def log_exception(event: str, exc: Exception, **fields):
+    """Log an error together with its full traceback (the list of calls that
+    led to it), so problems can be diagnosed later from the log files.
+    """
     merged = dict(fields)
     merged.setdefault("exception_type",    type(exc).__name__)
     merged.setdefault("exception_message", str(exc))
@@ -191,6 +320,12 @@ def log_exception(event: str, exc: Exception, **fields):
 
 
 def install_global_exception_hooks():
+    """Make sure crashes that nobody caught are still written to the log.
+
+    Python normally just prints such errors to the console (which may not be
+    visible). These hooks log them as CRITICAL instead. Only the app itself
+    installs them (see the bottom of the file), not scripts that import it.
+    """
     def _excepthook(exc_type, exc_value, exc_tb):
         for log in (APP_LOG, ERROR_LOG):
             log.critical("unhandled_exception", exc_info=(exc_type, exc_value, exc_tb),
@@ -213,15 +348,22 @@ log_event(logging.INFO, "app_module_loaded",
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Log summary helpers
+#
+# Small helpers behind the "Export Log Summary" button: read the log files
+# back and count what happened.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def iter_log_files(base_path: Path):
+    """List the current log file plus its rotated, gzipped older copies."""
     files = [base_path] if base_path.exists() else []
     files.extend(sorted(base_path.parent.glob(base_path.name + ".*.gz")))
     return files
 
 
 def read_jsonl_entries(path: Path):
+    """Read a .jsonl (or .jsonl.gz) log file and yield one dictionary per line,
+    skipping any line that is not valid JSON.
+    """
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -235,6 +377,10 @@ def read_jsonl_entries(path: Path):
 
 
 def build_log_summary():
+    """Count log entries by level and event and write interpreter.log.summary.json.
+
+    Used by the "Export Log Summary" button.
+    """
     levels, events, issues, total = Counter(), Counter(), [], 0
     for path in iter_log_files(LOG_PATH):
         for entry in read_jsonl_entries(path):
@@ -263,6 +409,10 @@ def build_log_summary():
 
 
 # ── Audio / VAD ────────────────────────────────────────────────────────────────
+# Settings for recording and for deciding where phrases start and end.
+# Whisper expects 16 kHz mono 16-bit audio (SAMPLE_RATE / CHANNELS /
+# SAMPLE_WIDTH); devices usually record at 44.1 or 48 kHz, so audio is
+# resampled. Times ending in _SEC are in seconds.
 SAMPLE_RATE      = 16_000
 CHUNK_SAMPLES    = 512
 CHANNELS         = 1
@@ -344,6 +494,9 @@ FIIO_KEYWORDS   = ["fiio", "fio k", "fio q", "fio dac",
                    "btr", "realtek usb audio"]
 
 # ── Whisper models ────────────────────────────────────────────────────────────
+# MODELS maps the names shown in the Model menu to Whisper model sizes.
+# Bigger models are more accurate but slower. LANGUAGES maps menu names to
+# (Whisper language code, translation-service language code).
 MODELS = {
     "Tiny  — fastest":        "tiny",
     "Small — recommended ✓":  "small",
@@ -389,6 +542,7 @@ LANGUAGES = {
 }
 
 # ── UI colours ────────────────────────────────────────────────────────────────
+# Colours used by the window. A pair means (light theme, dark theme).
 COL_MY_VOICE = ("#1A6B3A", "#1A6B3A")
 COL_MY_HOVER = ("#155730", "#155730")
 COL_FRIEND   = ("#1A4A7A", "#1A4A7A")
@@ -405,9 +559,19 @@ COL_INFO     = "#2980B9"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GPU detection
+#
+# Whisper is much faster on an NVIDIA graphics card (GPU). This checks, once
+# at start-up, that the GPU and its CUDA libraries are usable, and picks
+# sensible defaults for GPU or CPU.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_device():
+    """Decide whether Whisper runs on the NVIDIA GPU ("cuda") or the CPU.
+
+    Returns (device, compute_type, worker_count, default_model_label). The GPU
+    is only chosen if the CUDA libraries really load; otherwise Whisper would
+    crash later in the middle of transcribing.
+    """
     try:
         dll_dirs = _add_cuda_dll_dirs()
         import ctranslate2
@@ -441,7 +605,12 @@ INFERENCE_LOCK = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Translation — persistent session + LRU cache + multiple workers
+# Online translation (fallback)
+#
+# Normally translation is done locally by Opus-MT (see LocalTranslator) or by
+# Whisper itself. These functions are the last resort, for language pairs
+# with no local model: they call free web services (Google, then MyMemory)
+# over one shared, kept-open HTTPS connection (_http).
 # ─────────────────────────────────────────────────────────────────────────────
 
 _http = requests.Session()
@@ -453,10 +622,15 @@ _http.mount("https://", _adapter)
 
 
 class RateLimitedError(Exception):
+    """Raised when an online translation service says "too many requests" (HTTP 429)."""
     pass
 
 
 def _google_translate(text: str, src: str, tgt: str) -> str:
+    """Translate text with Google's free web endpoint (online fallback only).
+
+    Google often blocks this endpoint (HTTP 429); the caller then pauses it.
+    """
     url    = "https://translate.googleapis.com/translate_a/single"
     params = {"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text}
     resp   = _http.get(url, params=params, timeout=6)
@@ -470,6 +644,9 @@ def _google_translate(text: str, src: str, tgt: str) -> str:
 _MYMEMORY_CODES: dict | None = None
 
 def _mymemory_code(code: str) -> str:
+    """Convert a short language code ("ru") into the regional code MyMemory
+    expects ("ru-RU"), using MyMemory's own list of supported languages.
+    """
     # MyMemory wants region codes ("ru-RU"), not bare ISO codes ("ru").
     global _MYMEMORY_CODES
     if _MYMEMORY_CODES is None:
@@ -486,6 +663,7 @@ def _mymemory_code(code: str) -> str:
 
 
 def _mymemory_translate(text: str, src: str, tgt: str) -> str:
+    """Translate text with the MyMemory online service (second online fallback)."""
     # Called directly over the shared keep-alive session: deep-translator
     # opens a fresh TLS connection per call, adding ~200 ms each time.
     resp = _http.get("https://api.mymemory.translated.net/get",
@@ -514,6 +692,12 @@ _provider_lock  = threading.Lock()
 
 @lru_cache(maxsize=512)
 def _translate_cached(text: str, src: str, tgt: str) -> str:
+    """Translate text online, trying each provider in turn (Google, MyMemory).
+
+    Results are cached (lru_cache) so repeated phrases are instant. A provider
+    that rate-limits us is skipped for a cooldown that doubles each time.
+    Only used when no local Opus-MT model exists for the language pair.
+    """
     if src == tgt:
         return text
     errors = []
@@ -553,7 +737,14 @@ def _translate_cached(text: str, src: str, tgt: str) -> str:
 
 
 class TranslationWorker(threading.Thread):
+    """Background thread that does *online* translation, one phrase at a time.
+
+    The window puts (seq, text, source, target) items on a queue; this thread
+    translates them and puts the result on result_queue. Kept to one thread so
+    results come back in the same order the phrases were spoken.
+    """
     def __init__(self, wid: int, request_queue: queue.Queue, result_queue: queue.Queue):
+        """Set up the worker. `wid` is just a number used in the thread's name."""
         super().__init__(daemon=True, name=f"translation-worker-{wid}")
         self.wid           = wid
         self.request_queue = request_queue
@@ -561,10 +752,12 @@ class TranslationWorker(threading.Thread):
         self._stop_evt     = threading.Event()
 
     def stop(self):
+        """Ask the thread to finish (the None item wakes it up if it is waiting)."""
         self._stop_evt.set()
         self.request_queue.put(None)
 
     def run(self):
+        """Main loop: take a phrase from the queue, translate it, send the result."""
         while not self._stop_evt.is_set():
             item = self.request_queue.get()
             if item is None:
@@ -587,6 +780,11 @@ class TranslationWorker(threading.Thread):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Audio helpers
+#
+# Functions for finding audio devices and their capabilities. Windows
+# exposes each device several times through different "host APIs"
+# (WASAPI, DirectSound, MME…); these helpers keep the best one and pick
+# sensible defaults (FiiO for output, the FiiO's loopback for Friend mode).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_device_native_rate(pa_instance, device_index) -> int:
@@ -602,6 +800,9 @@ def get_device_native_rate(pa_instance, device_index) -> int:
 
 
 def rms(data: bytes) -> float:
+    """Root-mean-square loudness of a block of 16-bit audio (a raw number,
+    not decibels). Uses NumPy because a plain Python loop is far slower.
+    """
     import numpy as np
     n = len(data) // SAMPLE_WIDTH
     if n == 0:
@@ -845,7 +1046,14 @@ def downmix(data: bytes, channels: int) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LoopbackOutputThread(threading.Thread):
+    """Plays captured audio back out of another device.
+
+    Only used with VB-Audio virtual cables ("Hear input through output"): the
+    call audio goes into the cable, so without this you would not hear it.
+    Not used when capturing an output device directly (it is already playing).
+    """
     def __init__(self, output_device_index, input_sample_rate, status_cb):
+        """Remember which device to play to; audio arrives later through push()."""
         super().__init__(daemon=True, name="loopback-output")
         self.output_device_index = output_device_index
         self.input_sample_rate   = input_sample_rate   # rate the capture thread uses
@@ -868,10 +1076,12 @@ class LoopbackOutputThread(threading.Thread):
             pass  # drop under pressure
 
     def stop(self):
+        """Ask the thread to finish."""
         self._stop_evt.set()
         self._buf.put(b"")
 
     def run(self):
+        """Open the output device and keep writing queued audio blocks to it."""
         if not _PYAUDIO_AVAILABLE:
             return
         pa     = pyaudio.PyAudio()
@@ -939,7 +1149,12 @@ class LoopbackOutputThread(threading.Thread):
             pa.terminate()
         log_event(logging.INFO, "loopback_output_stopped")
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Audio capture + VAD
+#
+# AudioCaptureThread is the start of the pipeline: it records audio and
+# decides what is speech. PerfWindow and LatestSlot are small helpers it
+# uses. VAD = Voice Activity Detection (Silero VAD, a tiny neural network).
 # ─────────────────────────────────────────────────────────────────────────────
 
 STATS_INTERVAL_SEC = 10   # how often each component logs its perf summary
@@ -949,16 +1164,24 @@ class PerfWindow:
     """Collects samples per metric and summarises them as n/p50/p95/max for a
     periodic stats log line, then resets. Cheap enough for the audio loop."""
     def __init__(self):
+        """Start an empty collection of samples."""
         self._data = {}
         self.started = time.monotonic()
 
     def add(self, name, value):
+        """Record one measurement (e.g. add("vad_ms", 2.4))."""
         self._data.setdefault(name, []).append(value)
 
     def due(self):
+        """True when STATS_INTERVAL_SEC has passed and a summary should be logged."""
         return time.monotonic() - self.started >= STATS_INTERVAL_SEC
 
     def summary(self):
+        """Return {metric: {n, p50, p95, max}} for the collected samples, then reset.
+
+        p50 is the median (half the values are lower); p95 means 95 % of values
+        were at or below it, which shows the slow cases without the very worst.
+        """
         out = {}
         for name, vals in self._data.items():
             v = sorted(vals)
@@ -974,27 +1197,52 @@ class LatestSlot:
     """Single-item mailbox: put() overwrites, take() empties. Live previews
     only matter if current, so a stale one is replaced rather than queued."""
     def __init__(self):
+        """Start empty."""
         self._lock = threading.Lock()
         self._item = None
         self.overwritten = 0   # previews dropped because a newer one arrived
 
     def put(self, item):
+        """Store an item, replacing (and counting) any item not yet taken."""
         with self._lock:
             if self._item is not None:
                 self.overwritten += 1
             self._item = item
 
     def take(self):
+        """Return the stored item (or None) and empty the slot."""
         with self._lock:
             item, self._item = self._item, None
             return item
 
 
 class AudioCaptureThread(threading.Thread):
+    """Records audio from one device and turns it into phrases of speech.
+
+    For every ~32 ms block of sound it: measures the level (for the meter),
+    asks Silero VAD whether it is speech, and adds speech to the current
+    phrase. Finished phrases go to `phrase_queue` (for the final, accurate
+    transcription); while a phrase is still growing, a copy is put in
+    `partial_slot` every PARTIAL_INTERVAL_SEC for a quick preview.
+
+    For "loopback" devices (what an output device is playing) it also plays
+    silence to that device, because Windows delivers no loopback audio at all
+    while the device is silent, which would make reading hang.
+    """
     def __init__(self, device_index, phrase_queue, status_cb, level_cb,
                  loopback_out: "LoopbackOutputThread | None" = None,
                  partial_slot: "LatestSlot | None" = None,
                  mute_evt: "threading.Event | None" = None):
+        """Store settings; the device is opened later, in the thread itself (run).
+
+        device_index  which PortAudio device to record from.
+        phrase_queue  where finished phrases are sent as (seq, audio, info).
+        status_cb     function to show a status message in the window.
+        level_cb      function that receives (rms_dbfs, peak_dbfs, is_speech).
+        loopback_out  optional LoopbackOutputThread to copy audio to.
+        partial_slot  where preview audio is placed (LatestSlot).
+        mute_evt      while set, audio is replaced by silence (our own speech).
+        """
         super().__init__(daemon=True, name="audio-capture")
         self.device_index      = device_index
         self._keepalive        = None
@@ -1010,12 +1258,19 @@ class AudioCaptureThread(threading.Thread):
         self.vad_threshold     = vad_threshold_for(DEFAULT_SENS)
 
     def set_sensitivity(self, sensitivity: float):
+        """Change the speech sensitivity (0..1) while running; takes effect at once."""
         self.vad_threshold = vad_threshold_for(sensitivity)
 
     def stop(self):
+        """Ask the thread to stop; it finishes after its current audio block."""
         self._stop_evt.set()
 
     def _flush(self, seq, buf, min_c, label="Phrase", resample=None, meta=None):
+        """Send one finished phrase to the transcription worker.
+
+        The audio is converted to 16 kHz (what Whisper needs). A phrase that is
+        too short is still sent, but empty, so the window can clear its preview.
+        """
         # Always emit, even an empty payload, so the UI can clear the live
         # preview line for this phrase.
         payload = b""
@@ -1036,6 +1291,7 @@ class AudioCaptureThread(threading.Thread):
                       reason=label, bytes=len(payload), chunks=len(buf))
 
     def run(self):
+        """Thread entry point: create PortAudio, run the capture, always clean up."""
         pa     = pyaudio.PyAudio()
         try:
             self._run(pa)
@@ -1048,6 +1304,12 @@ class AudioCaptureThread(threading.Thread):
             pa.terminate()
 
     def _run(self, pa):
+        """The capture itself: open the device, then loop reading audio blocks.
+
+        Steps: find the device's sample rate and channels, open the stream,
+        then for each block: downmix to mono, measure level, run VAD, build
+        phrases, send previews and finished phrases, and log stats every 10 s.
+        """
         stream = None
         self._keepalive = None
         try:
@@ -1279,6 +1541,10 @@ class AudioCaptureThread(threading.Thread):
             if self.loopback_out is not None:
                 self.loopback_out.push(data)
 
+            # ── Step 1: measure this block ───────────────────────────────
+            # `recent` keeps the last few blocks (for VAD context and pre-roll).
+            # prob is Silero's estimate (0..1) that this block is speech;
+            # digital silence is skipped to save work.
             recent.append(data)
             rms_db, peak_db = levels_dbfs(data)
             prob = speech_prob() if rms_db > SILENCE_FLOOR_DBFS else 0.0
@@ -1298,6 +1564,9 @@ class AudioCaptureThread(threading.Thread):
                           vad_threshold=round(thr, 3), **stats.summary())
                 frames = speech_frames = 0
 
+            # ── Step 2: track whether we are inside a phrase ─────────────
+            # in_speech = "a phrase has started and not ended yet".
+            # sil_count = how many quiet blocks in a row since the last speech.
             if speaking:
                 if not in_speech:
                     in_speech = True
@@ -1315,15 +1584,19 @@ class AudioCaptureThread(threading.Thread):
             if not in_speech:
                 continue
 
+            # ── Step 3: add the block to the phrase, then decide what to do ─
+            # buf holds the phrase's audio blocks; probs their speech scores.
             buf.append(data)
             probs.append(prob)
             ph_levels.append(rms_db)
             ph_peak = max(ph_peak, peak_db)
             since_prev += 1
+            # (a) a long enough pause -> the phrase is finished
             if sil_count >= sil_c:
                 self._flush(seq, buf, min_c, "end", _resample, phrase_meta(len(buf)))
                 seq += 1
                 buf, probs, sil_count, since_prev, in_speech = [], [], 0, 0, False
+            # (b) the phrase is too long (people who never pause) -> cut it
             elif len(buf) >= max_c:
                 # Cut where speech is least likely (a word gap) near the end,
                 # carrying the remainder into the next phrase.
@@ -1336,6 +1609,7 @@ class AudioCaptureThread(threading.Thread):
                 since_prev = len(buf)
                 ph_t_start = time.monotonic() - len(buf) * chunk_sec
                 ph_levels, ph_peak, ph_previews = ph_levels[cut + 1:], -100.0, 0
+            # (c) still talking -> every PARTIAL_INTERVAL_SEC, offer a preview
             elif (since_prev >= partial_c and len(buf) >= pmin_c and sil_count == 0
                     and self.partial_slot is not None):
                 # sil_count == 0: once a pause starts the final is ~0.3 s away;
@@ -1355,9 +1629,13 @@ class AudioCaptureThread(threading.Thread):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Persisted user settings
+#
+# The user's choices are saved in interpreter.settings.json so they are
+# remembered the next time the app starts.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_settings() -> dict:
+    """Read interpreter.settings.json and return it as a dict ({} if missing or broken)."""
     try:
         return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1368,6 +1646,7 @@ def load_settings() -> dict:
 
 
 def save_settings(**changes):
+    """Update some settings (e.g. save_settings(model="…")) and write the file."""
     settings = load_settings()
     settings.update(changes)
     try:
@@ -1379,10 +1658,19 @@ def save_settings(**changes):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Whisper model loader — GPU with automatic CPU fallback
+#
+# Loading a model takes seconds, so it happens on a background thread.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WhisperModelLoader(threading.Thread):
+    """Loads a Whisper model on a background thread so the window stays usable.
+
+    Loading can take seconds (or minutes on the first download). When done,
+    `ready` is set and `model` (or `error`) is filled in. If loading on the
+    GPU fails it falls back to the Tiny model on the CPU.
+    """
     def __init__(self, model_size, status_cb):
+        """Prepare to load `model_size` ("tiny", "small", "medium", "large-v3-turbo")."""
         super().__init__(daemon=True, name="whisper-loader")
         self.model_size          = model_size
         self.status_cb           = status_cb
@@ -1396,6 +1684,11 @@ class WhisperModelLoader(threading.Thread):
         self.used_fallback       = False
 
     def _try_load(self, model_size, device, compute_type):
+        """Load the model on one device, then "warm it up" with one second of silence
+        so the first real phrase is not slowed down by start-up work.
+
+        Returns (model, milliseconds taken).
+        """
         from faster_whisper import WhisperModel
         label = "GPU" if device == "cuda" else "CPU"
         self.status_cb(f"Loading Whisper '{model_size}' on {label}…")
@@ -1438,6 +1731,7 @@ class WhisperModelLoader(threading.Thread):
         return model, round((time.perf_counter() - t0) * 1000, 2)
 
     def run(self):
+        """Thread entry point: load on the chosen device, fall back to CPU if needed."""
         try:
             # ── Primary attempt ───────────────────────────────────────────
             try:
@@ -1478,6 +1772,11 @@ class WhisperModelLoader(threading.Thread):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Transcription worker
+#
+# This section turns audio into text. First come the checks that spot
+# text Whisper may have invented (hallucinations) or results that look
+# wrong, then helper classes (level meter, local translator, speaker),
+# then TranscriptionWorker itself, the heart of the program.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Whisper's stock outputs on silence/noise (learned from YouTube captions).
@@ -1524,6 +1823,9 @@ HALLUCINATION_FRAGMENTS = ("субтитр", "dimatorzok", "редактор с�
 
 
 def is_hallucination(text: str) -> bool:
+    """True if the text is empty, a known stock phrase Whisper invents on silence
+    ("thank you", "you"…), or contains a YouTube subtitle-credit fragment.
+    """
     low = text.lower()
     if any(f in low for f in HALLUCINATION_FRAGMENTS):
         return True
@@ -1548,6 +1850,7 @@ class DbMeter(ctk.CTkCanvas):
     ZONES = ((-18, "#2ECC71", "#123d24"), (-6, "#F1C40F", "#4a3f0c"), (0.1, "#E74C3C", "#4a1712"))
 
     def __init__(self, master, **kw):
+        """Create the canvas; the LED segments are drawn when it gets its size."""
         super().__init__(master, height=30, highlightthickness=0, bg="#1d1e1e", **kw)
         self._segs, self._lit = [], []
         self._rms = self._peak = self.FLOOR_DB
@@ -1556,12 +1859,14 @@ class DbMeter(ctk.CTkCanvas):
         self.bind("<Configure>", lambda e: self._layout())
 
     def _colours(self, db):
+        """Return the (lit, unlit) colours for a level in dB (green/amber/red zone)."""
         for top, on, off in self.ZONES:
             if db < top:
                 return on, off
         return self.ZONES[-1][1:]
 
     def _layout(self):
+        """Draw all the LED segments and the scale numbers to fit the current width."""
         self.delete("all")
         w = max(100, self.winfo_width())
         n = int(-self.FLOOR_DB / self.SEG_DB)
@@ -1580,6 +1885,9 @@ class DbMeter(ctk.CTkCanvas):
                              font=("Segoe UI", 7))
 
     def update_level(self, rms_db, peak_db):
+        """Show a new level. Rises instantly, falls slowly (20 dB/s) like a real
+        meter, and keeps a peak marker for HOLD_SEC seconds.
+        """
         now = time.monotonic()
         dt, self._last_t = now - self._last_t, now
         fall = self.FALL_DB_PER_SEC * dt
@@ -1591,10 +1899,12 @@ class DbMeter(ctk.CTkCanvas):
         self._paint()
 
     def reset(self):
+        """Clear the meter (when listening stops)."""
         self._rms = self._peak = self.FLOOR_DB
         self._paint()
 
     def _paint(self):
+        """Recolour only the segments whose state changed (cheap to call often)."""
         hold_idx = int((self._peak - self.FLOOR_DB) / self.SEG_DB) - 1
         for i, (db, rid, on, off) in enumerate(self._segs):
             state = on if (db <= self._rms or i == hold_idx) else off
@@ -1608,6 +1918,11 @@ class LocalTranslator:
     sentences (Opus-MT is trained on sentences; fragments translate badly)
     and translated as one batch."""
     def __init__(self, src, tgt):
+        """Download (first time) and load the Opus-MT model for (src, tgt).
+
+        `sentencepiece` splits text into the sub-word pieces the model was trained
+        on; there is one tokenizer for the source and one for the target language.
+        """
         import ctranslate2
         import sentencepiece as spm
         from huggingface_hub import snapshot_download
@@ -1620,6 +1935,9 @@ class LocalTranslator:
         self._sp_tgt = spm.SentencePieceProcessor(model_file=os.path.join(path, "target.spm"))
 
     def translate(self, text: str) -> str:
+        """Translate `text`: split into sentences, translate them as one batch on the
+        GPU, and join the results.
+        """
         import re
         sentences = [x for x in re.split(r"(?<=[.!?…])\s+", text.strip()) if x]
         if not sentences:
@@ -1632,13 +1950,19 @@ class LocalTranslator:
 
 
 class TranslatorLoader(threading.Thread):
+    """Loads a LocalTranslator on a background thread (first use downloads ~300 MB).
+
+    Until it is ready the app uses Whisper or online translation instead.
+    """
     def __init__(self, src, tgt):
+        """Prepare to load the translator for the language pair (src, tgt)."""
         super().__init__(daemon=True, name=f"mt-loader-{src}-{tgt}")
         self.src, self.tgt = src, tgt
         self.translator = None
         self.ready = threading.Event()
 
     def run(self):
+        """Load the model, translate one word to warm it up, then signal `ready`."""
         t0 = time.perf_counter()
         try:
             self.translator = LocalTranslator(self.src, self.tgt)
@@ -1660,6 +1984,7 @@ class Speaker(threading.Thread):
     HANGOVER_SEC = 0.4   # loopback capture lags playback slightly
 
     def __init__(self):
+        """Set up the command queue; the SAPI voice is created inside the thread."""
         super().__init__(daemon=True, name="tts")
         self._cmds    = queue.Queue()
         self.speaking = threading.Event()
@@ -1667,18 +1992,26 @@ class Speaker(threading.Thread):
         self.error    = None
 
     def configure(self, output_label: str, language: str):
+        """Choose the output device and a voice for `language` (e.g. "English")."""
         self._cmds.put(("config", output_label, language))
 
     def say(self, text: str):
+        """Queue text to be spoken (does not wait for it to finish)."""
         self._cmds.put(("say", text))
 
     def stop_speech(self):
+        """Stop speaking immediately and drop anything queued."""
         self._cmds.put(("stop",))
 
     def shutdown(self):
+        """Stop speaking and end the thread (when the app closes)."""
         self._cmds.put(("quit",))
 
     def _configure(self, voice, output_label, language):
+        """Apply an output device and language to the SAPI voice.
+
+        Returns an error message if no voice for the language is installed.
+        """
         want_out = plain_device_name(output_label).lower()
         outputs  = voice.GetAudioOutputs()
         for i in range(outputs.Count):
@@ -1702,6 +2035,7 @@ class Speaker(threading.Thread):
         return None
 
     def run(self):
+        """Thread loop: carry out queued commands and keep `speaking` up to date."""
         try:
             import comtypes
             import comtypes.client
@@ -1757,6 +2091,17 @@ class TranscriptionWorker(threading.Thread):
                  phrase_queue, result_queue, status_cb,
                  partial_slot: "LatestSlot | None" = None,
                  preview_model=None, run_id=0, record_audio=False, translator=None):
+        """Store everything the worker needs for one listening session.
+
+        model          the main Whisper model (used for finished phrases).
+        src_whisper    language code of the speech, e.g. "ru".
+        phrase_queue   finished phrases from AudioCaptureThread.
+        result_queue   where results go back to the window.
+        partial_slot   preview audio (LatestSlot).
+        preview_model  smaller model for previews, or a function returning one.
+        translator     Opus-MT translator, or a function returning one (or None).
+        record_audio   save each phrase as a WAV for later accuracy checks.
+        """
         super().__init__(daemon=True, name=f"transcription-worker-{wid}")
         self.wid          = wid
         self.model        = model
@@ -1789,6 +2134,7 @@ class TranscriptionWorker(threading.Thread):
         self._session = Counter()    # totals for the session_summary log line
 
     def stop(self):
+        """Ask the worker to finish (None wakes it if it is waiting for a phrase)."""
         self._stop_evt.set()
         self.phrase_queue.put(None)
 
@@ -1814,6 +2160,7 @@ class TranscriptionWorker(threading.Thread):
 
     @property
     def translator(self):
+        """The local translator if it has finished loading, else None."""
         src = self._translator_src
         return src() if callable(src) else src
 
@@ -1839,6 +2186,7 @@ class TranscriptionWorker(threading.Thread):
 
     @property
     def preview_model(self):
+        """The model to use for previews (None means: use the main model)."""
         src = self._preview_model_src
         return src() if callable(src) else src
 
@@ -1984,6 +2332,15 @@ class TranscriptionWorker(threading.Thread):
         return self._special[key]
 
     def _prompts_for(self, tasks, model):
+        """Build the start-of-decoding instructions ("prompt") for each task.
+
+        A Whisper prompt looks like:
+            <|startofprev|> …previous sentence tokens… <|startoftranscript|> <|ru|>
+            <|transcribe|> <|notimestamps|>
+        i.e. "here is what was said before; now transcribe this Russian audio,
+        without timestamps". The special-token numbers depend on the model
+        (see _tokens_for).
+        """
         sp = self._tokens_for(model)
         hists = [[i for i in (self._history.get(t) or []) if i < sp["text_vocab"]]
                  for t in tasks]
@@ -2001,6 +2358,10 @@ class TranscriptionWorker(threading.Thread):
         self._history_t = time.monotonic()
 
     def run(self):
+        """Thread entry point. Runs the main loop and restarts it after an unexpected
+        error (so one bad phrase cannot stop transcription for the whole session),
+        then logs a session_summary when the session ends.
+        """
         # An unexpected error used to kill this thread for good: phrases then
         # piled up and were dropped for the rest of the session. Log it and
         # carry on instead.
@@ -2020,6 +2381,14 @@ class TranscriptionWorker(threading.Thread):
                   **ss)
 
     def _run_loop(self):
+        """The worker's main loop.
+
+        Finished phrases always come first. Only when there is no finished phrase
+        waiting does it process the newest preview. For each finished phrase it:
+        resets the context after a long silence, transcribes (with a retry if
+        the result looks wrong), translates, saves the audio, logs a detailed
+        "phrase_trace", and sends ("final", …) to the window.
+        """
         import numpy as np
         self._prepare()
         while not self._stop_evt.is_set():
@@ -2146,6 +2515,11 @@ class TranscriptionWorker(threading.Thread):
                               input_bytes=len(audio_bytes) if audio_bytes else 0)
 
     def _process_partial(self, seq, audio_bytes, t_capture, t_start):
+        """Make a quick preview of an unfinished phrase and send ("partial", …).
+
+        Uses the preview model and does not update the context: previews are
+        temporary and will be replaced by the finished text.
+        """
         import numpy as np
         try:
             # How old the preview audio already is when we pick it up
@@ -2191,11 +2565,29 @@ class TranscriptionWorker(threading.Thread):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main application
+#
+# InterpreterApp is the window and the coordinator of everything above.
+# Methods are grouped by purpose: window placement, models, building the
+# controls, the level meter, mode switching, starting/stopping listening,
+# text-to-speech, settings changes, handling results (_poll_queue),
+# diagnostics, the watchdog and logging.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class InterpreterApp(ctk.CTk):
 
+    """The main window, and the "conductor" that starts and stops everything.
+
+    It builds the controls, starts a listening "session" (one capture thread,
+    one transcription worker, one translation worker) and restarts it whenever
+    a setting changes. Background threads never touch the window directly:
+    they put messages on `result_queue`, and _poll_queue() (on the main
+    thread) reads them every 15 ms and updates the screen.
+    """
     def __init__(self):
+        """Create the window: load settings, find audio devices, build all the
+        controls, place the window on screen, start loading the AI models and
+        start listening.
+        """
         super().__init__()
         self.title("Voice Interpreter")
         self.geometry("980x720")
@@ -2352,6 +2744,7 @@ class InterpreterApp(ctk.CTk):
     # ── Model ─────────────────────────────────────────────────────────────
 
     def _preload_model(self):
+        """Start loading the selected Whisper model in the background."""
         self._whisper_model = None
         model_size = MODELS[self.model_var.get()]
         log_event(logging.INFO, "whisper_model_preload_started", model_size=model_size)
@@ -2362,6 +2755,9 @@ class InterpreterApp(ctk.CTk):
         self._model_loader.start()
 
     def _reload_model_if_changed(self):
+        """Called when the Model menu changes: save the choice, load the new model
+        and restart listening.
+        """
         log_event(logging.INFO, "whisper_model_reload_requested", selected_model=self.model_var.get())
         save_settings(model=self.model_var.get())
         if MODELS[self.model_var.get()] == "tiny" and self.src_var.get() != "English":
@@ -2377,6 +2773,7 @@ class InterpreterApp(ctk.CTk):
     # ── Header ────────────────────────────────────────────────────────────
 
     def _build_header(self):
+        """Build the title bar: app name, GPU/CPU badge and the LISTENING/MUTED badge."""
         hdr = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray85", "gray17"))
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.grid_columnconfigure(0, weight=1)
@@ -2408,6 +2805,7 @@ class InterpreterApp(ctk.CTk):
     # ── Quick switch ──────────────────────────────────────────────────────
 
     def _build_quick_switch(self):
+        """Build the mode buttons (My Voice / Friend) and Mute / Speak / Clear."""
         qs = ctk.CTkFrame(self, fg_color=("gray88", "gray20"), corner_radius=10)
         qs.grid(row=1, column=0, sticky="ew", padx=16, pady=(10, 0))
         qs.grid_columnconfigure(0, weight=1)
@@ -2448,6 +2846,9 @@ class InterpreterApp(ctk.CTk):
     # ── Controls ──────────────────────────────────────────────────────────
 
     def _build_controls(self, input_labels, output_labels):
+        """Build the settings rows: audio input, audio output, languages, model,
+        speech sensitivity and preview model.
+        """
         outer = ctk.CTkFrame(self, fg_color="transparent")
         outer.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 0))
         outer.grid_columnconfigure(1, weight=1)
@@ -2537,6 +2938,7 @@ class InterpreterApp(ctk.CTk):
     # ── Input-level meter ─────────────────────────────────────────────────
 
     def _build_meter(self):
+        """Build the input-level meter row (DbMeter plus the dBFS readout)."""
         mf = ctk.CTkFrame(self, fg_color="transparent")
         mf.grid(row=3, column=0, sticky="ew", padx=20, pady=(6, 0))
         mf.grid_columnconfigure(1, weight=1)
@@ -2555,6 +2957,9 @@ class InterpreterApp(ctk.CTk):
     # ── Main tabbed area ──────────────────────────────────────────────────
 
     def _build_text_area(self):
+        """Build the tabs: "Interpreter" (heard text + translation side by side)
+        and "Diagnostics" (live health and performance figures).
+        """
         tabs = ctk.CTkTabview(self, fg_color="transparent")
         tabs.grid(row=4, column=0, sticky="nsew", padx=20, pady=(2, 0))
         tabs.add("Interpreter")
@@ -2615,6 +3020,7 @@ class InterpreterApp(ctk.CTk):
     # ── Status bar ────────────────────────────────────────────────────────
 
     def _build_status_bar(self):
+        """Build the bottom bar: status message and the Export Log Summary button."""
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=5, column=0, sticky="ew", padx=22, pady=(2, 8))
         bar.grid_columnconfigure(0, weight=1)
@@ -2631,9 +3037,13 @@ class InterpreterApp(ctk.CTk):
     # ── Level meter ───────────────────────────────────────────────────────
 
     def _on_level(self, rms_db, peak_db, speaking):
+        """Called by the capture thread with each block's level; forwards it to the
+        main thread through result_queue (threads may not touch widgets).
+        """
         self.result_queue.put(("level", (rms_db, peak_db, speaking)))
 
     def _update_meter(self, rms_db, peak_db, speaking):
+        """Show a level on the meter and the dBFS readout (main thread)."""
         self.meter.update_level(rms_db, peak_db)
         if rms_db <= -99:
             self.level_text.configure(text="  -∞ dBFS   [ silent ]")
@@ -2644,12 +3054,16 @@ class InterpreterApp(ctk.CTk):
     # ── Mode switching ────────────────────────────────────────────────────
 
     def _on_mode_btn(self, mode_idx):
+        """A mode button was clicked: remember the current mode's settings, switch."""
         if self._active_mode is not None:
             self._mode_state[self._active_mode] = [
                 self.device_var.get(), self.src_var.get(), self.tgt_var.get()]
         self._apply_mode(mode_idx, switch_source=True)
 
     def _apply_mode(self, mode_idx, switch_source=False):
+        """Switch to mode 0 (My Voice) or 1 (Friend): set its device and languages,
+        highlight its button and restart listening.
+        """
         if self.is_listening:
             self._stop_session(keep_mode=True)
         self._active_mode = mode_idx
@@ -2670,14 +3084,17 @@ class InterpreterApp(ctk.CTk):
             self._restart_session()
 
     def _on_manual_device_change(self, _=None):
+        """An audio device menu changed: restart listening with the new device."""
         self._restart_session()
 
     def _on_manual_lang_change(self, _=None):
+        """A language menu changed: update the box titles and restart listening."""
         self.heard_label.configure(text=f"Heard in {self.src_var.get()}")
         self.translated_label.configure(text=f"Translation → {self.tgt_var.get()}")
         self._restart_session()
 
     def _refresh_devices(self):
+        """The ⟳ button: re-scan audio devices (e.g. after plugging one in)."""
         if self.is_listening:
             self._stop_session(keep_mode=True)
         self._input_devices, self._output_devices = get_audio_devices()
@@ -2708,12 +3125,14 @@ class InterpreterApp(ctk.CTk):
     # Mute is the only way to stop it.
 
     def _restart_session(self):
+        """Stop listening and start again with the current settings (unless muted)."""
         if self.is_listening:
             self._stop_session(keep_mode=True)
         if not self._muted:
             self._start_session()
 
     def _toggle_mute(self):
+        """The Mute button: stop listening (and release the device), or resume."""
         self._muted = not self._muted
         if self._muted:
             self._stop_session()
@@ -2728,8 +3147,15 @@ class InterpreterApp(ctk.CTk):
         log_event(logging.INFO, "mute_toggled", muted=self._muted)
 
     def _start_session(self):
+        """Start listening: create the capture thread, transcription worker and
+        translation worker for the current device, languages and models.
+
+        If the Whisper model is still loading, it tries again every 0.6 s.
+        """
         if self.is_listening or self._muted:
             return
+        # ── Step 1: make sure the Whisper model is loaded ────────────────
+        # If it is still loading, show a message and try again in 0.6 s.
         if self._model_loader and not self._model_loader.ready.is_set():
             self.status_var.set("⏳ Loading Whisper model — please wait…")
             if self._start_retry_after_id is None:
@@ -2758,6 +3184,8 @@ class InterpreterApp(ctk.CTk):
         self._set_live_status("LISTENING", COL_OK)
         self.status_var.set("Listening…")
 
+        # ── Step 2: work out the device, languages and queues ────────────
+        # in_idx is PortAudio's number for the selected input device.
         in_idx = self._input_map.get(self.device_var.get(), -1)
         if in_idx == -1:
             in_idx = None
@@ -2772,6 +3200,8 @@ class InterpreterApp(ctk.CTk):
         tgt_key     = self.tgt_var.get()
         src_whisper, _ = LANGUAGES.get(src_key, ("en", "en"))
 
+        # phrase_queue carries finished phrases (capture -> worker);
+        # partial_slot carries only the newest preview audio.
         worker_count = getattr(self._model_loader, "worker_count", NUM_WORKERS)
         self.phrase_queue  = queue.Queue(maxsize=max(worker_count * 4, 8))
         self._partial_slot = LatestSlot()
@@ -2868,10 +3298,14 @@ class InterpreterApp(ctk.CTk):
                   model_compute_type=getattr(self._model_loader, "active_compute_type", COMPUTE_TYPE))
 
     def _retry_start_session(self):
+        """Timer callback: try _start_session again (model was still loading)."""
         self._start_retry_after_id = None
         self._start_session()
 
     def _stop_session(self, keep_mode=False):
+        """Stop listening: tell all the session's threads to finish and reset the
+        meter. `keep_mode` is True when the stop is part of a restart.
+        """
         self.is_listening = False
         if self._start_retry_after_id is not None:
             self.after_cancel(self._start_retry_after_id)
@@ -2918,12 +3352,14 @@ class InterpreterApp(ctk.CTk):
         log_event(logging.INFO, "tts_toggled", enabled=self._tts_on)
 
     def _configure_speaker(self):
+        """Point the text-to-speech voice at the chosen output device and language."""
         self.speaker.configure(self.out_device_var.get(), self.tgt_var.get())
         self.after(300, lambda: self.speaker.error and self.status_var.set(self.speaker.error))
 
     # ── Clear ─────────────────────────────────────────────────────────────
 
     def _clear(self):
+        """The Clear button: empty both text boxes (listening carries on)."""
         self.heard_box.delete("1.0", "end")
         self.translated_box.delete("1.0", "end")
         self._live = {}
@@ -2933,6 +3369,9 @@ class InterpreterApp(ctk.CTk):
     # ── Sensitivity ───────────────────────────────────────────────────────
 
     def _on_sensitivity(self, val):
+        """The sensitivity slider moved: apply it at once, save and log it once the
+        slider has stopped moving for 0.5 s (dragging fires many events).
+        """
         v = round(float(val), 2)
         self.sens_label.configure(text=f"{round(v * 100)}%")
         if self._capture_thr:
@@ -2948,6 +3387,7 @@ class InterpreterApp(ctk.CTk):
         self._sens_log_after = self.after(500, _settled)
 
     def _on_preview_choice(self):
+        """The Previews menu changed: save, load that model, restart listening."""
         save_settings(preview_model=self.preview_choice_var.get())
         self._ensure_preview_model()
         self._restart_session()
@@ -2990,6 +3430,7 @@ class InterpreterApp(ctk.CTk):
     # ── Queue poll ────────────────────────────────────────────────────────
 
     def _log_displayed(self, seq, trace, online):
+        """Log how long a finished phrase took to reach the screen ("phrase_displayed")."""
         now = time.monotonic()
         log_event(logging.INFO, "phrase_displayed", run_id=trace["run_id"], seq=seq,
                   ui_ms=round((now - trace["t_result"]) * 1000, 1),
@@ -3085,6 +3526,11 @@ class InterpreterApp(ctk.CTk):
         self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
 
     def _poll_queue(self):
+        """Runs every 15 ms on the main thread: handle every message the background
+        threads have sent (previews, finished phrases, translations, status,
+        levels, metrics) and update the window. This is the only place results
+        reach the screen.
+        """
         now = time.monotonic()
         if self._last_poll_t is not None:
             # >0 means the Tk thread was busy and results waited on screen
@@ -3153,6 +3599,7 @@ class InterpreterApp(ctk.CTk):
         self.after(15, self._poll_queue)
 
     def _update_metric(self, name, value):
+        """Keep running statistics for the Diagnostics tab."""
         if name == "transcription_ms":
             self._perf_stats["transcriptions"] += 1
             self._perf_stats["transcription_ms"].append(value)
@@ -3165,10 +3612,12 @@ class InterpreterApp(ctk.CTk):
     # ── Diagnostics ───────────────────────────────────────────────────────
 
     def _refresh_diagnostics(self):
+        """Refresh the Diagnostics tab once a second."""
         self._refresh_diagnostics_once()
         self.after(1000, self._refresh_diagnostics)
 
     def _refresh_diagnostics_once(self):
+        """Rewrite the Diagnostics tab with current health and performance figures."""
         avg_tr  = self._avg(self._perf_stats["transcription_ms"])
         avg_tl  = self._avg(self._perf_stats["translation_ms"])
         avg_lk  = self._avg(self._perf_stats["lock_wait_ms"])
@@ -3222,9 +3671,11 @@ class InterpreterApp(ctk.CTk):
         self.diag_box.configure(state="disabled")
 
     def _set_live_status(self, text, color):
+        """Set the coloured status badge in the header (LISTENING, MUTED, …)."""
         self.live_status_badge.configure(text=f" {text} ", fg_color=color)
 
     def _open_path(self, path: Path):
+        """Open a file or folder in Windows Explorer / its default program."""
         try:
             target = path if path.exists() else APP_DIR
             os.startfile(str(target))
@@ -3234,9 +3685,11 @@ class InterpreterApp(ctk.CTk):
             log_exception("open_path_failed", e, path=str(path))
 
     def _open_app_folder(self):
+        """Open the folder that contains the app and its log files."""
         self._open_path(APP_DIR)
 
     def _export_log_summary(self):
+        """The Export Log Summary button: write the summary file and open it."""
         try:
             summary = build_log_summary()
             self.status_var.set(f"Log summary written → {LOG_SUMMARY_PATH.name}")
@@ -3252,10 +3705,14 @@ class InterpreterApp(ctk.CTk):
 
     @staticmethod
     def _avg(values):
+        """Average of a list of numbers (0 for an empty list)."""
         return (sum(values) / len(values)) if values else 0.0
 
     @staticmethod
     def _trim_textbox(box):
+        """Delete the oldest text so a box never holds more than
+        MAX_TEXT_HISTORY_CHARS characters (keeps the window fast in long calls).
+        """
         text = box.get("1.0", "end-1c")
         if len(text) > MAX_TEXT_HISTORY_CHARS:
             box.delete("1.0", f"1.0 + {len(text) - MAX_TEXT_HISTORY_CHARS} chars")
@@ -3293,6 +3750,7 @@ class InterpreterApp(ctk.CTk):
                 self._trim_textbox(box)
 
     def _commit_translation(self, seq, text):
+        """Show a finished translation, and speak it if Speak is on."""
         self._commit(self.translated_box, seq, text)
         if text and self._tts_on and not text.startswith("[translation failed"):
             self.speaker.say(text)
@@ -3300,11 +3758,13 @@ class InterpreterApp(ctk.CTk):
 
     @staticmethod
     def _append(box, text):
+        """Add a line of text to the end of a text box and scroll to it."""
         cur = box.get("1.0", "end-1c")
         box.insert("end", ("\n" if cur else "") + text)
         box.see("end")
 
     def _on_close(self):
+        """The window is closing: stop listening and the speaker, log, and exit."""
         try:
             if self.is_listening:
                 self._stop_session()
