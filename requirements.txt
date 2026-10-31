@@ -1,10 +1,12 @@
 customtkinter>=5.2.0
 requests>=2.31.0
 deep-translator>=1.11.0
-pyttsx3>=2.90
-pyaudio>=0.2.13
+comtypes>=1.4        # Windows SAPI text-to-speech
+pyaudiowpatch>=0.2.12.9   # PyAudio fork with WASAPI loopback (capture output devices)
 faster-whisper>=1.0.3
 numpy>=1.26.0
 scipy>=1.11.0
 ctranslate2>=4.4.0
 pyinstaller>=6.0.0
+nvidia-cublas-cu12>=12.4    # CUDA libraries for GPU Whisper (Windows)
+nvidia-cudnn-cu12>=9,<10

@@ -2,26 +2,17 @@
 Voice Interpreter — optimised for minimum latency.
 
 Speed stack:
-  • Auto-detects NVIDIA GPU; falls back to CPU int8 automatically if CUDA
-    libraries are missing (e.g. cublas64_12.dll not installed).
-  • Model pre-warmed with a dummy buffer after load.
-  • STREAM_CHUNK_SEC = 1.2 s mid-speech flush; SILENCE_SEC = 0.25 s end-phrase.
-  • 3 parallel workers on CPU (1 on GPU).
-  • Persistent requests.Session + LRU cache for translation.
-  • VB-Audio loopback: captures system audio for translation; a separate
-    loopback output thread simultaneously plays back audio to the Fiio output.
-
-Bug fixes in this revision:
-  • VB-Audio loopback output: audio from the virtual cable is now also written
-    to the selected output device (Fiio) so you can hear it through headphones.
-  • TTS "run loop already started": pyttsx3 is now guarded with a lock and the
-    engine is re-initialised on failure instead of crashing silently.
-  • Translation queue unbounded backlog: the queue is now bounded (64 items)
-    and excess phrases are dropped with a warning; a second parallel translation
-    worker is spawned on CPU to drain the queue faster.
-  • Diagnostics tab text invisible: rowconfigure weight fixed so the textbox
-    fills the available space and is scrollable.
-  • Diagnostics summary label wraps correctly with a larger fixed height frame.
+  • Auto-detects NVIDIA GPU (CUDA DLLs from the nvidia-* pip packages);
+    falls back to CPU int8 if they are missing.
+  • Speech is cut at natural pauses (relative to the speaker's level) with a
+    5 s cap at the quietest moment, and a live preview is transcribed every
+    0.7 s while someone is still talking.
+  • To-English translation runs in Whisper itself (task=translate) on the
+    GPU; other targets use online services over a keep-alive session.
+  • One inference worker using all physical cores (inference is serialised).
+  • WASAPI loopback: capture what an output device (e.g. FiiO K7) is playing.
+  • Text-to-speech via SAPI on its own thread: toggled on/off, stops
+    instantly, and mutes capture while speaking on the captured device.
 """
 
 import queue
@@ -47,17 +38,44 @@ import requests
 import subprocess
 import customtkinter as ctk
 
+# PyAudioWPatch is a drop-in PyAudio fork that adds WASAPI loopback devices,
+# letting us capture what an output device (e.g. FiiO K7) is playing.
 try:
-    import pyaudio
+    import pyaudiowpatch as pyaudio
     _PYAUDIO_AVAILABLE = True
+    _LOOPBACK_AVAILABLE = True
 except ImportError:
-    _PYAUDIO_AVAILABLE = False
+    _LOOPBACK_AVAILABLE = False
+    try:
+        import pyaudio
+        _PYAUDIO_AVAILABLE = True
+    except ImportError:
+        _PYAUDIO_AVAILABLE = False
 
-try:
-    import pyttsx3
-    _TTS_AVAILABLE = True
-except Exception:
-    _TTS_AVAILABLE = False
+
+def _add_cuda_dll_dirs():
+    """Make the pip-installed NVIDIA CUDA DLLs (nvidia-cublas-cu12,
+    nvidia-cudnn-cu12) loadable by ctranslate2 on Windows."""
+    if os.name != "nt":
+        return []
+    roots = [Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"]
+    if getattr(sys, "frozen", False):
+        roots.insert(0, Path(getattr(sys, "_MEIPASS", APP_DIR)) / "nvidia")
+    added = []
+    for root in roots:
+        for bin_dir in root.glob("*/bin"):
+            os.add_dll_directory(str(bin_dir))
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+            added.append(str(bin_dir))
+    return added
+
+
+# Device labels contain emoji; a cp1252 console would raise on every log line.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -67,6 +85,7 @@ APP_DIR               = Path(__file__).resolve().parent
 LOG_PATH              = APP_DIR / "interpreter.log.jsonl"
 ERROR_LOG_PATH        = APP_DIR / "interpreter.error.log.jsonl"
 LOG_SUMMARY_PATH      = APP_DIR / "interpreter.log.summary.json"
+SETTINGS_PATH         = APP_DIR / "interpreter.settings.json"
 MAX_LOG_BYTES         = 5 * 1024 * 1024
 LOG_BACKUP_COUNT      = 5
 
@@ -74,7 +93,7 @@ LOG_BACKUP_COUNT      = 5
 MAX_TEXT_HISTORY_CHARS         = 12_000
 PHRASE_QUEUE_BACKLOG_WARN      = 6
 TRANSLATION_QUEUE_BACKLOG_WARN = 16
-TRANSLATION_WORKERS            = 2          # parallel translation threads
+TRANSLATION_WORKERS            = 1          # >1 lets results arrive out of order
 TRANSLATION_QUEUE_MAX          = 64
 
 
@@ -249,10 +268,15 @@ SAMPLE_RATE      = 16_000
 CHUNK_SAMPLES    = 512
 CHANNELS         = 1
 SAMPLE_WIDTH     = 2
-SILENCE_SEC      = 0.25
-STREAM_CHUNK_SEC = 1.2
-MAX_PHRASE_SEC   = 6
-MIN_PHRASE_SEC   = 0.10
+SILENCE_SEC      = 0.4     # pause that ends a phrase
+MAX_PHRASE_SEC   = 4       # longest phrase before a forced cut...
+CUT_SEARCH_SEC   = 1.5     # ...made at the quietest moment in this final window
+PAUSE_RATIO      = 0.25    # mid-speech, "quiet" means below this fraction of the
+                           # speaker's level (call audio rarely hits true silence)
+PARTIAL_INTERVAL_SEC = 0.35 # live preview cadence; the worker skips stale ones,
+                            # so this self-limits to what the GPU can keep up with
+PARTIAL_MIN_SEC  = 0.8     # less audio than this makes Whisper guess wildly
+MIN_PHRASE_SEC   = 0.5     # shorter clips are mostly silence and make Whisper hallucinate
 CAL_MULTIPLIER   = 1.3
 DEFAULT_SENS     = 0.6
 
@@ -318,30 +342,31 @@ COL_INFO     = "#2980B9"
 
 def detect_device():
     try:
+        dll_dirs = _add_cuda_dll_dirs()
         import ctranslate2
         n = ctranslate2.get_cuda_device_count()
         # On Windows, just because get_cuda_device_count() > 0 doesn't mean
-        # the cuBLAS libraries are actually in the PATH. If they are missing,
+        # the cuBLAS/cuDNN libraries are loadable. If they are missing,
         # CTranslate2 throws a RuntimeError at transcribe() time, which can deadlock.
-        # We explicitly verify we can load the DLL before trusting 'cuda'.
-        import os
+        # We explicitly verify we can load the DLLs before trusting 'cuda'.
         if n > 0 and os.name == "nt":
             import ctypes
-            try:
-                ctypes.cdll.LoadLibrary("cublas64_12.dll")
-            except Exception:
+            for dll in ("cublas64_12.dll", "cudnn64_9.dll"):
                 try:
-                    ctypes.cdll.LoadLibrary("cublas64_11.dll")
+                    ctypes.cdll.LoadLibrary(dll)
                 except Exception:
-                    log_event(logging.WARNING, "cuda_detection_dll_missing")
+                    log_event(logging.WARNING, "cuda_detection_dll_missing",
+                              dll=dll, searched=dll_dirs)
                     n = 0
-                    
-        log_event(logging.INFO, "cuda_detection_result", cuda_device_count=n)
+                    break
+
+        log_event(logging.INFO, "cuda_detection_result", cuda_device_count=n,
+                  ctranslate2_version=ctranslate2.__version__)
         if n > 0:
             return "cuda", "float16", 1, DEFAULT_MODEL_GPU
     except Exception as e:
         log_exception("cuda_detection_failed", e)
-    return "cpu", "int8", 2, DEFAULT_MODEL_CPU
+    return "cpu", "int8", 1, DEFAULT_MODEL_CPU
 
 
 WHISPER_DEVICE, COMPUTE_TYPE, NUM_WORKERS, _DEFAULT_MODEL = detect_device()
@@ -360,27 +385,103 @@ _http.mount("http://",  _adapter)
 _http.mount("https://", _adapter)
 
 
+class RateLimitedError(Exception):
+    pass
+
+
+def _google_translate(text: str, src: str, tgt: str) -> str:
+    url    = "https://translate.googleapis.com/translate_a/single"
+    params = {"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text}
+    resp   = _http.get(url, params=params, timeout=6)
+    if resp.status_code == 429:
+        raise RateLimitedError("Google returned 429 Too Many Requests")
+    resp.raise_for_status()
+    data = resp.json()
+    return "".join(p[0] for p in data[0] if p[0]).strip()
+
+
+_MYMEMORY_CODES: dict | None = None
+
+def _mymemory_code(code: str) -> str:
+    # MyMemory wants region codes ("ru-RU"), not bare ISO codes ("ru").
+    global _MYMEMORY_CODES
+    if _MYMEMORY_CODES is None:
+        from deep_translator import MyMemoryTranslator
+        _MYMEMORY_CODES = MyMemoryTranslator(source="en-GB", target="ru-RU") \
+            .get_supported_languages(as_dict=True)
+    codes = list(_MYMEMORY_CODES.values())
+    if code in codes:
+        return code
+    for c in codes:
+        if c.split("-")[0].lower() == code.split("-")[0].lower():
+            return c
+    raise ValueError(f"MyMemory does not support language '{code}'")
+
+
+def _mymemory_translate(text: str, src: str, tgt: str) -> str:
+    # Called directly over the shared keep-alive session: deep-translator
+    # opens a fresh TLS connection per call, adding ~200 ms each time.
+    resp = _http.get("https://api.mymemory.translated.net/get",
+                     params={"q": text,
+                             "langpair": f"{_mymemory_code(src)}|{_mymemory_code(tgt)}"},
+                     timeout=6)
+    if resp.status_code == 429:
+        raise RateLimitedError("MyMemory returned 429 Too Many Requests")
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("responseStatus") == 429 or "QUOTA" in str(data.get("responseDetails", "")).upper():
+        raise RateLimitedError(str(data.get("responseDetails")))
+    if data.get("responseStatus") not in (200, "200"):
+        raise RuntimeError(f"MyMemory error: {data.get('responseDetails')}")
+    return (data["responseData"]["translatedText"] or "").strip()
+
+
+# Providers are tried in order. A provider that rate-limits us is skipped for
+# an increasing cooldown so we stop hammering it (which prolongs the block).
+_PROVIDERS = [("google", _google_translate), ("mymemory", _mymemory_translate)]
+_PROVIDER_COOLDOWN_BASE = 30.0
+_PROVIDER_COOLDOWN_MAX  = 600.0
+_provider_state = {name: {"until": 0.0, "cooldown": 0.0} for name, _ in _PROVIDERS}
+_provider_lock  = threading.Lock()
+
+
 @lru_cache(maxsize=512)
 def _translate_cached(text: str, src: str, tgt: str) -> str:
     if src == tgt:
         return text
-    try:
-        url    = "https://translate.googleapis.com/translate_a/single"
-        params = {"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text}
-        t0     = time.perf_counter()
-        resp   = _http.get(url, params=params, timeout=6)
-        resp.raise_for_status()
-        data       = resp.json()
-        translated = "".join(p[0] for p in data[0] if p[0]).strip()
-        log_event(logging.INFO, "translation_completed",
-                  src=src, tgt=tgt,
-                  input_chars=len(text), output_chars=len(translated),
-                  elapsed_ms=round((time.perf_counter() - t0) * 1000, 2),
-                  cache_info=_translate_cached.cache_info()._asdict())
-        return translated
-    except Exception as e:
-        log_exception("translation_failed", e, src=src, tgt=tgt, input_chars=len(text))
-        raise RuntimeError(f"Translation failed: {e}") from e
+    errors = []
+    for name, fn in _PROVIDERS:
+        with _provider_lock:
+            state = _provider_state[name]
+            wait  = state["until"] - time.monotonic()
+        if wait > 0:
+            errors.append(f"{name}: cooling down ({wait:.0f}s)")
+            continue
+        try:
+            t0         = time.perf_counter()
+            translated = fn(text, src, tgt)
+            with _provider_lock:
+                state["cooldown"] = 0.0
+            log_event(logging.INFO, "translation_completed",
+                      provider=name, src=src, tgt=tgt,
+                      input_chars=len(text), output_chars=len(translated),
+                      elapsed_ms=round((time.perf_counter() - t0) * 1000, 2))
+            return translated
+        except RateLimitedError as e:
+            with _provider_lock:
+                state["cooldown"] = min(_PROVIDER_COOLDOWN_MAX,
+                                        max(_PROVIDER_COOLDOWN_BASE, state["cooldown"] * 2))
+                state["until"]    = time.monotonic() + state["cooldown"]
+            log_event(logging.WARNING, "translation_rate_limited",
+                      provider=name, cooldown_s=state["cooldown"], error=str(e))
+            errors.append(f"{name}: rate limited")
+        except Exception as e:
+            log_exception("translation_provider_failed", e,
+                          provider=name, src=src, tgt=tgt, input_chars=len(text))
+            errors.append(f"{name}: {type(e).__name__}")
+    log_event(logging.ERROR, "translation_failed",
+              src=src, tgt=tgt, input_chars=len(text), errors=errors)
+    raise RuntimeError("; ".join(errors))
 
 
 class TranslationWorker(threading.Thread):
@@ -400,16 +501,19 @@ class TranslationWorker(threading.Thread):
             item = self.request_queue.get()
             if item is None:
                 break
-            text, src_lang_key, tgt_lang_key = item
+            seq, text, src_lang_key, tgt_lang_key = item
             _, src = LANGUAGES.get(src_lang_key, ("en", "en"))
             _, tgt = LANGUAGES.get(tgt_lang_key, ("ru", "ru"))
             try:
                 t0  = time.perf_counter()
                 out = _translate_cached(text, src, tgt)
                 elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-                self.result_queue.put(("translated",   out or text))
+                self.result_queue.put(("translated", (seq, out or text)))
                 self.result_queue.put(("metric", ("translation_ms", elapsed_ms)))
             except Exception as e:
+                # Show the failure in the translation box, not just the status
+                # bar, which "Listening…" overwrites almost immediately.
+                self.result_queue.put(("translated", (seq, f"[translation failed: {text}]")))
                 self.result_queue.put(("status", f"Translation error: {e}"))
 
 
@@ -430,11 +534,12 @@ def get_device_native_rate(pa_instance, device_index) -> int:
 
 
 def rms(data: bytes) -> float:
+    import numpy as np
     n = len(data) // SAMPLE_WIDTH
     if n == 0:
         return 0.0
-    samples = struct.unpack(f"{n}h", data[:n * SAMPLE_WIDTH])
-    return math.sqrt(sum(s * s for s in samples) / n)
+    samples = np.frombuffer(data, dtype=np.int16, count=n).astype(np.float32)
+    return float(np.sqrt(np.mean(samples * samples)))
 
 
 # Host API preference order for PortAudio on Windows.
@@ -524,6 +629,7 @@ def get_audio_devices():
         return [(-1, "Default Microphone")], [(-1, "Default Output")]
 
     inputs, outputs, seen_in, seen_out = [], [], {}, {}
+    pa = None
     try:
         pa = pyaudio.PyAudio()
         api_map, pref_order, skip_apis = _get_host_api_map(pa)
@@ -538,7 +644,8 @@ def get_audio_devices():
                 nl   = name.lower()
                 if info.get("maxInputChannels", 0) >= 1 and name not in seen_in:
                     seen_in[name] = True
-                    prefix = "\U0001f3a4 " if any(k in nl for k in NVIDIA_KEYWORDS) else \
+                    prefix = "\U0001f50a " if info.get("isLoopbackDevice")           else \
+                             "\U0001f3a4 " if any(k in nl for k in NVIDIA_KEYWORDS) else \
                              "\u2605 "      if any(k in nl for k in VB_KEYWORDS)     else ""
                     inputs.append((i, prefix + name))
                 if info.get("maxOutputChannels", 0) >= 1 and name not in seen_out:
@@ -560,6 +667,11 @@ def get_audio_devices():
                   preferred_api_order=[api_map.get(i) for i in pref_order[:4]])
     except Exception as e:
         log_exception("audio_device_enumeration_failed", e)
+    finally:
+        # A leaked PortAudio instance breaks WASAPI streams opened later
+        # from other threads ("Unanticipated host error").
+        if pa is not None:
+            pa.terminate()
     return (inputs or [(-1, "Default Microphone")],
             outputs or [(-1, "Default Output")])
 
@@ -574,9 +686,24 @@ FIIO_PRIORITY_KEYWORDS = [
 ]
 
 
+def find_best_friend_input(input_devices):
+    """Default input for Friend mode: capture what the FiiO is playing (the
+    call audio from Teams/Telemost) via WASAPI loopback, else a VB-Audio cable."""
+    loopbacks = [(i, l) for i, l in input_devices if "[loopback]" in l.lower()]
+    for priority_kw in FIIO_PRIORITY_KEYWORDS:
+        for _idx, label in loopbacks:
+            if priority_kw in label.lower():
+                return label
+    return find_best_vb_input(input_devices)
+
+
 def find_device_by_keywords(devices, keywords):
-    """Return the first device label whose name (lowercased) contains any keyword."""
+    """Return the first device label whose name (lowercased) contains any keyword.
+    Loopback (output-capture) devices are skipped: "nvidia" would otherwise
+    match "NVIDIA High Definition Audio [Loopback]" (a monitor's speakers)."""
     for _idx, label in devices:
+        if "[loopback]" in label.lower():
+            continue
         if any(kw in label.lower() for kw in keywords):
             return label
     return None
@@ -591,6 +718,52 @@ def find_best_output_device(output_devices):
             if priority_kw in label.lower():
                 return label
     return None
+
+
+def open_loopback_keepalive(pa, loopback_info, attempts=3):
+    for attempt in range(attempts):
+        stream = _open_loopback_keepalive(pa, loopback_info, log_failure=attempt == attempts - 1)
+        if stream is not None:
+            return stream
+        time.sleep(0.2)
+    return None
+
+
+def _open_loopback_keepalive(pa, loopback_info, log_failure=True):
+    """WASAPI loopback delivers no data while nothing is playing, so a blocking
+    read() would hang. Playing silence to the same render device keeps the
+    loopback stream ticking. Returns the stream (caller closes it) or None."""
+    try:
+        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+        name   = loopback_info["name"].replace(" [Loopback]", "")
+        for i in range(pa.get_device_count()):
+            d = pa.get_device_info_by_index(i)
+            if (d["hostApi"] == wasapi and not d.get("isLoopbackDevice")
+                    and d["maxOutputChannels"] > 0 and d["name"] == name):
+                ch = min(2, int(d["maxOutputChannels"]))
+                silence_cb = lambda _in, frames, _t, _s: (b"\x00" * frames * 2 * ch,
+                                                          pyaudio.paContinue)
+                stream = pa.open(format=pyaudio.paInt16, channels=ch,
+                                 rate=int(d["defaultSampleRate"]), output=True,
+                                 output_device_index=i, stream_callback=silence_cb)
+                log_event(logging.INFO, "loopback_keepalive_opened",
+                          render_device=name, render_index=i)
+                return stream
+        log_event(logging.WARNING, "loopback_keepalive_device_not_found", name=name)
+    except Exception as e:
+        if log_failure:
+            log_exception("loopback_keepalive_failed", e)
+    return None
+
+
+def downmix(data: bytes, channels: int) -> bytes:
+    """Average all channels to mono (taking only the left channel loses audio
+    that is panned right or sent on the right channel only)."""
+    if channels <= 1:
+        return data
+    import numpy as np
+    arr = np.frombuffer(data, dtype=np.int16).reshape(-1, channels)
+    return arr.mean(axis=1).astype(np.int16).tobytes()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -697,11 +870,34 @@ class LoopbackOutputThread(threading.Thread):
 # Audio capture + VAD
 # ─────────────────────────────────────────────────────────────────────────────
 
+class LatestSlot:
+    """Single-item mailbox: put() overwrites, take() empties. Live previews
+    only matter if current, so a stale one is replaced rather than queued."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._item = None
+
+    def put(self, item):
+        with self._lock:
+            self._item = item
+
+    def take(self):
+        with self._lock:
+            item, self._item = self._item, None
+            return item
+
+
 class AudioCaptureThread(threading.Thread):
     def __init__(self, device_index, phrase_queue, status_cb, level_cb,
-                 loopback_out: "LoopbackOutputThread | None" = None):
+                 loopback_out: "LoopbackOutputThread | None" = None,
+                 partial_slot: "LatestSlot | None" = None,
+                 mute_evt: "threading.Event | None" = None):
         super().__init__(daemon=True, name="audio-capture")
         self.device_index      = device_index
+        self._keepalive        = None
+        self.is_loopback       = False
+        self.partial_slot      = partial_slot
+        self.mute_evt          = mute_evt   # set while our own TTS is audible on this device
         self.phrase_queue      = phrase_queue
         self.status_cb         = status_cb
         self.level_cb          = level_cb
@@ -716,26 +912,48 @@ class AudioCaptureThread(threading.Thread):
     def stop(self):
         self._stop_evt.set()
 
-    def _flush(self, buf, label="Phrase", resample=None):
-        min_c = int(MIN_PHRASE_SEC * SAMPLE_RATE / CHUNK_SAMPLES)
+    def _flush(self, seq, buf, min_c, label="Phrase", resample=None):
+        # Always emit, even an empty payload, so the UI can clear the live
+        # preview line for this phrase.
+        payload = b""
         if len(buf) >= min_c:
             raw     = b"".join(buf)
             payload = resample(raw) if resample else raw
-            try:
-                self.phrase_queue.put(payload, timeout=0.25)
-                backlog = self.phrase_queue.qsize()
-                log_event(logging.INFO, "phrase_flushed",
-                          reason=label, bytes=len(payload),
-                          chunks=len(buf), queue_backlog=backlog)
-                if backlog >= PHRASE_QUEUE_BACKLOG_WARN:
-                    log_event(logging.WARNING, "phrase_queue_backlog_high", backlog=backlog)
-            except queue.Full:
-                log_event(logging.WARNING, "phrase_dropped_queue_full",
-                          reason=label, bytes=len(payload), chunks=len(buf))
+        try:
+            self.phrase_queue.put((seq, payload), timeout=0.25)
+            backlog = self.phrase_queue.qsize()
+            log_event(logging.INFO, "phrase_flushed",
+                      reason=label, seq=seq, bytes=len(payload),
+                      chunks=len(buf), queue_backlog=backlog)
+            if backlog >= PHRASE_QUEUE_BACKLOG_WARN:
+                log_event(logging.WARNING, "phrase_queue_backlog_high", backlog=backlog)
+        except queue.Full:
+            log_event(logging.WARNING, "phrase_dropped_queue_full",
+                      reason=label, bytes=len(payload), chunks=len(buf))
 
     def run(self):
         pa     = pyaudio.PyAudio()
+        try:
+            self._run(pa)
+        finally:
+            if self._keepalive is not None:
+                try:
+                    self._keepalive.close()
+                except Exception:
+                    pass
+            pa.terminate()
+
+    def _run(self, pa):
         stream = None
+        self._keepalive = None
+        try:
+            dev_info = (pa.get_device_info_by_index(self.device_index)
+                        if self.device_index is not None and self.device_index >= 0 else {})
+        except Exception:
+            dev_info = {}
+        self.is_loopback = bool(dev_info.get("isLoopbackDevice"))
+        if self.is_loopback:
+            self._keepalive = open_loopback_keepalive(pa, dev_info)
         # ── Open stream at the device's native sample rate ────────────────────
         # PortAudio on Windows will refuse to open a VB-Audio virtual cable
         # at 16000 Hz if the device is configured for 44100/48000 Hz in the
@@ -823,9 +1041,7 @@ class AudioCaptureThread(threading.Thread):
             try:
                 data = stream.read(chunk_sz, exception_on_overflow=False)
                 if in_channels > 1:
-                    import array
-                    arr = array.array('h', data)
-                    data = arr[0::in_channels].tobytes()
+                    data = downmix(data, in_channels)
                 cal.append(rms(data))
             except Exception:
                 pass
@@ -844,11 +1060,21 @@ class AudioCaptureThread(threading.Thread):
             log_event(logging.WARNING, "audio_calibration_empty",
                       threshold=self.energy_threshold, open_rate=open_rate)
 
-        sil_c    = int(SILENCE_SEC      * open_rate / chunk_sz)
-        stream_c = int(STREAM_CHUNK_SEC * open_rate / chunk_sz)
-        max_c    = int(MAX_PHRASE_SEC   * open_rate / chunk_sz)
+        per_sec   = open_rate / chunk_sz
+        sil_c     = max(1, int(SILENCE_SEC * per_sec))
+        max_c     = int(MAX_PHRASE_SEC * per_sec)
+        cut_win   = int(CUT_SEARCH_SEC * per_sec)
+        partial_c = max(1, int(PARTIAL_INTERVAL_SEC * per_sec))
+        min_c     = max(1, int(MIN_PHRASE_SEC * per_sec))
+        pmin_c    = max(1, int(PARTIAL_MIN_SEC * per_sec))
 
-        buf, sil_count, in_speech, chunk_timer = [], 0, False, 0
+        buf, levels  = [], []
+        sil_count    = 0
+        in_speech    = False
+        since_prev   = 0
+        speech_level = 0.0
+        seq          = 0
+        silence      = bytes(chunk_sz * SAMPLE_WIDTH)
 
         # ── Resampler: captured at open_rate; Whisper needs SAMPLE_RATE (16 kHz)
         if open_rate != SAMPLE_RATE:
@@ -880,13 +1106,16 @@ class AudioCaptureThread(threading.Thread):
             try:
                 data = stream.read(chunk_sz, exception_on_overflow=False)
                 if in_channels > 1:
-                    import array
-                    arr = array.array('h', data)
-                    data = arr[0::in_channels].tobytes()
+                    data = downmix(data, in_channels)
             except Exception as e:
                 log_exception("audio_stream_read_failed", e)
                 time.sleep(0.01)
                 continue
+
+            # Our own text-to-speech playing on the captured device must not
+            # be transcribed as the friend speaking.
+            if self.mute_evt is not None and self.mute_evt.is_set():
+                data = silence[:len(data)]
 
             # ── Feed raw audio to loopback so headphones receive it ──────
             if self.loopback_out is not None:
@@ -896,36 +1125,71 @@ class AudioCaptureThread(threading.Thread):
             threshold = self.energy_threshold * self._sensitivity_mult
             self.level_cb(level, threshold)
 
-            if level > threshold:
+            if in_speech:
+                loud = level > max(threshold, PAUSE_RATIO * speech_level)
+            else:
+                loud = level > threshold
+            if loud:
                 if not in_speech:
-                    in_speech   = True
-                    chunk_timer = 0
+                    in_speech, speech_level = True, level
                     self.status_cb("🎙 Speech…")
-                buf.append(data)
-                sil_count    = 0
-                chunk_timer += 1
-                if chunk_timer >= stream_c:
-                    self._flush(buf, "mid", _resample)
-                    buf, chunk_timer = [], 0
-                elif len(buf) >= max_c:
-                    self._flush(buf, "max", _resample)
-                    buf, chunk_timer = [], 0
+                speech_level = 0.95 * speech_level + 0.05 * level
+                sil_count = 0
             elif in_speech:
-                sil_count   += 1
-                chunk_timer += 1
-                buf.append(data)
-                if sil_count >= sil_c:
-                    self._flush(buf, "end", _resample)
-                    buf, sil_count, chunk_timer, in_speech = [], 0, 0, False
+                sil_count += 1
+            if not in_speech:
+                continue
+
+            buf.append(data)
+            levels.append(level)
+            since_prev += 1
+            if sil_count >= sil_c:
+                self._flush(seq, buf, min_c, "end", _resample)
+                seq += 1
+                buf, levels, sil_count, since_prev, in_speech = [], [], 0, 0, False
+            elif len(buf) >= max_c:
+                # Cut at the quietest chunk (likely a word gap) near the end,
+                # carrying the remainder into the next phrase.
+                start = len(levels) - cut_win
+                cut   = start + min(range(cut_win), key=lambda i: levels[start + i])
+                self._flush(seq, buf[:cut + 1], min_c, "max", _resample)
+                seq += 1
+                buf, levels = buf[cut + 1:], levels[cut + 1:]
+                since_prev  = len(buf)
+            elif (since_prev >= partial_c and len(buf) >= pmin_c
+                    and self.partial_slot is not None):
+                self.partial_slot.put((seq, _resample(b"".join(buf))))
+                since_prev = 0
 
         if buf:
-            self._flush(buf, "final", _resample)
-        try:
-            if stream is not None:
-                stream.close()
-        finally:
-            pa.terminate()
+            self._flush(seq, buf, min_c, "final", _resample)
+        if stream is not None:
+            stream.close()
         log_event(logging.INFO, "audio_capture_stopped", open_rate=open_rate)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persisted user settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log_exception("settings_load_failed", e, path=str(SETTINGS_PATH))
+        return {}
+
+
+def save_settings(**changes):
+    settings = load_settings()
+    settings.update(changes)
+    try:
+        SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    except Exception as e:
+        log_exception("settings_save_failed", e, path=str(SETTINGS_PATH))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -952,19 +1216,28 @@ class WhisperModelLoader(threading.Thread):
         self.status_cb(f"Loading Whisper '{model_size}' on {label}…")
         t0    = time.perf_counter()
         
-        # Prevent openmp thread explosion on CPU by limiting threads per worker
+        # INFERENCE_LOCK serialises inference, so a second worker only adds
+        # contention. One worker gets every physical core instead (logical
+        # count / 2 on SMT CPUs; hyperthreads slow CTranslate2 down). On GPU the
+        # CPU threads still run feature extraction and VAD.
         kwargs = dict(device=device, compute_type=compute_type)
-        if device == "cpu":
-            import os
-            cores = os.cpu_count() or 4
-            # If we have 2 workers, give each worker half the cores
-            kwargs["cpu_threads"] = max(1, cores // 2)
+        cores = os.cpu_count() or 4
+        kwargs["cpu_threads"] = max(1, cores // 2 if cores > 4 else cores)
             
+        try:
+            from faster_whisper.utils import download_model
+            download_model(model_size, local_files_only=True)
+        except Exception:
+            self.status_cb(f"Downloading Whisper '{model_size}' (first time only, "
+                           f"can take a few minutes)…")
+            log_event(logging.INFO, "whisper_model_download_started", model_size=model_size)
         model = WhisperModel(model_size, **kwargs)
         self.status_cb("Pre-warming model…")
         import numpy as np
         dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        list(model.transcribe(dummy, language="en", beam_size=1,
+        # One token is enough to warm the encoder and decoder; letting it
+        # decode freely on silence wastes seconds generating junk.
+        list(model.transcribe(dummy, language="en", beam_size=1, max_new_tokens=1,
                                vad_filter=False, without_timestamps=True)[0])
         return model, round((time.perf_counter() - t0) * 1000, 2)
 
@@ -990,7 +1263,7 @@ class WhisperModelLoader(threading.Thread):
                 self.model_size    = fb_size
                 self.active_device = "cpu"
                 self.active_compute_type = "int8"
-                self.worker_count  = 2
+                self.worker_count  = 1
                 self.default_model_key = DEFAULT_MODEL_CPU
                 self.used_fallback = True
                 self.status_cb(f"✔ Whisper '{fb_size}' ready on CPU (fallback).")
@@ -1011,9 +1284,130 @@ class WhisperModelLoader(threading.Thread):
 # Transcription worker
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Whisper's stock outputs on silence/noise (learned from YouTube captions).
+HALLUCINATIONS = {
+    "thank you", "thanks", "thank you very much", "thanks for watching",
+    "thank you for watching", "please subscribe", "subscribe", "you", "bye",
+    "hmm", "um", "uh", "oh", "so",
+}
+
+
+def is_hallucination(text: str) -> bool:
+    core = "".join(ch for ch in text.lower() if ch.isalnum() or ch == " ").strip()
+    return not core or " ".join(core.split()) in HALLUCINATIONS
+
+
+def plain_device_name(label: str) -> str:
+    """'🔊 Speakers (FiiO Q series) [Loopback]' -> 'Speakers (FiiO Q series)'."""
+    import re
+    return re.sub(r"^[^\w(]+", "", label).replace(" [Loopback]", "").strip()
+
+
+class Speaker(threading.Thread):
+    """Text-to-speech via Windows SAPI, owned by one thread (COM objects are
+    apartment-bound). Speech is asynchronous, so stop() purges it instantly,
+    unlike pyttsx3's blocking runAndWait(). `speaking` is set while audio is
+    playing so the capture thread can ignore our own voice."""
+    SVSF_ASYNC, SVSF_PURGE = 1, 2
+    HANGOVER_SEC = 0.4   # loopback capture lags playback slightly
+
+    def __init__(self):
+        super().__init__(daemon=True, name="tts")
+        self._cmds    = queue.Queue()
+        self.speaking = threading.Event()
+        self.ready    = threading.Event()
+        self.error    = None
+
+    def configure(self, output_label: str, language: str):
+        self._cmds.put(("config", output_label, language))
+
+    def say(self, text: str):
+        self._cmds.put(("say", text))
+
+    def stop_speech(self):
+        self._cmds.put(("stop",))
+
+    def shutdown(self):
+        self._cmds.put(("quit",))
+
+    def _configure(self, voice, output_label, language):
+        want_out = plain_device_name(output_label).lower()
+        outputs  = voice.GetAudioOutputs()
+        for i in range(outputs.Count):
+            tok = outputs.Item(i)
+            if tok.GetDescription().lower() == want_out:
+                voice.AudioOutput = tok
+                break
+        voices = voice.GetVoices()
+        chosen = None
+        for i in range(voices.Count):
+            tok = voices.Item(i)
+            if language.lower() in tok.GetDescription().lower():
+                chosen = tok
+                break
+        if chosen is not None:
+            voice.Voice = chosen
+        log_event(logging.INFO, "tts_configured", output=want_out, language=language,
+                  voice=chosen.GetDescription() if chosen else None)
+        if chosen is None:
+            return f"No {language} text-to-speech voice installed (Windows Settings → Speech)."
+        return None
+
+    def run(self):
+        try:
+            import comtypes
+            import comtypes.client
+            comtypes.CoInitialize()
+            voice = comtypes.client.CreateObject("SAPI.SpVoice")
+        except Exception as e:
+            self.error = str(e)
+            log_exception("tts_init_failed", e)
+            self.ready.set()
+            return
+        self.ready.set()
+        quiet_since = None
+        while True:
+            try:
+                cmd = self._cmds.get(timeout=0.05)
+            except queue.Empty:
+                cmd = None
+            try:
+                if cmd is None:
+                    pass
+                elif cmd[0] == "quit":
+                    voice.Speak("", self.SVSF_ASYNC | self.SVSF_PURGE)
+                    break
+                elif cmd[0] == "stop":
+                    voice.Speak("", self.SVSF_ASYNC | self.SVSF_PURGE)
+                elif cmd[0] == "say":
+                    voice.Speak(cmd[1], self.SVSF_ASYNC)
+                    self.speaking.set()
+                elif cmd[0] == "config":
+                    self.error = self._configure(voice, cmd[1], cmd[2])
+                # RunningState 2 = SRSEIsSpeaking
+                if voice.Status.RunningState == 2:
+                    self.speaking.set()
+                    quiet_since = None
+                elif self.speaking.is_set():
+                    quiet_since = quiet_since or time.monotonic()
+                    if time.monotonic() - quiet_since > self.HANGOVER_SEC:
+                        self.speaking.clear()
+            except Exception as e:
+                log_exception("tts_command_failed", e, command=cmd[0] if cmd else None)
+        self.speaking.clear()
+
+
 class TranscriptionWorker(threading.Thread):
+    """Finished phrases (phrase_queue) always take priority; live previews
+    (partial_slot) only run when the model would otherwise sit idle.
+
+    When the target is English, Whisper translates directly (task="translate")
+    on the GPU: no network round trip, no rate limits, and it makes live
+    previews of the *translation* cheap enough to show while the friend talks.
+    """
     def __init__(self, wid, model, src_whisper, src_lang_key, tgt_lang_key,
-                 phrase_queue, result_queue, status_cb):
+                 phrase_queue, result_queue, status_cb,
+                 partial_slot: "LatestSlot | None" = None):
         super().__init__(daemon=True, name=f"transcription-worker-{wid}")
         self.wid          = wid
         self.model        = model
@@ -1024,54 +1418,138 @@ class TranscriptionWorker(threading.Thread):
         self.phrase_queue = phrase_queue
         self.result_queue = result_queue
         self.status_cb    = status_cb
+        self.partial_slot = partial_slot
         self._stop_evt    = threading.Event()
+        tgt_code          = LANGUAGES.get(tgt_lang_key, ("en", "en"))[0]
+        self.local_translate = tgt_code == "en" and src_whisper != "en"
+        self._last_final  = -1
+        self._last_preview = None
 
     def stop(self):
         self._stop_evt.set()
         self.phrase_queue.put(None)
 
+    NO_SPEECH_PROB = 0.6
+
+    def _prepare(self):
+        """Prompt tokens and VAD options, built once per worker."""
+        from faster_whisper.vad import VadOptions
+        tok = self.model.hf_tokenizer
+        ids = lambda t: tok.token_to_id(t)
+        head = [ids("<|startoftranscript|>"), ids(f"<|{self.src_whisper}|>")]
+        tail = [ids("<|notimestamps|>")]
+        self._prompts = {"transcribe": head + [ids("<|transcribe|>")] + tail,
+                         "translate":  head + [ids("<|translate|>")] + tail}
+        self._tokenizer = tok
+        self._vad_opts  = VadOptions(min_silence_duration_ms=300, speech_pad_ms=200)
+        self._n_frames  = self.model.feature_extractor.nb_max_frames
+
+    def _decode(self, audio_np, tasks):
+        """Return one text per task. VAD runs once (CPU); the GPU then encodes
+        and decodes all tasks as a single batch, which costs little more than
+        one task because Whisper's encoder always processes a padded 30 s
+        window."""
+        import numpy as np
+        import ctranslate2
+        from faster_whisper.vad import get_speech_timestamps
+        stamps = get_speech_timestamps(audio_np, self._vad_opts)
+        if not stamps:
+            return ["" for _ in tasks], 0.0
+        audio_np = audio_np[stamps[0]["start"]:stamps[-1]["end"]]
+        feats = self.model.feature_extractor(audio_np)[:, :self._n_frames]
+        if feats.shape[1] < self._n_frames:
+            feats = np.pad(feats, ((0, 0), (0, self._n_frames - feats.shape[1])))
+        batch = ctranslate2.StorageView.from_array(
+            np.ascontiguousarray(np.stack([feats] * len(tasks)), dtype=np.float32))
+        lock_t0 = time.perf_counter()
+        with self.model_lock:
+            lock_wait_ms = round((time.perf_counter() - lock_t0) * 1000, 2)
+            enc = self.model.model.encode(batch, to_cpu=False)
+            results = self.model.model.generate(
+                enc, [self._prompts[t] for t in tasks],
+                beam_size=1, max_length=224, return_no_speech_prob=True,
+                suppress_blank=True)
+        texts = []
+        for r in results:
+            if r.no_speech_prob > self.NO_SPEECH_PROB:
+                texts.append("")
+            else:
+                texts.append(self._tokenizer.decode(r.sequences_ids[0]).strip())
+        return texts, lock_wait_ms
+
     def run(self):
         import numpy as np
+        self._prepare()
+        tasks = ["transcribe", "translate"] if self.local_translate else ["transcribe"]
         while not self._stop_evt.is_set():
             try:
-                audio_bytes = self.phrase_queue.get(timeout=0.3)
+                item = self.phrase_queue.get(timeout=0.01)
             except queue.Empty:
-                continue
-            if audio_bytes is None:
+                item = False
+            if item is None:
                 break
+            if item is False:
+                partial = self.partial_slot.take() if self.partial_slot else None
+                if partial and partial[0] > self._last_final:
+                    self._process_partial(*partial)
+                continue
+            seq, audio_bytes = item
+            self._last_final = seq
             t0 = time.perf_counter()
             try:
+                if not audio_bytes:
+                    self.result_queue.put(("final", (seq, "", "")))
+                    continue
                 audio_np = (np.frombuffer(audio_bytes, dtype=np.int16)
                             .astype(np.float32) / 32768.0)
-                lock_t0 = time.perf_counter()
-                with self.model_lock:
-                    lock_wait_ms = round((time.perf_counter() - lock_t0) * 1000, 2)
-                    segments, _ = self.model.transcribe(
-                        audio_np,
-                        language=self.src_whisper,
-                        task="transcribe",
-                        beam_size=1, best_of=1, temperature=0.0,
-                        vad_filter=False,
-                        condition_on_previous_text=False,
-                        without_timestamps=True,
-                    )
-                text       = " ".join(seg.text for seg in segments).strip()
+                texts, lock_wait_ms = self._decode(audio_np, tasks)
+                text       = texts[0]
+                translated = texts[1] if self.local_translate else None
+                if is_hallucination(text):
+                    log_event(logging.INFO, "transcription_discarded",
+                              worker_id=self.wid, text=text)
+                    text = ""
+                    translated = "" if self.local_translate else None
+                elif self.local_translate and is_hallucination(translated):
+                    translated = ""
                 elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
                 log_event(logging.INFO, "transcription_completed",
-                          worker_id=self.wid,
+                          worker_id=self.wid, seq=seq, tasks=len(tasks),
                           input_bytes=len(audio_bytes), text_chars=len(text),
                           elapsed_ms=elapsed_ms, lock_wait_ms=lock_wait_ms,
                           queue_backlog=self.phrase_queue.qsize())
                 self.result_queue.put(("metric", ("transcription_ms", elapsed_ms)))
                 self.result_queue.put(("metric", ("lock_wait_ms",     lock_wait_ms)))
-                if text:
-                    self.result_queue.put(("heard",     text))
-                    self.result_queue.put(("translate", (text, self.src_lang_key, self.tgt_lang_key)))
+                if self._stop_evt.is_set():
+                    break   # session restarted: don't leak into the new one
+                # translated None => the UI sends it for online translation
+                self.result_queue.put(("final", (seq, text, translated)))
             except Exception as e:
+                self.result_queue.put(("final", (seq, "", "")))
                 self.result_queue.put(("status", f"Worker {self.wid}: {e}"))
                 log_exception("transcription_failed", e,
                               worker_id=self.wid,
                               input_bytes=len(audio_bytes) if audio_bytes else 0)
+
+    def _process_partial(self, seq, audio_bytes):
+        import numpy as np
+        try:
+            audio_np = (np.frombuffer(audio_bytes, dtype=np.int16)
+                        .astype(np.float32) / 32768.0)
+            tasks = ["transcribe", "translate"] if self.local_translate else ["transcribe"]
+            t0 = time.perf_counter()
+            texts, _ = self._decode(audio_np, tasks)
+            heard = texts[0] if not is_hallucination(texts[0]) else ""
+            translated = (texts[1] if self.local_translate and heard
+                          and not is_hallucination(texts[1]) else None)
+            preview = (seq, heard, translated)
+            if heard and preview != self._last_preview and not self._stop_evt.is_set():
+                self._last_preview = preview
+                self.result_queue.put(("partial", preview))
+                self.result_queue.put(("metric", ("partial_ms",
+                                                  round((time.perf_counter() - t0) * 1000, 2))))
+        except Exception as e:
+            log_exception("partial_transcription_failed", e, worker_id=self.wid, seq=seq)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1104,18 +1582,19 @@ class InterpreterApp(ctk.CTk):
         self._model_loader        = None
         self._whisper_model       = None
         self.is_listening         = False
+        self._muted               = False
+        self._initialised         = False
         self._active_mode         = None
         self._start_retry_after_id = None
-        self._tts_lock            = threading.Lock()
-
         # ── TTS ───────────────────────────────────────────────────────────
-        self.tts = None
-        if _TTS_AVAILABLE:
-            try:
-                self.tts = pyttsx3.init()
-                log_event(logging.INFO, "tts_initialized")
-            except Exception as e:
-                log_exception("tts_init_failed", e)
+        self._tts_on   = False
+        self.speaker   = Speaker()
+        self.speaker.start()
+        # Live preview state: per text box, where the grey preview line starts
+        # and which phrase it belongs to.
+        self._live       = {}
+        self._mute_evt   = None
+        self._partial_slot = None
 
         # ── Audio devices ─────────────────────────────────────────────────
         self._input_devices, self._output_devices = get_audio_devices()
@@ -1126,18 +1605,28 @@ class InterpreterApp(ctk.CTk):
 
         nvidia_lbl  = find_device_by_keywords(self._input_devices,  NVIDIA_KEYWORDS)
         vb_lbl      = find_best_vb_input(self._input_devices)       # prefers CABLE-A
+        friend_lbl  = find_best_friend_input(self._input_devices)   # FiiO loopback > VB cable
         fiio_lbl    = find_best_output_device(self._output_devices)  # K7 > Q series etc.
         default_out = output_labels[0] if output_labels else ""
 
         self._mode_state = [
             [nvidia_lbl or (input_labels[0] if input_labels else ""), "English", "Russian"],
-            [vb_lbl     or (input_labels[0] if input_labels else ""), "Russian", "English"],
+            [friend_lbl or (input_labels[0] if input_labels else ""), "Russian", "English"],
         ]
+        saved_devices = load_settings().get("mode_devices", [])
+        for i, lbl in enumerate(saved_devices[:2]):
+            if lbl in self._input_map:
+                self._mode_state[i][0] = lbl
 
         self.device_var     = ctk.StringVar(value=self._mode_state[0][0])
         self.out_device_var = ctk.StringVar(value=fiio_lbl or default_out)
-        self.loopback_var   = ctk.BooleanVar(value=bool(vb_lbl))
-        self.model_var      = ctk.StringVar(value=_DEFAULT_MODEL)
+        # Replaying audio is only for VB-Audio cables; with a [Loopback]
+        # input the audio is already playing on the device.
+        self.loopback_var   = ctk.BooleanVar(
+            value=bool(vb_lbl) and "[loopback]" not in (friend_lbl or "").lower())
+        saved_model = load_settings().get("model")
+        self.model_var      = ctk.StringVar(
+            value=saved_model if saved_model in MODELS else _DEFAULT_MODEL)
         self.sensitivity_var = ctk.DoubleVar(value=DEFAULT_SENS)
         self.src_var        = ctk.StringVar(value="English")
         self.tgt_var        = ctk.StringVar(value="Russian")
@@ -1161,7 +1650,9 @@ class InterpreterApp(ctk.CTk):
                   input_device_count=len(input_labels),
                   output_device_count=len(output_labels))
         self._preload_model()
-        self.after(80,   self._poll_queue)
+        self._initialised = True
+        self._start_session()
+        self.after(30,   self._poll_queue)
         self.after(1000, self._refresh_diagnostics)
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -1178,10 +1669,12 @@ class InterpreterApp(ctk.CTk):
 
     def _reload_model_if_changed(self):
         log_event(logging.INFO, "whisper_model_reload_requested", selected_model=self.model_var.get())
+        save_settings(model=self.model_var.get())
         if self.is_listening:
-            self._stop_session()
+            self._stop_session(keep_mode=True)
         self._whisper_model = None
         self._preload_model()
+        self._restart_session()
 
     # ── Header ────────────────────────────────────────────────────────────
 
@@ -1260,6 +1753,9 @@ class InterpreterApp(ctk.CTk):
                       fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
                       text_color=("gray10", "gray90"),
                       command=self._refresh_devices).grid(row=0, column=1, padx=(8, 0))
+        ctk.CTkLabel(r0, text="🔊 = sound playing on an output device (e.g. FiiO in a call)",
+                     font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")
+                     ).grid(row=0, column=2, padx=(10, 0))
 
         # Audio output + loopback toggle
         ctk.CTkLabel(outer, text="Audio output:", width=140, anchor="w",
@@ -1267,11 +1763,13 @@ class InterpreterApp(ctk.CTk):
         r1 = ctk.CTkFrame(outer, fg_color="transparent")
         r1.grid(row=1, column=1, sticky="w")
         self.out_device_menu = ctk.CTkOptionMenu(
-            r1, variable=self.out_device_var, values=output_labels, width=260)
+            r1, variable=self.out_device_var, values=output_labels, width=260,
+            command=self._on_manual_device_change)
         self.out_device_menu.grid(row=0, column=0)
         self.loopback_chk = ctk.CTkCheckBox(
-            r1, text="Hear input through output  (loopback)",
-            variable=self.loopback_var, font=ctk.CTkFont(size=12))
+            r1, text="Hear input through output  (VB-Audio cables only)",
+            variable=self.loopback_var, font=ctk.CTkFont(size=12),
+            command=self._on_manual_device_change)
         self.loopback_chk.grid(row=0, column=1, padx=(16, 0))
 
         # Translate
@@ -1313,15 +1811,15 @@ class InterpreterApp(ctk.CTk):
         # Action buttons
         btns = ctk.CTkFrame(outer, fg_color="transparent")
         btns.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        self.start_btn = ctk.CTkButton(
-            btns, text="▶  Start Listening", width=165,
-            command=self._toggle_listening)
-        self.start_btn.grid(row=0, column=0, padx=(0, 8))
+        self.mute_btn = ctk.CTkButton(
+            btns, text="🔇  Mute", width=165,
+            command=self._toggle_mute)
+        self.mute_btn.grid(row=0, column=0, padx=(0, 8))
         self.tts_btn = ctk.CTkButton(
-            btns, text="🔊  Read Aloud", width=130,
+            btns, text="🔇  Speak: Off", width=130,
             fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
             text_color=("gray10", "gray90"),
-            command=self._speak_translation)
+            command=self._toggle_tts)
         self.tts_btn.grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(btns, text="Clear", width=70,
                       fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
@@ -1444,8 +1942,7 @@ class InterpreterApp(ctk.CTk):
         self._apply_mode(mode_idx, switch_source=True)
 
     def _apply_mode(self, mode_idx, switch_source=False):
-        was = self.is_listening
-        if was:
+        if self.is_listening:
             self._stop_session(keep_mode=True)
         self._active_mode = mode_idx
         device_lbl, src_lang, tgt_lang = self._mode_state[mode_idx]
@@ -1461,22 +1958,20 @@ class InterpreterApp(ctk.CTk):
                 btn.configure(fg_color=colours[i][0], hover_color=colours[i][1])
             else:
                 btn.configure(fg_color=COL_INACTIVE, hover_color=COL_IN_HOVER)
-        if was:
-            self._start_session()
+        if self._initialised:
+            self._restart_session()
 
     def _on_manual_device_change(self, _=None):
-        if self.is_listening:
-            self._stop_session()
+        self._restart_session()
 
     def _on_manual_lang_change(self, _=None):
         self.heard_label.configure(text=f"Heard in {self.src_var.get()}")
         self.translated_label.configure(text=f"Translation → {self.tgt_var.get()}")
-        if self.is_listening:
-            self._stop_session()
+        self._restart_session()
 
     def _refresh_devices(self):
         if self.is_listening:
-            self._stop_session()
+            self._stop_session(keep_mode=True)
         self._input_devices, self._output_devices = get_audio_devices()
         self._input_map  = {lbl: idx for idx, lbl in self._input_devices}
         self._output_map = {lbl: idx for idx, lbl in self._output_devices}
@@ -1489,29 +1984,43 @@ class InterpreterApp(ctk.CTk):
         if self.out_device_var.get() not in out_labels:
             self.out_device_var.set(out_labels[0] if out_labels else "")
         nvidia_lbl = find_device_by_keywords(self._input_devices, NVIDIA_KEYWORDS)
-        vb_lbl     = find_device_by_keywords(self._input_devices, VB_KEYWORDS)
-        if nvidia_lbl: self._mode_state[0][0] = nvidia_lbl
-        if vb_lbl:     self._mode_state[1][0] = vb_lbl
+        friend_lbl = find_best_friend_input(self._input_devices)
+        if self._mode_state[0][0] not in self._input_map and nvidia_lbl:
+            self._mode_state[0][0] = nvidia_lbl
+        if self._mode_state[1][0] not in self._input_map and friend_lbl:
+            self._mode_state[1][0] = friend_lbl
         self.status_var.set(f"Refreshed — {len(in_labels)} in / {len(out_labels)} out device(s).")
         log_event(logging.INFO, "audio_devices_refreshed",
                   input_count=len(in_labels), output_count=len(out_labels))
         self._refresh_diagnostics_once()
-
-    def _set_controls_state(self, state):
-        for w in (self.device_menu, self.out_device_menu, self.loopback_chk,
-                  self.src_menu, self.tgt_menu, self.model_menu, self.sens_slider):
-            w.configure(state=state)
+        self._restart_session()
 
     # ── Session start / stop ──────────────────────────────────────────────
+    # The app listens continuously; settings changes restart the session and
+    # Mute is the only way to stop it.
 
-    def _toggle_listening(self):
+    def _restart_session(self):
         if self.is_listening:
-            self._stop_session()
-        else:
+            self._stop_session(keep_mode=True)
+        if not self._muted:
             self._start_session()
 
+    def _toggle_mute(self):
+        self._muted = not self._muted
+        if self._muted:
+            self._stop_session()
+            self.mute_btn.configure(text="🎙  Unmute", fg_color=COL_STOP,
+                                    hover_color=COL_STOP_HOV)
+            self._set_live_status("MUTED", COL_ERR)
+            self.status_var.set("Muted — not listening.")
+        else:
+            self.mute_btn.configure(text="🔇  Mute", fg_color=["#3B8ED0", "#1F6AA5"],
+                                    hover_color=["#3281BC", "#1A5C8F"])
+            self._start_session()
+        log_event(logging.INFO, "mute_toggled", muted=self._muted)
+
     def _start_session(self):
-        if self.is_listening:
+        if self.is_listening or self._muted:
             return
         if self._model_loader and not self._model_loader.ready.is_set():
             self.status_var.set("⏳ Loading Whisper model — please wait…")
@@ -1536,23 +2045,34 @@ class InterpreterApp(ctk.CTk):
             return
 
         self.is_listening = True
-        self.start_btn.configure(text="⏹  Stop Listening",
-                                 fg_color=COL_STOP, hover_color=COL_STOP_HOV)
         self._set_live_status("LISTENING", COL_OK)
-        self._set_controls_state("disabled")
+        self.status_var.set("Listening…")
 
         in_idx = self._input_map.get(self.device_var.get(), -1)
         if in_idx == -1:
             in_idx = None
         log_event(logging.INFO, "audio_device_selected",
                   device_label=self.device_var.get(), device_index=in_idx)
+        if self._active_mode is not None:
+            self._mode_state[self._active_mode][0] = self.device_var.get()
+        save_settings(mode_devices=[m[0] for m in self._mode_state])
+        capturing_output = "[loopback]" in self.device_var.get().lower()
 
         src_key     = self.src_var.get()
         tgt_key     = self.tgt_var.get()
         src_whisper, _ = LANGUAGES.get(src_key, ("en", "en"))
 
         worker_count = getattr(self._model_loader, "worker_count", NUM_WORKERS)
-        self.phrase_queue = queue.Queue(maxsize=max(worker_count * 4, 8))
+        self.phrase_queue  = queue.Queue(maxsize=max(worker_count * 4, 8))
+        self._partial_slot = LatestSlot()
+        self._live         = {}
+        # Spoken translations played on the device we're capturing would be
+        # heard as the friend; mute capture while the speaker is talking.
+        same_device = (capturing_output and plain_device_name(self.device_var.get())
+                       == plain_device_name(self.out_device_var.get()))
+        self._mute_evt = self.speaker.speaking if same_device else None
+        if self._tts_on:
+            self._configure_speaker()
 
         # ── Optional loopback output (VB-Audio → Fiio headphones) ────────
         # Look up the native sample rate of the input device so the loopback
@@ -1562,7 +2082,12 @@ class InterpreterApp(ctk.CTk):
         if _pa_tmp:
             _pa_tmp.terminate()
         self._loopback_out = None
-        if self.loopback_var.get():
+        if self.loopback_var.get() and capturing_output:
+            # The audio is already playing on that device; replaying it would
+            # double it up (or feed back if it's the same device).
+            log_event(logging.INFO, "loopback_skipped_output_capture",
+                      device_label=self.device_var.get())
+        elif self.loopback_var.get():
             out_lbl = self.out_device_var.get()
             out_idx = self._output_map.get(out_lbl, -1)
             if out_idx == -1:
@@ -1576,12 +2101,20 @@ class InterpreterApp(ctk.CTk):
                       output_label=out_lbl, output_index=out_idx,
                       input_native_rate=in_native_rate)
 
+        # Opening a new PortAudio instance while the previous capture thread is
+        # still terminating its own fails with "Unanticipated host error".
+        prev = getattr(self, "_stopping_capture", None)
+        if prev is not None and prev.is_alive():
+            prev.join(timeout=1.0)
+        self._stopping_capture = None
         self._capture_thr = AudioCaptureThread(
             device_index=in_idx,
             phrase_queue=self.phrase_queue,
             status_cb=lambda m: self.result_queue.put(("status", m)),
             level_cb=self._on_level,
             loopback_out=self._loopback_out,
+            partial_slot=self._partial_slot,
+            mute_evt=self._mute_evt,
         )
         self._capture_thr.set_sensitivity(round(self.sensitivity_var.get(), 2))
         self._capture_thr.start()
@@ -1602,7 +2135,8 @@ class InterpreterApp(ctk.CTk):
                 src_lang_key=src_key, tgt_lang_key=tgt_key,
                 phrase_queue=self.phrase_queue,
                 result_queue=self.result_queue,
-                status_cb=lambda m: self.result_queue.put(("status", m)))
+                status_cb=lambda m: self.result_queue.put(("status", m)),
+                partial_slot=self._partial_slot)
             w.start()
             self._workers.append(w)
 
@@ -1629,6 +2163,7 @@ class InterpreterApp(ctk.CTk):
             self._start_retry_after_id = None
         if self._capture_thr:
             self._capture_thr.stop()
+            self._stopping_capture = self._capture_thr
             self._capture_thr = None
         if self._loopback_out:
             self._loopback_out.stop()
@@ -1639,10 +2174,6 @@ class InterpreterApp(ctk.CTk):
         for tw in self._translation_workers:
             tw.stop()
         self._translation_workers = []
-        self.start_btn.configure(text="▶  Start Listening",
-                                 fg_color=["#3B8ED0", "#1F6AA5"],
-                                 hover_color=["#3281BC", "#1A5C8F"])
-        self._set_controls_state("normal")
         self.level_bar.set(0)
         self.level_text.configure(text="—")
         self._set_live_status("IDLE", COL_WARN)
@@ -1653,47 +2184,34 @@ class InterpreterApp(ctk.CTk):
 
     # ── TTS — fixed: lock prevents "run loop already started" ────────────
 
-    def _speak_translation(self):
-        text = self.translated_box.get("1.0", "end-1c").strip()
-        if not text:
-            self.status_var.set("Nothing to read aloud.")
+    def _toggle_tts(self):
+        """On: each new translation is spoken as it arrives, through the
+        selected Audio output device. Off: speech stops immediately."""
+        if self.speaker.error and not self.speaker.is_alive():
+            self.status_var.set(f"Text-to-speech unavailable: {self.speaker.error}")
             return
-        if not self.tts:
-            self.status_var.set("TTS engine not available.")
-            log_event(logging.WARNING, "tts_unavailable")
-            return
-        if not self._tts_lock.acquire(blocking=False):
-            self.status_var.set("Read Aloud already running — please wait.")
-            return
-        self.tts_btn.configure(state="disabled")
+        self._tts_on = not self._tts_on
+        if self._tts_on:
+            self._configure_speaker()
+            self.tts_btn.configure(text="🔊  Speak: On", fg_color=COL_OK,
+                                   hover_color=COL_MY_HOVER, text_color="white")
+        else:
+            self.speaker.stop_speech()
+            self.tts_btn.configure(text="🔇  Speak: Off", fg_color=("gray75", "gray30"),
+                                   hover_color=("gray65", "gray40"),
+                                   text_color=("gray10", "gray90"))
+        log_event(logging.INFO, "tts_toggled", enabled=self._tts_on)
 
-        def _run():
-            try:
-                self.tts.say(text)
-                self.tts.runAndWait()
-                log_event(logging.INFO, "tts_completed", text_chars=len(text))
-            except RuntimeError:
-                # Engine was busy; reinitialise for next call
-                try:
-                    self.tts = pyttsx3.init()
-                    log_event(logging.WARNING, "tts_engine_reinitialised")
-                except Exception as e2:
-                    log_exception("tts_reinit_failed", e2)
-            except Exception as e:
-                log_exception("tts_run_failed", e, text_chars=len(text))
-            finally:
-                self._tts_lock.release()
-                self.after(0, lambda: self.tts_btn.configure(state="normal"))
-
-        threading.Thread(target=_run, daemon=True, name="tts-worker").start()
+    def _configure_speaker(self):
+        self.speaker.configure(self.out_device_var.get(), self.tgt_var.get())
+        self.after(300, lambda: self.speaker.error and self.status_var.set(self.speaker.error))
 
     # ── Clear ─────────────────────────────────────────────────────────────
 
     def _clear(self):
-        if self.is_listening:
-            self._stop_session()
         self.heard_box.delete("1.0", "end")
         self.translated_box.delete("1.0", "end")
+        self._live = {}
         self.status_var.set("Cleared.")
         log_event(logging.INFO, "ui_cleared")
 
@@ -1712,13 +2230,25 @@ class InterpreterApp(ctk.CTk):
         try:
             while True:
                 kind, data = self.result_queue.get_nowait()
-                if kind == "heard":
-                    self._append(self.heard_box, data)
-                    self._trim_textbox(self.heard_box)
+                if kind == "partial":
+                    seq, heard, translated = data
+                    self._set_live(self.heard_box, seq, heard)
+                    if translated:
+                        self._set_live(self.translated_box, seq, translated)
+                elif kind == "final":
+                    seq, text, translated = data
+                    self._commit(self.heard_box, seq, text)
+                    if translated is not None:
+                        self._commit_translation(seq, translated)
+                    elif text:
+                        self.result_queue.put(("translate", (seq, text, self.src_var.get(),
+                                                             self.tgt_var.get())))
+                    else:
+                        self._commit(self.translated_box, seq, "")
                 elif kind == "translate":
-                    text, sk, tk = data
+                    seq, text, sk, tk = data
                     try:
-                        self._translation_queue.put((text, sk, tk), timeout=0.1)
+                        self._translation_queue.put((seq, text, sk, tk), timeout=0.1)
                         backlog = self._translation_queue.qsize()
                         log_event(logging.INFO, "translation_queued",
                                   input_chars=len(text), src_lang=sk, tgt_lang=tk,
@@ -1730,9 +2260,8 @@ class InterpreterApp(ctk.CTk):
                         log_event(logging.WARNING, "translation_dropped_queue_full",
                                   input_chars=len(text), src_lang=sk, tgt_lang=tk)
                 elif kind == "translated":
-                    self._append(self.translated_box, data)
-                    self._trim_textbox(self.translated_box)
-                    self.status_var.set("Listening…" if self.is_listening else "Done.")
+                    seq, text = data
+                    self._commit_translation(seq, text)
                 elif kind == "status":
                     self.status_var.set(data)
                     log_event(logging.INFO, "status_updated", status=data)
@@ -1742,7 +2271,7 @@ class InterpreterApp(ctk.CTk):
                     self._update_metric(*data)
         except queue.Empty:
             pass
-        self.after(80, self._poll_queue)
+        self.after(30, self._poll_queue)
 
     def _update_metric(self, name, value):
         if name == "transcription_ms":
@@ -1852,6 +2381,44 @@ class InterpreterApp(ctk.CTk):
         if len(text) > MAX_TEXT_HISTORY_CHARS:
             box.delete("1.0", f"1.0 + {len(text) - MAX_TEXT_HISTORY_CHARS} chars")
 
+    def _set_live(self, box, seq, text):
+        """Show (or replace) the grey in-progress line for phrase `seq`."""
+        start, live_seq = self._live.get(box, (None, None))
+        if live_seq is not None and seq < live_seq:
+            return
+        if start is not None:
+            box.delete(start, "end")
+        else:
+            start = box.index("end-1c")
+        prefix = "\n" if box.get("1.0", start).strip() else ""
+        box.insert(start, prefix + "… " + text, "live")
+        box.tag_config("live", foreground="gray55")
+        box.see("end")
+        self._live[box] = (start, seq)
+
+    def _commit(self, box, seq, text):
+        """Replace the live line (if it belongs to `seq` or earlier) with the
+        final text."""
+        start, live_seq = self._live.get(box, (None, None))
+        if start is not None and live_seq <= seq:
+            box.delete(start, "end")
+            self._live.pop(box, None)
+        if text:
+            if box in self._live:      # a newer phrase is previewing: insert before it
+                start, live_seq = self._live[box]
+                prefix = "\n" if box.get("1.0", start).strip() else ""
+                box.insert(start, prefix + text)
+                self._live[box] = (box.index(f"{start} + {len(prefix + text)} chars"), live_seq)
+            else:
+                self._append(box, text)
+                self._trim_textbox(box)
+
+    def _commit_translation(self, seq, text):
+        self._commit(self.translated_box, seq, text)
+        if text and self._tts_on and not text.startswith("[translation failed"):
+            self.speaker.say(text)
+        self.status_var.set("Listening…" if self.is_listening else "Done.")
+
     @staticmethod
     def _append(box, text):
         cur = box.get("1.0", "end-1c")
@@ -1863,6 +2430,7 @@ class InterpreterApp(ctk.CTk):
             if self.is_listening:
                 self._stop_session()
             log_event(logging.INFO, "app_closing", session_id=self.session_id)
+            self.speaker.shutdown()
         finally:
             self.destroy()
 

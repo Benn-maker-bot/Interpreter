@@ -13,4 +13,5 @@ dist/
 *.jsonl
 *.jsonl.*.gz
 interpreter.log.summary.json
+interpreter.settings.json
 logs/

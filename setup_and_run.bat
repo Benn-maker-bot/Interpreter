@@ -19,15 +19,7 @@ echo [OK] Python found.
 echo.
 
 echo Installing core packages...
-pip install customtkinter pyttsx3 pyaudio numpy requests deep-translator --quiet
-if errorlevel 1 (
-    echo PyAudio failed, trying fallback...
-    pip install pipwin --quiet
-    pipwin install pyaudio --quiet
-)
-
-echo Installing faster-whisper...
-pip install faster-whisper --quiet
+pip install -r requirements.txt --quiet
 
 echo.
 echo Checking for NVIDIA GPU...
@@ -36,7 +28,7 @@ python -c "import ctranslate2; n=ctranslate2.get_cuda_device_count(); print('[GP
 echo.
 echo [OK] Setup complete. Starting Voice Interpreter...
 echo.
-echo Log file will be created at: interpreter_debug.jsonl
+echo Log file will be created at: interpreter.log.jsonl
 echo.
 python interpreter.py
 pause

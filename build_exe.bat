@@ -12,7 +12,7 @@ pause
 
 echo.
 echo [1/3] Installing dependencies...
-pip install customtkinter deep-translator pyttsx3 pyaudio numpy faster-whisper pyinstaller --quiet
+pip install -r requirements.txt --quiet
 
 echo.
 echo [2/3] Building executable...
@@ -23,9 +23,10 @@ pyinstaller ^
   --collect-all customtkinter ^
   --collect-all faster_whisper ^
   --collect-all ctranslate2 ^
-  --hidden-import pyttsx3.drivers ^
-  --hidden-import pyttsx3.drivers.sapi5 ^
-  --hidden-import pyaudio ^
+  --hidden-import comtypes.client ^
+  --hidden-import pyaudiowpatch ^
+  --collect-binaries nvidia.cublas ^
+  --collect-binaries nvidia.cudnn ^
   --hidden-import numpy ^
   interpreter.py
 
