@@ -24,6 +24,7 @@ pyinstaller ^
   --collect-all faster_whisper ^
   --collect-all ctranslate2 ^
   --hidden-import comtypes.client ^
+  --hidden-import sentencepiece ^
   --hidden-import pyaudiowpatch ^
   --collect-binaries nvidia.cublas ^
   --collect-binaries nvidia.cudnn ^

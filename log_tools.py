@@ -93,7 +93,16 @@ def build_report(since=None):
 
     out.append("\nFinished phrases (speech -> final text)")
     out.append(f"  phrases: {len(tr)}   cut reasons: {dict(Counter(col(tr, 'reason')))}   "
-               f"models: {dict(Counter(col(tr, 'model')))}")
+               f"models: {dict(Counter(col(tr, 'model')))}   "
+               f"translation: {dict(Counter(col(tr, 'translation_engine')))}")
+    out.append(_row("local translation (Opus-MT)", [r.get("mt_ms") for r in tr if r.get("mt_ms")]))
+    out.append(f"  suspicious results: {sum(bool(r.get('suspicious')) for r in tr)}   "
+               f"retried: {sum(bool(r.get('retry')) for r in tr)}   "
+               f"retry used: {sum(bool((r.get('retry') or {}).get('used')) for r in tr)}   "
+               f"still suspicious: {sum(bool(r.get('still_suspicious')) for r in tr)}   "
+               f"context resets: {sum(bool(r.get('context_reset')) for r in tr)}   "
+               f"no-speech drops: {sum(bool(r.get('dropped_text')) for r in tr)}")
+    out.append(_row("retry cost", [(r.get("retry") or {}).get("ms") for r in tr if r.get("retry")]))
     for label, vals, unit in [
             ("audio length", [x * 1000 if x else None for x in col(tr, "audio_sec")], "ms"),
             ("speech start -> phrase end", col(tr, "capture_ms"), "ms"),
@@ -167,6 +176,9 @@ def build_report(since=None):
         flags.append("More previews skipped than processed: preview model can't keep up.")
     if (_pct(col(tr, "agc_gain_db"), .5) or 0) > 20:
         flags.append("AGC is boosting >20 dB: input is very quiet, raise the source volume.")
+    if sum(bool(r.get("still_suspicious")) for r in tr) > 0.1 * max(1, len(tr)):
+        flags.append("Over 10% of phrases still look wrong after a retry: check the audio "
+                     "(music, overlapping speech) or try a larger model.")
     if (_pct(col(tr, "peak_dbfs"), .95) or -100) > -0.5:
         flags.append("Peaks reach 0 dBFS: input is clipping, lower the source volume.")
     out.append("\nFindings")
@@ -205,16 +217,68 @@ def _align(ref, hyp):
     return d[len(ref)][len(hyp)], missing[::-1], wrong[::-1]
 
 
+# Text the reference model itself invents on music/silence (YouTube subtitle
+# credits etc.); phrases whose reference contains these are skipped.
+REF_HALLUCINATIONS = ("субтитр", "dimatorzok", "продолжение следует", "редактор",
+                      "спасибо за просмотр", "подписывайтесь", "thanks for watching")
+
+
+def _reference_text(model_holder, ref_model, wav_path, lang):
+    """Reference transcript for one recording, cached next to it as .ref.json
+    so the large model only ever runs once per recording."""
+    cache = wav_path.with_suffix(".ref.json")
+    if cache.exists():
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        if cached.get("model") == ref_model:
+            return cached["text"]
+    if model_holder.get("model") is None:
+        import ctranslate2
+        from faster_whisper import WhisperModel
+        device = "cuda" if ctranslate2.get_cuda_device_count() else "cpu"
+        model_holder["model"] = WhisperModel(
+            ref_model, device=device, compute_type="float16" if device == "cuda" else "int8")
+    # Read the WAV ourselves: faster-whisper's file decoder is incompatible
+    # with the installed PyAV version.
+    import wave
+    import numpy as np
+    with wave.open(str(wav_path)) as w:
+        audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+    segs, _ = model_holder["model"].transcribe(audio, language=lang, beam_size=5,
+                                               vad_filter=False,
+                                               condition_on_previous_text=False)
+    text = " ".join(s.text for s in segs).strip()
+    cache.write_text(json.dumps({"model": ref_model, "text": text}, ensure_ascii=False),
+                     encoding="utf-8")
+    return text
+
+
+FILLER_WORDS = {"ну", "вот", "и", "а", "то", "так", "это", "же", "уж", "да", "um", "uh",
+                "well", "so", "and"}
+
+
+def _classify(ref, hyp, err, missing, wrong):
+    """Rough error category for one phrase, to show where accuracy is lost."""
+    if not err:
+        return None
+    if not hyp or err >= 0.7 * len(ref):
+        return "whole phrase lost/wrong"
+    words = missing + [w.split("→")[0] for w in wrong]
+    if words and all(w in FILLER_WORDS for w in words):
+        return "filler words only"
+    if words and all(w in (ref[0], ref[-1]) for w in words):
+        return "first/last word (phrase cut)"
+    return "word errors"
+
+
 def build_accuracy(since=None, ref_model="large-v3"):
     """Re-transcribe saved phrase recordings with a larger reference model
     (beam search, no filtering) and compare with what the app logged, to find
-    words and whole phrases the app failed to recognise."""
+    words and whole phrases the app failed to recognise. Results are broken
+    down by recognition model and translation engine."""
     import sys
     sys.path.insert(0, str(APP_DIR))
     from interpreter import _add_cuda_dll_dirs, RECORD_DIR
     _add_cuda_dll_dirs()
-    from faster_whisper import WhisperModel
-    import ctranslate2
 
     traces = [e for p in iter_log_files(LOG_PATH) for e in read_jsonl(p)
               if e.get("event") == "phrase_trace" and e.get("audio_file")
@@ -222,47 +286,64 @@ def build_accuracy(since=None, ref_model="large-v3"):
     traces = [t for t in traces if (RECORD_DIR / t["audio_file"]).exists()]
     if not traces:
         return "No phrase recordings found (they are saved from this version on)."
-    device = "cuda" if ctranslate2.get_cuda_device_count() else "cpu"
-    model = WhisperModel(ref_model, device=device,
-                         compute_type="float16" if device == "cuda" else "int8")
-    out = [f"Accuracy check: {len(traces)} phrases, app vs reference model '{ref_model}'\n"]
-    tot_err = tot_ref = 0
-    all_missing = Counter()
-    missed_phrases = 0
+
+    holder = {}
+    details, per_model, all_missing, categories = [], {}, Counter(), Counter()
+    retries = Counter()
+    tot_err = tot_ref = missed_phrases = skipped = 0
     for t in traces:
-        # Read the WAV ourselves: faster-whisper's file decoder is
-        # incompatible with the installed PyAV version.
-        import wave
-        import numpy as np
-        with wave.open(str(RECORD_DIR / t["audio_file"])) as w:
-            audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
-        segs, _ = model.transcribe(audio,
-                                   language=t.get("src_lang"), beam_size=5,
-                                   vad_filter=False, condition_on_previous_text=False)
-        ref_text = " ".join(s.text for s in segs).strip()
+        ref_text = _reference_text(holder, ref_model, RECORD_DIR / t["audio_file"],
+                                   t.get("src_lang"))
         ref, hyp = _words(ref_text), _words(t.get("text"))
-        if not ref:
+        if not ref or any(h in ref_text.lower() for h in REF_HALLUCINATIONS):
+            skipped += 1
             continue
         err, missing, wrong = _align(ref, hyp)
+        cat = _classify(ref, hyp, err, missing, wrong)
+        if cat:
+            categories[cat] += err
+        if t.get("retry"):
+            retries["used" if t["retry"].get("used") else "kept original"] += 1
         tot_err += err
         tot_ref += len(ref)
-        all_missing.update(missing)
         missed_phrases += not hyp
+        all_missing.update(missing)
+        key = f"{t.get('model')} / {t.get('translation_engine') or '-'}"
+        e, n, c = per_model.get(key, (0, 0, 0))
+        per_model[key] = (e + err, n + len(ref), c + 1)
         if err:
-            out.append(f"  {t['ts'][11:19]} seq={t['seq']} reason={t.get('reason')} "
-                       f"errors={err}/{len(ref)} no_speech={t.get('no_speech_prob')} "
-                       f"logprob={t.get('avg_logprob')}")
-            out.append(f"     app: {t.get('text') or '(nothing)'}")
-            out.append(f"     ref: {ref_text}")
+            details.append(f"  {t['ts'][11:19]} seq={t['seq']} model={t.get('model')} "
+                           f"reason={t.get('reason')} errors={err}/{len(ref)} "
+                           f"no_speech={t.get('no_speech_prob')} logprob={t.get('avg_logprob')}")
+            details.append(f"     category: {cat}"
+                           + (f"   retry: {t['retry'].get('original_text')!r} -> "
+                              f"{t['retry'].get('text')!r} (used={t['retry'].get('used')})"
+                              if t.get("retry") else ""))
+            details.append(f"     app: {t.get('text') or '(nothing)'}")
+            details.append(f"     ref: {ref_text}")
+            if t.get("translation"):
+                details.append(f"     en:  {t['translation']}")
             if missing:
-                out.append(f"     missing: {' '.join(missing)}")
+                details.append(f"     missing: {' '.join(missing)}")
             if wrong:
-                out.append(f"     wrong:   {', '.join(wrong)}")
-    out.insert(1, f"  word error rate vs reference: {tot_err / max(1, tot_ref):.1%} "
-                  f"({tot_err} errors / {tot_ref} words)   phrases with no text at all: "
-                  f"{missed_phrases}\n  most often missed: "
-                  f"{', '.join(f'{w}×{n}' for w, n in all_missing.most_common(10)) or '-'}\n")
-    return "\n".join(out)
+                details.append(f"     wrong:   {', '.join(wrong)}")
+
+    out = [f"Accuracy check: {len(traces)} phrases, app vs reference model '{ref_model}'",
+           f"  word error rate vs reference: {tot_err / max(1, tot_ref):.1%} "
+           f"({tot_err} errors / {tot_ref} words)   phrases with no text at all: "
+           f"{missed_phrases}   skipped (reference hallucinated/empty): {skipped}",
+           "  by model / translation engine:"]
+    out += [f"    {k:<26} WER {e / max(1, n):6.1%}  ({e} errors / {n} words, {c} phrases)"
+            for k, (e, n, c) in sorted(per_model.items())]
+    out.append("  errors by category: " + (", ".join(
+        f"{c} {n}" for c, n in categories.most_common()) or "-"))
+    out.append(f"  suspicious-result retries: {dict(retries) or 'none'}")
+    out.append("  most often missed: " + (", ".join(
+        f"{w}×{n}" for w, n in all_missing.most_common(10)) or "-"))
+    out.append("  (the reference is itself a model, not a human transcript: small "
+               "differences such as '10' vs 'десять' count as errors)\n")
+    return "\n".join(out + details)
+
 
 
 if __name__ == "__main__":

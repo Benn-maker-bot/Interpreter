@@ -12,3 +12,4 @@ nvidia-cublas-cu12>=12.4    # CUDA libraries for GPU Whisper (Windows)
 nvidia-cudnn-cu12>=9,<10
 psutil>=5.9               # CPU/memory figures for the resource_stats log
 nvidia-ml-py>=12          # GPU load/memory/clock for the resource_stats log
+sentencepiece>=0.2         # tokenizer for the local Opus-MT translation models
