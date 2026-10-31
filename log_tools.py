@@ -76,10 +76,13 @@ def build_summary():
     """Count entries by level and event, list recent problems, and write the
     summary JSON file (same as the app's Export Log Summary button).
     """
+    # A Counter is a dict that counts: levels['ERROR'] += 1 starts at 0.
     levels = Counter()
     events = Counter()
     issues = []
     total = 0
+    # Go through every log entry (newest file and the older gzipped ones),
+    # counting levels and event names, and keeping warnings/errors aside.
     for path in iter_log_files(LOG_PATH):
         for entry in read_jsonl(path):
             total += 1
@@ -91,6 +94,7 @@ def build_summary():
                     "event": entry.get("event"),
                     "message": entry.get("message"),
                 })
+    # Put the counts together and save them as a nicely indented JSON file.
     summary = {
         "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "log_path": str(LOG_PATH),
@@ -104,14 +108,14 @@ def build_summary():
     return summary
 
 
-def _pct(values, q):
+def _pct(values, fraction):
     """The value below which a fraction `q` of the values fall (q=0.5 is the
     median, q=0.95 the 95th percentile). None values are ignored.
     """
     v = sorted(x for x in values if x is not None)
     if not v:
         return None
-    return v[min(len(v) - 1, int(len(v) * q))]
+    return v[min(len(v) - 1, int(len(v) * fraction))]
 
 
 def _row(label, values, unit="ms"):
@@ -127,107 +131,133 @@ def build_report(since=None):
     """Latency/efficiency breakdown of the speech -> text -> translation
     pipeline from the phrase_trace, phrase_displayed and *_stats log lines.
     `since` is an ISO prefix such as '2026-10-31T14:00' (UTC offset as logged)."""
-    ev = [e for p in iter_log_files(LOG_PATH) for e in read_jsonl(p)]
+    # ── Step 1: read every log entry, optionally only those from `since` on.
+    #    (Timestamps are text like '2026-10-31T14:05:…', so comparing them
+    #    as text also compares them in time order.)
+    entries = [e for p in iter_log_files(LOG_PATH) for e in read_jsonl(p)]
     if since:
-        ev = [e for e in ev if e.get("ts", "") >= since]
-    by = {}
-    for e in ev:
-        by.setdefault(e.get("event"), []).append(e)
-    tr, disp = by.get("phrase_trace", []), by.get("phrase_displayed", [])
-    col = lambda rows, k: [r.get(k) for r in rows]
-    gpu = [(r.get("encode_ms") or 0) + (r.get("decode_ms") or 0) for r in tr if "decode_ms" in r]
-    out = [f"Pipeline report  ({ev[0]['ts'][:19]} .. {ev[-1]['ts'][:19]}, {len(ev)} log lines)"
-           if ev else "No log entries."]
+        entries = [e for e in entries if e.get("ts", "") >= since]
+    # ── Step 2: sort the entries by event name, e.g. by['phrase_trace'] is
+    #    the list of all phrase_trace entries.
+    #    tr   = one entry per finished phrase (timings, text, scores …)
+    #    displayed = one entry per phrase previews_processed on screen (screen delays)
+    by_event = {}
+    for e in entries:
+        by_event.setdefault(e.get("event"), []).append(e)
+    traces, displayed = by_event.get("phrase_trace", []), by_event.get("phrase_displayed", [])
+    # col(rows, 'x') = the list of each entry's 'x' value (a 'column').
+    # gpu = encode + decode time: the two GPU stages added together, because
+    # GPU work is asynchronous and can be counted in either one.
+    column = lambda rows, k: [r.get(k) for r in rows]
+    gpu_ms = [(r.get("encode_ms") or 0) + (r.get("decode_ms") or 0) for r in traces if "decode_ms" in r]
+    out = [f"Pipeline report  ({entries[0]['ts'][:19]} .. {entries[-1]['ts'][:19]}, {len(entries)} log lines)"
+           if entries else "No log entries."]
 
+    # ── Step 3: the finished-phrase section. `out` collects the report's
+    #    lines; they are joined into one text at the end. _row() prints
+    #    count, median (p50), 95th percentile (p95) and maximum.
     out.append("\nFinished phrases (speech -> final text)")
-    out.append(f"  phrases: {len(tr)}   cut reasons: {dict(Counter(col(tr, 'reason')))}   "
-               f"models: {dict(Counter(col(tr, 'model')))}   "
-               f"translation: {dict(Counter(col(tr, 'translation_engine')))}")
-    out.append(_row("local translation (Opus-MT)", [r.get("mt_ms") for r in tr if r.get("mt_ms")]))
-    out.append(f"  suspicious results: {sum(bool(r.get('suspicious')) for r in tr)}   "
-               f"retried: {sum(bool(r.get('retry')) for r in tr)}   "
-               f"retry used: {sum(bool((r.get('retry') or {}).get('used')) for r in tr)}   "
-               f"still suspicious: {sum(bool(r.get('still_suspicious')) for r in tr)}   "
-               f"context resets: {sum(bool(r.get('context_reset')) for r in tr)}   "
-               f"no-speech drops: {sum(bool(r.get('dropped_text')) for r in tr)}")
-    out.append(_row("retry cost", [(r.get("retry") or {}).get("ms") for r in tr if r.get("retry")]))
+    out.append(f"  phrases: {len(traces)}   cut reasons: {dict(Counter(column(traces, 'reason')))}   "
+               f"models: {dict(Counter(column(traces, 'model')))}   "
+               f"translation: {dict(Counter(column(traces, 'translation_engine')))}")
+    out.append(_row("local translation (Opus-MT)", [r.get("mt_ms") for r in traces if r.get("mt_ms")]))
+    out.append(f"  suspicious results: {sum(bool(r.get('suspicious')) for r in traces)}   "
+               f"retried: {sum(bool(r.get('retry')) for r in traces)}   "
+               f"retry used: {sum(bool((r.get('retry') or {}).get('used')) for r in traces)}   "
+               f"still suspicious: {sum(bool(r.get('still_suspicious')) for r in traces)}   "
+               f"context resets: {sum(bool(r.get('context_reset')) for r in traces)}   "
+               f"no-speech drops: {sum(bool(r.get('dropped_text')) for r in traces)}")
+    out.append(_row("retry cost", [(r.get("retry") or {}).get("ms") for r in traces if r.get("retry")]))
+    # One report row per stage of the pipeline, in the order a phrase goes
+    # through them: capture, queue, VAD, features, GPU, screen …
     for label, vals, unit in [
-            ("audio length", [x * 1000 if x else None for x in col(tr, "audio_sec")], "ms"),
-            ("speech start -> phrase end", col(tr, "capture_ms"), "ms"),
-            ("phrase end -> worker picks up", col(tr, "queue_wait_ms"), "ms"),
-            ("  VAD trim (CPU)", col(tr, "vad_ms"), "ms"),
-            ("  mel features (CPU)", col(tr, "mel_ms"), "ms"),
-            ("  GPU lock wait", col(tr, "lock_wait_ms"), "ms"),
-            ("  GPU encode+decode", gpu, "ms"),
-            ("worker total", col(tr, "process_ms"), "ms"),
-            ("result -> on screen (UI)", col(disp, "ui_ms"), "ms"),
-            ("PAUSE -> FINAL TEXT ON SCREEN", col(disp, "speech_end_to_text_ms"), "ms"),
-            ("SPEECH START -> FIRST PREVIEW", col(disp, "first_preview_ms"), "ms"),
+            ("audio length", [x * 1000 if x else None for x in column(traces, "audio_sec")], "ms"),
+            ("speech start -> phrase end", column(traces, "capture_ms"), "ms"),
+            ("phrase end -> worker picks up", column(traces, "queue_wait_ms"), "ms"),
+            ("  VAD trim (CPU)", column(traces, "vad_ms"), "ms"),
+            ("  mel features (CPU)", column(traces, "mel_ms"), "ms"),
+            ("  GPU lock wait", column(traces, "lock_wait_ms"), "ms"),
+            ("  GPU encode+decode", gpu_ms, "ms"),
+            ("worker total", column(traces, "process_ms"), "ms"),
+            ("result -> on screen (UI)", column(displayed, "ui_ms"), "ms"),
+            ("PAUSE -> FINAL TEXT ON SCREEN", column(displayed, "speech_end_to_text_ms"), "ms"),
+            ("SPEECH START -> FIRST PREVIEW", column(displayed, "first_preview_ms"), "ms"),
             ("pause -> online translation shown",
-             col(by.get("translation_displayed", []), "speech_end_to_translation_ms"), "ms"),
-            ("tokens generated", col(tr, "tokens"), "tok"),
-            ("speech level", col(tr, "rms_dbfs"), "dBFS"),
-            ("peak level", col(tr, "peak_dbfs"), "dBFS"),
-            ("AGC gain applied", col(tr, "agc_gain_db"), "dB"),
-            ("mean VAD speech probability", col(tr, "vad_mean"), ""),
-            ("previews per phrase", col(tr, "previews"), "")]:
+             column(by_event.get("translation_displayed", []), "speech_end_to_translation_ms"), "ms"),
+            ("tokens generated", column(traces, "tokens"), "tok"),
+            ("speech level", column(traces, "rms_dbfs"), "dBFS"),
+            ("peak level", column(traces, "peak_dbfs"), "dBFS"),
+            ("AGC gain applied", column(traces, "agc_gain_db"), "dB"),
+            ("mean VAD speech probability", column(traces, "vad_mean"), ""),
+            ("previews per phrase", column(traces, "previews"), "")]:
         out.append(_row(label, vals, unit))
 
-    ps = by.get("preview_stats", [])
+    # ── Step 4: live previews. preview_stats lines are written every 10 s;
+    #    each holds its own p50/p95/max, so we summarise those values.
+    preview_stats = by_event.get("preview_stats", [])
     out.append("\nLive previews (10 s windows; p50 of each window's p50)")
     for k in ("age_ms", "process_ms", "encode_ms", "decode_ms", "vad_ms"):
-        out.append(_row(k, [w[k]["p50"] for w in ps if isinstance(w.get(k), dict)]))
-    shown = sum(w["process_ms"]["n"] for w in ps if isinstance(w.get("process_ms"), dict))
-    out.append(f"  previews processed: {shown}   skipped as stale: "
-               f"{sum(w.get('skipped_stale', 0) for w in ps)}   not shown (empty/unchanged): "
-               f"{sum(w['not_shown']['n'] for w in ps if isinstance(w.get('not_shown'), dict))}   "
-               f"preview model: {dict(Counter(w.get('preview_model') for w in ps))}")
+        out.append(_row(k, [w[k]["p50"] for w in preview_stats if isinstance(w.get(k), dict)]))
+    previews_processed = sum(w["process_ms"]["n"] for w in preview_stats if isinstance(w.get("process_ms"), dict))
+    out.append(f"  previews processed: {previews_processed}   skipped as stale: "
+               f"{sum(w.get('skipped_stale', 0) for w in preview_stats)}   not shown (empty/unchanged): "
+               f"{sum(w['not_shown']['n'] for w in preview_stats if isinstance(w.get('not_shown'), dict))}   "
+               f"preview model: {dict(Counter(w.get('preview_model') for w in preview_stats))}")
 
-    cs = by.get("capture_stats", [])
+    # ── Step 5: audio capture health. read_gap_ms is the time between two
+    #    audio reads; it should be about one block (~32 ms). Much more means
+    #    the capture loop fell behind and audio may have been lost.
+    capture_stats = by_event.get("capture_stats", [])
     out.append("\nAudio capture (10 s windows; worst value per window)")
     for k in ("read_gap_ms", "loop_ms", "vad_ms", "backlog_frames"):
-        out.append(_row(k + " (max)", [w[k]["max"] for w in cs if isinstance(w.get(k), dict)],
+        out.append(_row(k + " (max)", [w[k]["max"] for w in capture_stats if isinstance(w.get(k), dict)],
                         "frames" if k == "backlog_frames" else "ms"))
-    out.append(_row("level p50", [w["level_dbfs"]["p50"] for w in cs
+    out.append(_row("level p50", [w["level_dbfs"]["p50"] for w in capture_stats
                                   if isinstance(w.get("level_dbfs"), dict)], "dBFS"))
-    out.append(_row("speech frames", col(cs, "speech_pct"), "%"))
+    out.append(_row("speech frames", column(capture_stats, "speech_pct"), "%"))
 
-    rs = by.get("resource_stats", [])
+    # ── Step 6: CPU, memory, GPU and how promptly the window updates.
+    resource_stats = by_event.get("resource_stats", [])
     out.append("\nResources and UI (10 s windows)")
     for k, unit in (("process_cpu_pct", "%"), ("system_cpu_pct", "%"), ("rss_mb", "MB"),
                     ("gpu_util_pct", "%"), ("gpu_mem_used_mb", "MB"), ("gpu_sm_clock_mhz", "MHz"),
                     ("gpu_temp_c", "C")):
-        out.append(_row(k, col(rs, k), unit))
+        out.append(_row(k, column(resource_stats, k), unit))
     out.append(_row("UI poll lag (p95 per window)",
-                    [w["poll_lag_ms"]["p95"] for w in rs if isinstance(w.get("poll_lag_ms"), dict)]))
+                    [w["poll_lag_ms"]["p95"] for w in resource_stats if isinstance(w.get("poll_lag_ms"), dict)]))
 
-    sc = by.get("sensitivity_changed", [])
-    if sc:
+    # ── Step 7: for each sensitivity change, compare the measured input level
+    #    just before and just after it (it should not change: sensitivity
+    #    only decides what counts as speech, not how loud the audio is).
+    sensitivity_changes = by_event.get("sensitivity_changed", [])
+    if sensitivity_changes:
         out.append("\nSensitivity changes vs measured input level (capture level p50, dBFS)")
-        for e in sc:
-            before = [w for w in cs if w["ts"] < e["ts"] and isinstance(w.get("level_dbfs"), dict)]
-            after = [w for w in cs if w["ts"] > e["ts"] and isinstance(w.get("level_dbfs"), dict)]
-            b = before[-1]["level_dbfs"]["p50"] if before else None
-            a = after[0]["level_dbfs"]["p50"] if after else None
+        for e in sensitivity_changes:
+            before = [w for w in capture_stats if w["ts"] < e["ts"] and isinstance(w.get("level_dbfs"), dict)]
+            after = [w for w in capture_stats if w["ts"] > e["ts"] and isinstance(w.get("level_dbfs"), dict)]
+            level_before = before[-1]["level_dbfs"]["p50"] if before else None
+            level_after = after[0]["level_dbfs"]["p50"] if after else None
             out.append(f"  {e['ts'][11:19]}  sensitivity={e.get('value')}  "
-                       f"threshold={e.get('vad_threshold')}  level before={b}  after={a}")
+                       f"threshold={e.get('vad_threshold')}  level before={level_before}  after={level_after}")
 
+    # ── Step 8: automatic findings. Each rule checks for a known problem
+    #    and adds a plain-language explanation if it is found.
     flags = []
-    if (_pct(col(tr, "queue_wait_ms"), .95) or 0) > 100:
+    if (_pct(column(traces, "queue_wait_ms"), .95) or 0) > 100:
         flags.append("Phrases wait >100 ms for the worker: GPU busy with previews or backlog.")
-    if any((w.get("read_gap_ms") or {}).get("max", 0) > 150 for w in cs):
+    if any((w.get("read_gap_ms") or {}).get("max", 0) > 150 for w in capture_stats):
         flags.append("Audio reads stalled >150 ms: capture loop fell behind the device.")
-    if (_pct([w["poll_lag_ms"]["p95"] for w in rs if isinstance(w.get("poll_lag_ms"), dict)],
+    if (_pct([w["poll_lag_ms"]["p95"] for w in resource_stats if isinstance(w.get("poll_lag_ms"), dict)],
              .5) or 0) > 50:
         flags.append("UI thread is busy: results wait >50 ms before being drawn.")
-    if ps and sum(w.get("skipped_stale", 0) for w in ps) > shown:
+    if preview_stats and sum(w.get("skipped_stale", 0) for w in preview_stats) > previews_processed:
         flags.append("More previews skipped than processed: preview model can't keep up.")
-    if (_pct(col(tr, "agc_gain_db"), .5) or 0) > 20:
+    if (_pct(column(traces, "agc_gain_db"), .5) or 0) > 20:
         flags.append("AGC is boosting >20 dB: input is very quiet, raise the source volume.")
-    if sum(bool(r.get("still_suspicious")) for r in tr) > 0.1 * max(1, len(tr)):
+    if sum(bool(r.get("still_suspicious")) for r in traces) > 0.1 * max(1, len(traces)):
         flags.append("Over 10% of phrases still look wrong after a retry: check the audio "
                      "(music, overlapping speech) or try a larger model.")
-    if (_pct(col(tr, "peak_dbfs"), .95) or -100) > -0.5:
+    if (_pct(column(traces, "peak_dbfs"), .95) or -100) > -0.5:
         flags.append("Peaks reach 0 dBFS: input is clipping, lower the source volume.")
     out.append("\nFindings")
     out.extend(f"  - {f}" for f in flags) if flags else out.append("  - nothing abnormal")
@@ -243,29 +273,43 @@ def _words(text):
     return re.findall(r"\w+", text)
 
 
-def _align(ref, hyp):
+def _align(ref_words, app_words):
     """Word edit distance with backtrace: (errors, missing words, substitutions)."""
-    d = [[0] * (len(hyp) + 1) for _ in range(len(ref) + 1)]
-    for i in range(len(ref) + 1):
-        d[i][0] = i
-    for j in range(len(hyp) + 1):
-        d[0][j] = j
-    for i in range(1, len(ref) + 1):
-        for j in range(1, len(hyp) + 1):
-            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1,
-                          d[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]))
-    i, j, missing, wrong = len(ref), len(hyp), [], []
+    # This is the standard 'edit distance' method (Levenshtein), on words.
+    # d is a table: d[i][j] = the fewest edits (insert, delete or replace a
+    # word) needed to turn the first i reference words into the first j app
+    # words. The answer for the whole texts ends up in the bottom-right cell.
+    # Example: ref 'мы поедем домой', app 'мы едем домой' -> 1 edit.
+    edits = [[0] * (len(app_words) + 1) for _ in range(len(ref_words) + 1)]
+    # Edges of the table: turning i words into nothing takes i deletions,
+    # and turning nothing into j words takes j insertions.
+    for i in range(len(ref_words) + 1):
+        edits[i][0] = i
+    for j in range(len(app_words) + 1):
+        edits[0][j] = j
+    # Fill the table. Each cell takes the cheapest of three moves:
+    #   from above (+1): the reference word is missing in the app's text
+    #   from the left (+1): the app added an extra word
+    #   diagonally (+0 if the words match, +1 if one replaced the other)
+    for i in range(1, len(ref_words) + 1):
+        for j in range(1, len(app_words) + 1):
+            edits[i][j] = min(edits[i - 1][j] + 1, edits[i][j - 1] + 1,
+                          edits[i - 1][j - 1] + (ref_words[i - 1] != app_words[j - 1]))
+    # Walk back from the bottom-right corner along the cheapest path to see
+    # WHICH words were missing or replaced, not just how many errors.
+    # The lists come out backwards, so they are reversed ([::-1]) at the end.
+    i, j, missing, wrong = len(ref_words), len(app_words), [], []
     while i > 0 or j > 0:
-        if i and j and d[i][j] == d[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]):
-            if ref[i - 1] != hyp[j - 1]:
-                wrong.append(f"{ref[i - 1]}→{hyp[j - 1]}")
+        if i and j and edits[i][j] == edits[i - 1][j - 1] + (ref_words[i - 1] != app_words[j - 1]):
+            if ref_words[i - 1] != app_words[j - 1]:
+                wrong.append(f"{ref_words[i - 1]}→{app_words[j - 1]}")
             i, j = i - 1, j - 1
-        elif i and d[i][j] == d[i - 1][j] + 1:
-            missing.append(ref[i - 1])
+        elif i and edits[i][j] == edits[i - 1][j] + 1:
+            missing.append(ref_words[i - 1])
             i -= 1
         else:
             j -= 1
-    return d[len(ref)][len(hyp)], missing[::-1], wrong[::-1]
+    return edits[len(ref_words)][len(app_words)], missing[::-1], wrong[::-1]
 
 
 # Text the reference model itself invents on music/silence (YouTube subtitle
@@ -307,16 +351,16 @@ FILLER_WORDS = {"ну", "вот", "и", "а", "то", "так", "это", "же"
                 "well", "so", "and"}
 
 
-def _classify(ref, hyp, err, missing, wrong):
+def _classify(ref_words, app_words, errors, missing, wrong):
     """Rough error category for one phrase, to show where accuracy is lost."""
-    if not err:
+    if not errors:
         return None
-    if not hyp or err >= 0.7 * len(ref):
+    if not app_words or errors >= 0.7 * len(ref_words):
         return "whole phrase lost/wrong"
     words = missing + [w.split("→")[0] for w in wrong]
     if words and all(w in FILLER_WORDS for w in words):
         return "filler words only"
-    if words and all(w in (ref[0], ref[-1]) for w in words):
+    if words and all(w in (ref_words[0], ref_words[-1]) for w in words):
         return "first/last word (phrase cut)"
     return "word errors"
 
@@ -326,62 +370,81 @@ def build_accuracy(since=None, ref_model="large-v3"):
     (beam search, no filtering) and compare with what the app logged, to find
     words and whole phrases the app failed to recognise. Results are broken
     down by recognition model and translation engine."""
+    # Borrow two things from the app: the function that makes the NVIDIA
+    # libraries loadable (so the reference model can use the GPU) and the
+    # folder where phrase recordings are saved.
     import sys
     sys.path.insert(0, str(APP_DIR))
     from interpreter import _add_cuda_dll_dirs, RECORD_DIR
     _add_cuda_dll_dirs()
 
+    # ── Step 1: find every finished phrase that has a saved recording.
     traces = [e for p in iter_log_files(LOG_PATH) for e in read_jsonl(p)
               if e.get("event") == "phrase_trace" and e.get("audio_file")
               and (not since or e.get("ts", "") >= since)]
-    traces = [t for t in traces if (RECORD_DIR / t["audio_file"]).exists()]
+    traces = [trace for trace in traces if (RECORD_DIR / trace["audio_file"]).exists()]
     if not traces:
         return "No phrase recordings found (they are saved from this version on)."
 
-    holder = {}
+    # ── Step 2: set up the tallies.
+    #    model_holder      keeps the reference model once loaded (loaded only if
+    #                some recording has no cached reference yet)
+    #    per_model   errors and words per (model / translation engine)
+    #    categories  errors per kind of mistake (see _classify)
+    model_holder = {}
     details, per_model, all_missing, categories = [], {}, Counter(), Counter()
     retries = Counter()
-    tot_err = tot_ref = missed_phrases = skipped = 0
-    for t in traces:
-        ref_text = _reference_text(holder, ref_model, RECORD_DIR / t["audio_file"],
-                                   t.get("src_lang"))
-        ref, hyp = _words(ref_text), _words(t.get("text"))
-        if not ref or any(h in ref_text.lower() for h in REF_HALLUCINATIONS):
+    total_errors = total_ref_words = missed_phrases = skipped = 0
+    for trace in traces:
+        # ── Step 3, for each phrase: get the reference text (what the bigger
+        #    model heard) and split both texts into words.
+        ref_text = _reference_text(model_holder, ref_model, RECORD_DIR / trace["audio_file"],
+                                   trace.get("src_lang"))
+        ref_words, app_words = _words(ref_text), _words(trace.get("text"))
+        # Skip phrases where the reference itself is empty or invented (the big
+        # model also hallucinates on music, e.g. subtitle credits).
+        if not ref_words or any(h in ref_text.lower() for h in REF_HALLUCINATIONS):
             skipped += 1
             continue
-        err, missing, wrong = _align(ref, hyp)
-        cat = _classify(ref, hyp, err, missing, wrong)
-        if cat:
-            categories[cat] += err
-        if t.get("retry"):
-            retries["used" if t["retry"].get("used") else "kept original"] += 1
-        tot_err += err
-        tot_ref += len(ref)
-        missed_phrases += not hyp
+        # Line the two word lists up (like a spell-checker's 'diff') to count
+        # the errors and list which words were missing or wrong.
+        errors, missing, wrong = _align(ref_words, app_words)
+        category = _classify(ref_words, app_words, errors, missing, wrong)
+        if category:
+            categories[category] += errors
+        if trace.get("retry"):
+            retries["used" if trace["retry"].get("used") else "kept original"] += 1
+        total_errors += errors
+        total_ref_words += len(ref_words)
+        missed_phrases += not app_words
         all_missing.update(missing)
-        key = f"{t.get('model')} / {t.get('translation_engine') or '-'}"
+        key = f"{trace.get('model')} / {trace.get('translation_engine') or '-'}"
         e, n, c = per_model.get(key, (0, 0, 0))
-        per_model[key] = (e + err, n + len(ref), c + 1)
-        if err:
-            details.append(f"  {t['ts'][11:19]} seq={t['seq']} model={t.get('model')} "
-                           f"reason={t.get('reason')} errors={err}/{len(ref)} "
-                           f"no_speech={t.get('no_speech_prob')} logprob={t.get('avg_logprob')}")
-            details.append(f"     category: {cat}"
-                           + (f"   retry: {t['retry'].get('original_text')!r} -> "
-                              f"{t['retry'].get('text')!r} (used={t['retry'].get('used')})"
-                              if t.get("retry") else ""))
-            details.append(f"     app: {t.get('text') or '(nothing)'}")
+        per_model[key] = (e + errors, n + len(ref_words), c + 1)
+        # Keep a detailed description of every phrase that had an error, so you
+        # can read exactly what the app wrote and what was really said.
+        if errors:
+            details.append(f"  {trace['ts'][11:19]} seq={trace['seq']} model={trace.get('model')} "
+                           f"reason={trace.get('reason')} errors={errors}/{len(ref_words)} "
+                           f"no_speech={trace.get('no_speech_prob')} logprob={trace.get('avg_logprob')}")
+            details.append(f"     category: {category}"
+                           + (f"   retry: {trace['retry'].get('original_text')!r} -> "
+                              f"{trace['retry'].get('text')!r} (used={trace['retry'].get('used')})"
+                              if trace.get("retry") else ""))
+            details.append(f"     app: {trace.get('text') or '(nothing)'}")
             details.append(f"     ref: {ref_text}")
-            if t.get("translation"):
-                details.append(f"     en:  {t['translation']}")
+            if trace.get("translation"):
+                details.append(f"     en:  {trace['translation']}")
             if missing:
                 details.append(f"     missing: {' '.join(missing)}")
             if wrong:
                 details.append(f"     wrong:   {', '.join(wrong)}")
 
+    # ── Step 4: the summary at the top, then the per-phrase details.
+    #    WER = errors / reference words. :.1% formats 0.123 as 12.3%.
     out = [f"Accuracy check: {len(traces)} phrases, app vs reference model '{ref_model}'",
-           f"  word error rate vs reference: {tot_err / max(1, tot_ref):.1%} "
-           f"({tot_err} errors / {tot_ref} words)   phrases with no text at all: "
+           f"  word error rate vs reference: {total_errors / max(1, total_ref_words):.1%} "
+           f"({total_errors} errors / {total_ref_words} words)   phrases with no text at all: "
            f"{missed_phrases}   skipped (reference hallucinated/empty): {skipped}",
            "  by model / translation engine:"]
     out += [f"    {k:<26} WER {e / max(1, n):6.1%}  ({e} errors / {n} words, {c} phrases)"
