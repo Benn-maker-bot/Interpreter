@@ -569,6 +569,8 @@ CUT_SEARCH_SEC   = 1.5     # ...made where speech is least likely in this final 
 PARTIAL_INTERVAL_SEC = 0.2 # live preview cadence; the worker skips stale ones,
                            # so this self-limits to what the GPU can keep up with
 PARTIAL_MIN_SEC  = 0.5     # less audio than this makes Whisper guess wildly
+MAIN_MODEL_PREVIEW_INTERVAL_SEC = 0.45   # preview cadence when a large main model
+                                         # makes the previews (see _start_session)
 MIN_PHRASE_SEC   = 0.5     # shorter clips are mostly silence and make Whisper hallucinate
 MAX_READ_FAILURES = 20     # consecutive audio read errors (~1 s) before capture gives up
 WATCHDOG_SEC      = 2      # how often the UI checks that capture/workers are alive
@@ -1478,6 +1480,7 @@ class AudioCaptureThread(threading.Thread):
         self.failed            = None   # set to a reason if capture gave up
         self.partial_slot      = partial_slot
         self.early_slot        = early_slot  # early (speculative) finals, see EARLY_FINAL_SEC
+        self.preview_interval_sec = PARTIAL_INTERVAL_SEC   # may be raised by the window
         self.mute_evt          = mute_evt   # set while our own TTS is audible on this device
         self.phrase_queue      = phrase_queue
         self.status_cb         = status_cb
@@ -1640,7 +1643,7 @@ class AudioCaptureThread(threading.Thread):
         silence_blocks_needed   = max(1, int(SILENCE_SEC * blocks_per_sec))       # pause that ends a phrase
         max_phrase_blocks       = int(MAX_PHRASE_SEC * blocks_per_sec)            # longest phrase before a cut
         cut_search_blocks       = int(CUT_SEARCH_SEC * blocks_per_sec)            # where to look for the cut
-        preview_interval_blocks = max(1, int(PARTIAL_INTERVAL_SEC * blocks_per_sec))  # time between previews
+        preview_interval_blocks = max(1, int(self.preview_interval_sec * blocks_per_sec))  # time between previews
         min_phrase_blocks       = max(1, int(MIN_PHRASE_SEC * blocks_per_sec))    # shorter = treat as noise
         min_preview_blocks      = max(1, int(PARTIAL_MIN_SEC * blocks_per_sec))   # audio needed for a preview
         vad_window_blocks       = max(1, int(VAD_WINDOW_SEC * blocks_per_sec))    # context given to the VAD
@@ -1848,7 +1851,11 @@ class AudioCaptureThread(threading.Thread):
                     preroll = list(recent_blocks)[-preroll_blocks:-1]
                     phrase_blocks, phrase_speech_probs = preroll, [speech_threshold] * len(preroll)
                     blocks_since_preview = len(phrase_blocks)
-                    phrase_start_time = time.monotonic() - len(preroll) * chunk_sec
+                    # When speech most likely began: the moment the speech score
+                    # first rose (possible_onset_t), not the start of the 0.6 s
+                    # pre-roll, which made "speech -> first preview" look ~0.5 s
+                    # slower than it was.
+                    phrase_start_time = possible_onset_t or time.monotonic()
                     onset_delay_ms = (round((time.monotonic() - possible_onset_t) * 1000)
                                       if possible_onset_t else 0)
                     phrase_levels_db, phrase_peak_db, phrase_preview_count = [], -100.0, 0
@@ -2080,6 +2087,8 @@ HALLUCINATIONS = {
     "thank you", "thanks", "thank you very much", "thanks for watching",
     "thank you for watching", "please subscribe", "subscribe", "you", "bye",
     "hmm", "um", "uh", "oh", "so",
+    # Russian ones seen in the logs: dropped only when they are the WHOLE text
+    "продолжение следует", "спасибо за просмотр", "подписывайтесь на канал",
 }
 
 
@@ -2116,6 +2125,57 @@ def suspicious_reasons(text: str, speech_sec: float, avg_logprob: float) -> list
 # subtitle credits), never from real speech; any text containing one is dropped.
 HALLUCINATION_FRAGMENTS = ("субтитр", "dimatorzok", "редактор субтитров", "корректор",
                            "amara.org", "subtitles by")
+
+
+CONTINUATION_MARKS = ("...", "…")
+
+
+def continuation_join(text_before: str, new_text: str):
+    """Whisper marks a sentence cut between two phrases with "..." at the end
+    of one and the start of the next ("и тогда они..." / "...включаться").
+    Joining them on one line reads far better. Returns (joined, text):
+    joined=True means remove the trailing "..." from text_before and append
+    text (already stripped of its leading "...") after a space."""
+    before = text_before.rstrip()
+    new = new_text.lstrip()
+    if before.endswith(CONTINUATION_MARKS) and new.startswith(CONTINUATION_MARKS):
+        return True, new.lstrip(".… ")
+    return False, new_text
+
+
+def trailing_marks_length(text_before: str) -> int:
+    """How many characters to delete from the end of text_before to remove
+    its trailing "..." (and spaces) before joining a continuation."""
+    return len(text_before) - len(text_before.rstrip().rstrip(".…").rstrip())
+
+
+def clean_translation(source: str, translated: str) -> str:
+    """Guard against the translator inventing text. Seen in the logs: the
+    one-word fragment "алым." became "I'm so sorry. I'm so sorry." So:
+    a sentence repeated back-to-back is kept once, and a translation far
+    longer than a very short source is cut to its first sentence."""
+    import re
+    split = lambda t: re.split(r"(?<=[.!?…])\s+", t.strip())
+    sentences = split(translated)
+    if len(split(source)) > 1:
+        return translated      # the speaker may really have repeated themselves
+    kept = [x for i, x in enumerate(sentences)
+            if i == 0 or x.strip().lower() != sentences[i - 1].strip().lower()]
+    out = " ".join(kept)
+    src_words, out_words = len(source.split()), len(out.split())
+    if src_words <= 2 and out_words > 3 * src_words + 3 and len(kept) > 1:
+        out = kept[0]
+    return out
+
+
+def collapse_repetitions(text: str) -> str:
+    """Shorten runaway repetition ("А-а-а-а-а-а…" ×50, a Whisper loop seen in
+    the logs) to three repeats, keeping the separator style."""
+    import re
+    def shorten(m):
+        word, sep = m.group(1), m.group(2)
+        return sep.join([word] + [word.lower()] * 2)
+    return re.sub(r"\b(\w+)([-\s,]+)(?:\1\2?){3,}\b", shorten, text, flags=re.IGNORECASE)
 
 
 def is_hallucination(text: str) -> bool:
@@ -2560,7 +2620,13 @@ class TranscriptionWorker(threading.Thread):
                 w.writeframes(audio_bytes)
             old = sorted(RECORD_DIR.glob("*.wav"))[:-RECORD_KEEP]
             for f in old:
-                f.unlink(missing_ok=True)
+                # A file can be locked (open in another program): skip it and
+                # try again next time, instead of failing this recording.
+                try:
+                    f.unlink(missing_ok=True)
+                    f.with_suffix(".ref.json").unlink(missing_ok=True)
+                except OSError:
+                    pass
             return path.name
         except Exception as e:
             log_exception("phrase_record_failed", e)
@@ -2586,7 +2652,7 @@ class TranscriptionWorker(threading.Thread):
             return None, 0.0
         t0 = time.perf_counter()
         try:
-            out = translator.translate(text)
+            out = clean_translation(text, translator.translate(text))
         except Exception as e:
             log_exception("local_translation_failed", e, chars=len(text))
             return None, 0.0
@@ -2654,7 +2720,8 @@ class TranscriptionWorker(threading.Thread):
             t = time.perf_counter()
             results = model.model.generate(
                 enc, self._prompts_for(tasks, model),
-                beam_size=beam_size, max_length=224, return_no_speech_prob=True,
+                beam_size=beam_size, max_length=self._max_length(info, tasks, model),
+                return_no_speech_prob=True,
                 return_scores=True, suppress_blank=True)
             info["decode_ms"] = round((time.perf_counter() - t) * 1000, 2)
         texts, dropped = [], []
@@ -2738,6 +2805,15 @@ class TranscriptionWorker(threading.Thread):
                 "text_vocab": token_id_of("<|endoftext|>"),   # ids below this are plain text
             }
         return self._special[model_key]
+
+    def _max_length(self, info, tasks, model):
+        """Longest output allowed for this clip: about 15 tokens per second of
+        speech plus a margin (Russian speech is ~8-10 tokens/s), instead of a
+        flat 224. A stuck model ("а-а-а-а…" in the logs) then stops quickly,
+        which also saves GPU time. The prompt's own tokens are added on top."""
+        speech_sec = info.get("speech_sec") or 1.0
+        cap = min(224, int(speech_sec * 15) + 20)
+        return min(448, len(self._prompts_for(tasks, model)[0]) + cap)
 
     def _prompts_for(self, tasks, model):
         """Build the start-of-decoding instructions ("prompt") for each task.
@@ -2987,8 +3063,8 @@ class TranscriptionWorker(threading.Thread):
         token_ids = info.pop("_token_ids", [])
         texts, token_ids, info = self._retry_if_suspicious(
             audio_np, tasks, texts, token_ids, info)
-        text       = texts[0]
-        translated = texts[1] if whisper_translates else None
+        text       = collapse_repetitions(texts[0])
+        translated = collapse_repetitions(texts[1]) if whisper_translates else None
         engine     = "whisper" if whisper_translates else "online"
         mt_ms      = 0.0
         if is_hallucination(text):
@@ -3201,7 +3277,8 @@ class InterpreterApp(ctk.CTk):
         self._build_text_area()
         self._build_status_bar()
 
-        self._apply_mode(0, switch_source=True)
+        # Start in the mode used last time (Friend, for most calls)
+        self._apply_mode(int(load_settings().get("mode", 0)) % 2, switch_source=True)
         self._fit_to_screen()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         log_event(logging.INFO, "app_initialized",
@@ -3515,11 +3592,12 @@ class InterpreterApp(ctk.CTk):
         self.translated_label = ctk.CTkLabel(interp_tab, text="Translation → Russian",
                                              font=ctk.CTkFont(size=12, weight="bold"))
         self.translated_label.grid(row=0, column=1, sticky="w", padx=(12, 4), pady=(4, 4))
+        self._text_size = int(load_settings().get("text_size", 14))
         self.heard_box = ctk.CTkTextbox(interp_tab, wrap="word", height=120,
-                                        font=ctk.CTkFont(size=14))
+                                        font=ctk.CTkFont(size=self._text_size))
         self.heard_box.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         self.translated_box = ctk.CTkTextbox(interp_tab, wrap="word", height=120,
-                                             font=ctk.CTkFont(size=14))
+                                             font=ctk.CTkFont(size=self._text_size))
         self.translated_box.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
         # ─── Diagnostics tab ──────────────────────────────────────────────
@@ -3566,10 +3644,17 @@ class InterpreterApp(ctk.CTk):
                      font=ctk.CTkFont(size=11),
                      text_color=("gray45", "gray55"), anchor="w").grid(
             row=0, column=0, sticky="ew")
+        # Text size (caption guidance: readers must control the size)
+        for col, (label, step) in enumerate((("A−", -1), ("A+", 1)), start=1):
+            ctk.CTkButton(status_bar, text=label, width=40,
+                          fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
+                          text_color=("gray10", "gray90"),
+                          command=lambda d=step: self._change_text_size(d)).grid(
+                row=0, column=col, padx=(6, 0))
         ctk.CTkButton(status_bar, text="Export Log Summary", width=150,
                       fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
                       text_color=("gray10", "gray90"),
-                      command=self._export_log_summary).grid(row=0, column=1, padx=(10, 0))
+                      command=self._export_log_summary).grid(row=0, column=3, padx=(10, 0))
 
     # ── Level meter ───────────────────────────────────────────────────────
 
@@ -3606,6 +3691,7 @@ class InterpreterApp(ctk.CTk):
         if self.is_listening:
             self._stop_session(keep_mode=True)
         self._active_mode = mode_idx
+        save_settings(mode=mode_idx)   # remembered for the next start
         device_lbl, src_lang, tgt_lang = self._mode_state[mode_idx]
         if switch_source and device_lbl:
             self.device_var.set(device_lbl)
@@ -3811,6 +3897,13 @@ class InterpreterApp(ctk.CTk):
             early_slot=self._early_slot,
         )
         self._capture_thread.set_sensitivity(round(self.sensitivity_var.get(), 2))
+        # Previews from a large main model (Turbo/Medium) take ~190 ms each;
+        # every 0.2 s kept the GPU at 100 % and made finished phrases wait
+        # (logs: 120 ms median, 331 ms p95; 561 previews thrown away). Make
+        # them every 0.45 s instead; small preview models keep 0.2 s.
+        if not self._preview_enabled and MODELS.get(self.model_var.get()) in (
+                "large-v3-turbo", "medium"):
+            self._capture_thread.preview_interval_sec = MAIN_MODEL_PREVIEW_INTERVAL_SEC
         self._capture_thread.start()
 
         # ── Translation workers (TRANSLATION_WORKERS parallel) ────────────
@@ -4333,8 +4426,19 @@ class InterpreterApp(ctk.CTk):
         if len(text) > MAX_TEXT_HISTORY_CHARS:
             box.delete("1.0", f"1.0 + {len(text) - MAX_TEXT_HISTORY_CHARS} chars")
 
+    @staticmethod
+    def _at_bottom(box):
+        """True if the text box is scrolled to the end. If the user has
+        scrolled up to re-read something, new text must not yank the view
+        back down (real-time caption design guidance)."""
+        try:
+            return box.yview()[1] >= 0.98
+        except Exception:
+            return True
+
     def _set_live(self, box, seq, text):
         """Show (or replace) the grey in-progress line for phrase `seq`."""
+        follow = self._at_bottom(box)
         start, live_seq = self._live.get(box, (None, None))
         if live_seq is not None and seq < live_seq:
             return
@@ -4360,25 +4464,47 @@ class InterpreterApp(ctk.CTk):
         box.insert(start, prefix + "… " + stable_text + (" " if stable_text else ""), "stable")
         box.insert("end-1c", changing_text, "live")
         box.tag_config("live", foreground="gray55")
-        box.see("end")
+        if follow:
+            box.see("end")
         self._live[box] = (start, seq)
 
     def _commit(self, box, seq, text):
         """Replace the live line (if it belongs to `seq` or earlier) with the
         final text."""
+        follow = self._at_bottom(box)
         start, live_seq = self._live.get(box, (None, None))
         if start is not None and live_seq <= seq:
             box.delete(start, "end")
             self._live.pop(box, None)
-        if text:
-            if box in self._live:      # a newer phrase is previewing: insert before it
-                start, live_seq = self._live[box]
-                prefix = "\n" if box.get("1.0", start).strip() else ""
-                box.insert(start, prefix + text)
-                self._live[box] = (box.index(f"{start} + {len(prefix + text)} chars"), live_seq)
-            else:
-                self._append(box, text)
-                self._trim_textbox(box)
+        if not text:
+            return
+        # Insert at the end of the finished text: before a newer phrase's
+        # preview if one is showing, otherwise at the very end.
+        live = self._live.get(box)
+        anchor = live[0] if live else box.index("end-1c")
+        before = box.get("1.0", anchor)
+        joined, piece = continuation_join(before, text)
+        if joined:      # "...они..." + "...включаться" -> one line
+            cut, insert = trailing_marks_length(before), " " + piece
+        else:
+            cut, insert = 0, ("\n" if before.strip() else "") + text
+        pos = box.index(f"{anchor} - {cut} chars")
+        if cut:
+            box.delete(pos, anchor)
+        box.insert(pos, insert)
+        if live:
+            self._live[box] = (box.index(f"{pos} + {len(insert)} chars"), live[1])
+        else:
+            self._trim_textbox(box)
+        if follow:
+            box.see("end")
+
+    def _change_text_size(self, step):
+        """A−/A+ buttons: change the transcript font size (10-32), saved."""
+        self._text_size = max(10, min(32, self._text_size + step))
+        for box in (self.heard_box, self.translated_box):
+            box.configure(font=ctk.CTkFont(size=self._text_size))
+        save_settings(text_size=self._text_size)
 
     def _commit_translation(self, seq, text):
         """Show a finished translation, and speak it if Speak is on."""
@@ -4407,9 +4533,50 @@ class InterpreterApp(ctk.CTk):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    install_global_exception_hooks()
-    log_event(logging.INFO, "app_main_start")
+def acquire_single_instance():
+    """Allow only one copy of the app at a time. Two copies would fight over
+    the audio device and the GPU, and both write the same log file at once,
+    which corrupted a log line in testing. Returns an open lock file to keep
+    for the app's lifetime, or None if another copy already holds it."""
+    import msvcrt
+    lock = open(APP_DIR / "interpreter.lock", "a+")
+    try:
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        return lock
+    except OSError:
+        lock.close()
+        return None
+
+
+def run_classic():
+    """Start the original customtkinter window."""
+    log_event(logging.INFO, "app_main_start", gui="classic")
     app = InterpreterApp()
     app.mainloop()
-    log_event(logging.INFO, "app_main_exit")
+    log_event(logging.INFO, "app_main_exit", gui="classic")
+
+
+if __name__ == "__main__":
+    # `python interpreter.py` opens the Fluent window (interpreter_qt.py) by
+    # default; `python interpreter.py --classic` opens the original window.
+    install_global_exception_hooks()
+    instance_lock = acquire_single_instance()
+    if instance_lock is None:
+        log_event(logging.WARNING, "second_instance_refused")
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None, "Voice Interpreter is already running.", "Voice Interpreter", 0x40)
+        sys.exit(0)
+    if "--classic" in sys.argv:
+        run_classic()
+    else:
+        # interpreter_qt does `import interpreter`. Register this running file
+        # under that name first, so it isn't loaded (and initialised) twice.
+        sys.modules["interpreter"] = sys.modules["__main__"]
+        try:
+            import interpreter_qt
+        except ImportError as e:
+            log_exception("fluent_window_unavailable", e)
+            run_classic()     # PySide6 not installed: fall back to the classic window
+        else:
+            interpreter_qt.main()

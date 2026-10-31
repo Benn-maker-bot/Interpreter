@@ -6,7 +6,7 @@ REM  Double-click this file. It:
 REM    1. checks that Python is installed,
 REM    2. installs the packages listed in requirements.txt,
 REM    3. reports whether an NVIDIA GPU can be used (much faster),
-REM    4. starts the app (interpreter.py).
+REM    4. starts the app (interpreter.py; add --classic for the old window).
 REM
 REM  Note: this uses whichever "python" is on your PATH. For development the
 REM  project uses a virtual environment instead (.venv) - see README.txt.

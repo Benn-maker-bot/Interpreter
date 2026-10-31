@@ -4,7 +4,8 @@
 # ">=" means "this version or newer".
 
 # ── Window ────────────────────────────────────────────────────────────────
-customtkinter>=5.2.0        # modern-looking widgets on top of Python's Tkinter
+customtkinter>=5.2.0        # classic window (interpreter.py)
+PySide6-Fluent-Widgets>=1.6  # Fluent window (interpreter_qt.py): Qt + Windows 11 style controls
 
 # ── Audio ─────────────────────────────────────────────────────────────────
 pyaudiowpatch>=0.2.12.9     # records audio; this PyAudio fork can also record what

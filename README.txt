@@ -20,14 +20,37 @@ QUICK START
      Python projects):
          py -3.13 -m venv .venv
          .venv\Scripts\python -m pip install -r requirements.txt
-  3. Start the app:
-         .venv\Scripts\python interpreter.py
-     (or double-click setup_and_run.bat, which uses the Python on your PATH)
+  3. Start the app (or double-click setup_and_run.bat):
+         .venv\Scripts\python interpreter.py              Fluent window (default)
+         .venv\Scripts\python interpreter.py --classic    old classic window
+     Only one copy can run at a time (two copies would fight over the
+     audio device and the log files).
   4. The first start downloads the AI models once (Turbo ~1.6 GB, Small
      ~480 MB, Opus-MT ~300 MB per direction). Later starts take seconds.
 
-  The app starts listening by itself. In VS Code, press F5 and choose
-  "Interpreter" to run it under the debugger (.vscode/launch.json).
+  The app starts listening by itself, in the mode you used last. In VS Code,
+  press F5 and choose "Interpreter" or "Interpreter (classic window)".
+  The Settings button (top right) hides the settings to give the
+  transcript more room; A-/A+ change the text size. Both are remembered.
+
+
+DIAGNOSTICS PAGE (Fluent window)
+--------------------------------
+  Click the tools icon in the left bar. Values are coloured green (fine),
+  amber (worth a look) or red (problem); hover over a name for an
+  explanation.
+    Health        overall state, models and translator in use
+    Speed         pause -> final text, first preview, recognition and
+                  translation time, early transcription (last 50 phrases)
+    Audio         level, speech share, onset delay, sensitivity, peaks
+    Recognition   doubtful results, retries, empty phrases, context resets
+    Computer      CPU, memory, GPU load, memory, temperature and clock
+    Pipeline      waiting work, threads alive, watchdog restarts
+    Recent issues every warning/error (errors also pop up at the top right)
+    Recent phrases a table of the last 20 phrases with their timings
+  Buttons: open the app folder and logs, Copy (all figures as text, e.g.
+  to paste into a message) and Speed report (log_tools.py report for this
+  run, shown in the window).
 
 
 USING THE WINDOW
@@ -57,8 +80,12 @@ USING THE WINDOW
 
 FILES IN THIS FOLDER
 --------------------
-  interpreter.py               the application (start reading at the top:
-                               it explains how everything works)
+  interpreter.py               the application (start it with this file)
+                               and the classic window
+                               (start reading at the top: it explains how
+                               everything works)
+  interpreter_qt.py            the Fluent window (PySide6); reuses all the
+                               logic in interpreter.py
   log_tools.py                 analysis tool for the logs (see below)
   requirements.txt             the Python packages needed, with comments
   setup_and_run.bat            one-click install and start
