@@ -232,10 +232,24 @@ def build_report(since=None):
     # ── Step 6: CPU, memory, GPU and how promptly the window updates.
     resource_stats = by_event.get("resource_stats", [])
     out.append("\nResources and UI (10 s windows)")
-    for k, unit in (("process_cpu_pct", "%"), ("system_cpu_pct", "%"), ("rss_mb", "MB"),
-                    ("gpu_util_pct", "%"), ("gpu_mem_used_mb", "MB"), ("gpu_sm_clock_mhz", "MHz"),
-                    ("gpu_temp_c", "C")):
+    for k, unit in (("process_cpu_pct", "%"), ("process_cpu_machine_pct", "%"),
+                    ("system_cpu_pct", "%"), ("cpu_freq_mhz", "MHz"), ("rss_mb", "MB"),
+                    ("mem_available_mb", "MB"), ("gpu_util_pct", "%"), ("gpu_mem_used_mb", "MB"),
+                    ("gpu_mem_free_mb", "MB"), ("gpu_sm_clock_mhz", "MHz"), ("gpu_temp_c", "C"),
+                    ("threads", ""), ("probe_ms", "ms")):
         out.append(_row(k, column(resource_stats, k), unit))
+    # Average CPU per thread of ours (% of one core) and the busiest other apps
+    for field, title in (("thread_cpu_pct", "CPU by app thread (average % of one core)"),
+                         ("top_other_apps", "Busiest other apps (average % of one core)")):
+        totals = Counter()
+        windows = [w[field] for w in resource_stats if isinstance(w.get(field), dict)]
+        for w in windows:
+            totals.update(w)
+        if windows:
+            out.append(f"  {title}: " + ", ".join(
+                f"{k} {v / len(windows):.0f}" for k, v in totals.most_common(6)))
+    for e in by_event.get("resource_warning", [])[-5:]:
+        out.append(f"  WARNING {e['ts'][11:19]}: {'; '.join(e.get('problems', []))}")
     out.append(_row("UI poll lag (p95 per window)",
                     [w["poll_lag_ms"]["p95"] for w in resource_stats if isinstance(w.get("poll_lag_ms"), dict)]))
 
@@ -272,6 +286,65 @@ def build_report(since=None):
                      "(music, overlapping speech) or try a larger model.")
     if (_pct(column(traces, "peak_dbfs"), .95) or -100) > -0.5:
         flags.append("Peaks reach 0 dBFS: input is clipping, lower the source volume.")
+    # Languages Whisper detected (automatic language detection)
+    with_lang = [t for t in traces if t.get("lang")]
+    if with_lang:
+        from collections import Counter as _Counter
+        detected = _Counter(t["lang"] for t in with_lang)
+        switched = _Counter(t["lang_switched"] for t in traces if t.get("lang_switched"))
+        out.append(chr(10) + "Languages (automatic detection)")
+        out.append("  detected (top guess per phrase): " +
+                   ", ".join(f"{k} {v}" for k, v in detected.most_common(8)))
+        out.append("  phrases switched to another language: " +
+                   (", ".join(f"{k} {v}" for k, v in switched.most_common()) or "none"))
+        out.append(_row("expected-language probability", column(traces, "src_lang_prob")))
+        unsure = [t for t in with_lang if not t.get("lang_switched")
+                  and t["lang"] != t.get("src_lang") and (t.get("lang_prob") or 0) >= 0.5]
+        if unsure:
+            out.append(f"  {len(unsure)} phrase(s) looked like another language but were not "
+                       "switched (too short or not clear enough), e.g. "
+                       + "; ".join(f"{t['lang']} {t.get('lang_prob')}: {(t.get('text') or '')[:30]!r}"
+                                   for t in unsure[:3]))
+    # Music mode (music.py): how often music was detected and what it cost
+    music_traces = [t for t in traces if t.get("music_mode")]
+    if any("sound_music" in t for t in traces):
+        out.append("\nMusic and singing (sound classifier, vocal separation)")
+        out.append(f"  phrases in music mode: {len(music_traces)} of {len(traces)}   "
+                   f"with singing: {sum(1 for t in music_traces if t.get('singing'))}   "
+                   f"instrumental skipped: {len(by_event.get('transcription_skipped_instrumental', []))}")
+        out.append(_row("music score (all phrases)", column(traces, "sound_music")))
+        out.append(_row("speech score (all phrases)", column(traces, "sound_speech")))
+        out.append(_row("classifier time", column(traces, "sound_classify_ms"), "ms"))
+        out.append(_row("vocal separation time", column(music_traces, "separation_ms"), "ms"))
+        out.append(_row("music removed (level)", column(music_traces, "music_removed_db"), "dBFS"))
+        out.append(_row("audio length in music mode",
+                        [x * 1000 if x else None for x in column(music_traces, "audio_sec")], "ms"))
+        for e in by_event.get("music_mode_changed", [])[-6:]:
+            out.append(f"  {e['ts'][11:19]}  music mode {'ON' if e.get('active') else 'off'} "
+                       f"({e.get('reason') or 'phrase median ' + str(e.get('music_median'))}; "
+                       f"last seconds {e.get('last_seconds', '-')})")
+        scene = by_event.get("music_scene_stats", [])
+        if scene:
+            out.append(_row("music score per second (10 s mean)", column(scene, "music_mean")))
+            out.append(f"  seconds judged: {sum(w.get('windows', 0) for w in scene)}   silent: "
+                       f"{sum(w.get('silent_windows', 0) for w in scene)}   mode switches: "
+                       f"{sum(w.get('switches', 0) for w in scene)}")
+        failures = by_event.get("music_processing_failed", []) + by_event.get("music_scene_failed", [])
+        if failures:
+            flags.append(f"Music processing failed {len(failures)} time(s): see the error log.")
+    # Times the captured device received no sound at all (source paused,
+    # or playing to another device), with the apps that were playing.
+    silences = by_event.get("source_silent", [])
+    resumed = by_event.get("source_resumed", [])
+    if silences:
+        out.append("\nSource silent (no sound reached the device for 5 s or more)")
+        for e in silences[-8:]:
+            back = next((r for r in resumed if r["ts"] > e["ts"]), None)
+            until = f"{back['ts'][11:19]} ({back.get('silent_sec')} s)" if back else "end of log"
+            apps = ", ".join(a["app"] for a in e.get("playing_apps", []) if "app" in a)
+            out.append(f"  {e['ts'][11:19]}  silent until {until}; "
+                       f"apps with sound sessions: {apps or 'none'}")
+        flags.append(f"The audio source went silent {len(silences)} time(s): see 'Source silent' above.")
     out.append("\nFindings")
     out.extend(f"  - {f}" for f in flags) if flags else out.append("  - nothing abnormal")
     return "\n".join(out)
@@ -507,13 +580,20 @@ def build_compare(since=None, fill_refs=False, ref_model="large-v3"):
                f"{sens:.1f}" if isinstance(sens, (int, float)) else "?",
                t.get("cfg_compute_type") or "?")
         g = groups.setdefault(key, {"pause_to_text": [], "first_preview": [], "process": [],
-                                    "early": [], "suspicious": [], "preview_agree": [],
+                                    "early": [], "suspicious": [], "preview_agree": [], "first_text": [],
                                     "errors": 0, "ref_words": 0, "n": 0})
         g["n"] += 1
         d = displayed.get((t.get("session_id"), t.get("run_id"), t.get("seq")))
         if d:
             g["pause_to_text"].append(d.get("speech_end_to_text_ms"))
             g["first_preview"].append(d.get("first_preview_ms"))
+            # First text of any kind: the first preview, or with previews Off
+            # the finished phrase (speech start -> pause -> text on screen).
+            # This makes "Off" comparable with the preview settings.
+            first = d.get("first_preview_ms")
+            if first is None and t.get("capture_ms") is not None and d.get("speech_end_to_text_ms") is not None:
+                first = t["capture_ms"] + d["speech_end_to_text_ms"]
+            g["first_text"].append(first)
         g["process"].append(t.get("process_ms"))
         g["early"].append(1 if t.get("early_used") else 0)
         g["suspicious"].append(1 if t.get("suspicious") else 0)
@@ -537,10 +617,11 @@ def build_compare(since=None, fill_refs=False, ref_model="large-v3"):
     out = [f"Settings comparison ({len(traces)} phrases)",
            "  pause->text = end of speech to final text on screen (median); "
            "1st preview = speech start to first live text;",
+           "  1st text = speech start to the first text of any kind (with previews off, the final text);",
            "  early = phrases whose early transcription was used; preview ok = share of "
            "the final words the last preview already had right.\n",
            f"  {'model':<15}{'preview':<15}{'sens':>5} {'compute':<13}{'phrases':>7}"
-           f"{'pause->text':>12}{'1st preview':>12}{'process':>9}{'early':>7}"
+           f"{'pause->text':>12}{'1st preview':>12}{'1st text':>10}{'process':>9}{'early':>7}"
            f"{'doubtful':>9}{'preview ok':>11}{'WER':>8}"]
     for key in sorted(groups, key=lambda k: -groups[k]["n"]):
         g = groups[key]
@@ -549,6 +630,7 @@ def build_compare(since=None, fill_refs=False, ref_model="large-v3"):
         out.append(f"  {key[0]:<15}{key[1]:<15}{key[2]:>5} {key[3]:<13}{n:>7}"
                    f"{fmt(med(g['pause_to_text']), ' ms'):>12}"
                    f"{fmt(med(g['first_preview']), ' ms'):>12}"
+                   f"{fmt(med(g['first_text']), ' ms'):>10}"
                    f"{fmt(med(g['process']), ' ms'):>9}"
                    f"{100 * sum(g['early']) / n:>6.0f}%{100 * sum(g['suspicious']) / n:>8.0f}%"
                    f"{fmt(med(g['preview_agree']), '%'):>11}{wer:>8}")

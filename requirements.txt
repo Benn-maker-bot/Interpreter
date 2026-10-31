@@ -21,6 +21,18 @@ ctranslate2>=4.4.0          # the engine faster-whisper and Opus-MT run on
 nvidia-cublas-cu12>=12.4    # NVIDIA CUDA libraries so CTranslate2 can use the GPU
 nvidia-cudnn-cu12>=9,<10    # (Windows; not needed when running on the CPU only)
 
+# ── Music mode (music.py): sound classifier + vocal separation ───────────
+# onnxruntime-gpu runs YAMNet and the UVR vocal model. 1.23 is the newest
+# build for CUDA 12 (1.24+ need CUDA 13). faster-whisper also installs the
+# CPU-only "onnxruntime", which overwrites the GPU one; after installing,
+# run setup_and_run.bat or:
+#   pip uninstall -y onnxruntime && pip install --force-reinstall --no-deps onnxruntime-gpu==1.23.2
+onnxruntime-gpu==1.23.2
+nvidia-cuda-runtime-cu12>=12.4,<13   # CUDA runtime and FFT libraries the
+nvidia-cufft-cu12>=11,<12            # GPU onnxruntime needs
+huggingface_hub>=0.20       # downloads the models once
+soundfile>=0.12             # reads the test recordings (fetch_testdata.py)
+
 # ── Translation ──────────────────────────────────────────────────────────
 sentencepiece>=0.2          # splits text into pieces for the local Opus-MT models
 requests>=2.31.0            # web requests for the online translation fallback
@@ -31,6 +43,7 @@ comtypes>=1.4               # talks to Windows' built-in speech engine (SAPI)
 
 # ── Diagnostics (resource_stats log lines) ───────────────────────────────
 psutil>=5.9                 # CPU and memory use; physical core count
+pycaw>=20251023            # which apps are playing sound (logged when the source goes silent)
 nvidia-ml-py>=12            # GPU load, memory, clock speed and temperature
 
 # ── Building a standalone .exe (build_exe.bat) ───────────────────────────

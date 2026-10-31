@@ -19,3 +19,4 @@ logs/
 # Phrase audio saved for accuracy analysis
 recordings/
 interpreter.lock
+testdata/

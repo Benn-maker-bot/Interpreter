@@ -324,6 +324,7 @@ MAX_TEXT_HISTORY_CHARS         = 12_000
 # Warn when this many phrases / translations are waiting to be processed.
 PHRASE_QUEUE_BACKLOG_WARN      = 6
 TRANSLATION_QUEUE_BACKLOG_WARN = 16
+GPU_CPU_THREADS                = 4          # CPU threads per model when it runs on the GPU
 TRANSLATION_WORKERS            = 1          # >1 lets results arrive out of order
 TRANSLATION_QUEUE_MAX          = 64
 
@@ -336,6 +337,18 @@ TRANSLATION_QUEUE_MAX          = 64
 # errors also go to interpreter.error.log.jsonl) and a readable line in the
 # console. log_tools.py reads these files to measure speed and accuracy.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _json_safe(value):
+    """Turn values json can't write (numpy numbers/arrays, paths, sets) into
+    plain ones, so a log line is never lost because of one field."""
+    if hasattr(value, "item") and getattr(value, "size", 1) == 1:
+        return value.item()               # numpy scalar -> Python number/bool
+    if hasattr(value, "tolist"):
+        return value.tolist()             # numpy array -> list
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    return str(value)
 
 class JsonLineFormatter(logging.Formatter):
     """Turns each log message into one line of JSON.
@@ -360,7 +373,9 @@ class JsonLineFormatter(logging.Formatter):
             payload.update(extra_fields)
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+        # default=_json_safe: numpy numbers (np.int64, np.bool_ …) are not
+        # JSON types; without it the whole line was silently lost.
+        return json.dumps(payload, ensure_ascii=False, default=_json_safe)
 
 
 class GZipRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -444,6 +459,131 @@ def log_event(level: int, event: str, **fields):
         ERROR_LOG.log(level, event, extra={"event": event, "fields": fields})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Plain-language explanations of errors (shown in the window)
+#
+# The log names an error by its event ("music_processing_failed") and
+# Python's message ("name 'np' is not defined"), which means little to
+# someone who didn't write the code. explain_issue() turns that into a
+# title, what it means, and what to do. Events not listed get a general
+# explanation based on the kind of Python error.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ISSUE_HELP = {
+    # event: (title, what it means, what you can do)
+    "music_processing_failed": (
+        "Music mode stopped working",
+        "The part that detects music and removes instruments from the sound "
+        "failed. Speech is still recognised normally, just without the "
+        "music adjustments.",
+        "Nothing urgent. If it keeps happening, restart the app; if it still "
+        "fails, it is a bug - copy the details for the developer."),
+    "music_scene_failed": (
+        "Music detection failed",
+        "The once-per-second check for music could not run.",
+        "Speech recognition continues. Restart the app if music mode is needed."),
+    "music_scene_unavailable": (
+        "Music mode is not available",
+        "The music detector could not be started (a package may be missing).",
+        "Re-run setup_and_run.bat, or the pip install command in README.txt."),
+    "transcription_failed": (
+        "A phrase could not be recognised",
+        "Whisper failed on one piece of speech; that phrase is missing from "
+        "the transcript.",
+        "One-off failures are harmless. If many happen, try a smaller Model."),
+    "translation_failed": (
+        "A translation failed",
+        "The text was recognised but could not be translated.",
+        "Check the internet connection if the local translator isn't used."),
+    "audio_device_error": (
+        "Problem with the audio device",
+        "The selected microphone or speaker stopped sending sound.",
+        "Check it is plugged in; choose it again under Audio input; in Windows "
+        "Sound settings untick 'Allow applications to take exclusive control'."),
+    "audio_open_failed": (
+        "The audio device could not be opened",
+        "Windows refused to let the app record from the selected device.",
+        "Pick another device, or close apps that may be using it exclusively."),
+    "phrase_record_failed": (
+        "A recording could not be saved",
+        "The audio copy kept for accuracy checks was not written (disk full, "
+        "or a file open in another program). Recognition is not affected.",
+        "Close programs using files in the recordings folder."),
+    "settings_save_failed": (
+        "Settings could not be saved",
+        "Your choices will not be remembered next time.",
+        "Check that interpreter.settings.json is not read-only or open elsewhere."),
+    "power_throttling_failed": (
+        "Windows power saving could not be turned off",
+        "When this window is in the background, Windows may slow the app down.",
+        "Usually harmless; keep the window visible during important calls."),
+    "resource_warning": (
+        "The computer is running short of resources",
+        "Free memory, graphics memory or CPU time is low; recognition may "
+        "become slow or stutter.",
+        "Close unused programs, or choose a smaller Model."),
+    "source_silent": (
+        "No sound is reaching the selected device",
+        "Nothing is playing on it: the app playing the sound stopped, or it is "
+        "playing to a different device.",
+        "Check the call or video is playing, and that it plays to this device."),
+    "music_processing_disabled": (
+        "Music mode was switched off",
+        "Music processing failed several times in a row, so it was turned off "
+        "for this session. Speech recognition works as usual.",
+        "Restart the app to try music mode again."),
+    "watchdog_restart": (
+        "A stuck part of the app was restarted",
+        "A background task stopped responding and was restarted automatically.",
+        "Nothing to do unless it happens often."),
+}
+
+# General explanations by Python error type, for events not listed above
+ERROR_KIND_HELP = {
+    "NameError":       "a programming mistake in the app (a name used in the code doesn't exist) - a bug",
+    "AttributeError":  "a programming mistake in the app, or an incompatible package version",
+    "TypeError":       "a programming mistake in the app (wrong kind of value) - a bug",
+    "KeyError":        "missing data the code expected - probably a bug",
+    "ImportError":     "a required package is missing or broken",
+    "ModuleNotFoundError": "a required package is not installed",
+    "FileNotFoundError": "a file or model the app needs was not found",
+    "PermissionError": "Windows refused access to a file or device",
+    "OSError":         "a problem with a device, file or the operating system",
+    "MemoryError":     "the computer ran out of memory",
+    "ConnectionError": "no internet connection (or the service is down)",
+    "TimeoutError":    "something took too long to respond",
+    "RuntimeError":    "a library reported a problem (often the graphics card / CUDA)",
+}
+
+
+def explain_issue(event, fields=None, exc_info=None):
+    """Plain-language description of a logged problem: dict with title,
+    meaning, action, technical (the Python error) and where (file:line)."""
+    fields = fields or {}
+    kind = fields.get("exception_type") or ""
+    message = fields.get("exception_message") or fields.get("error") or ""
+    if not message and fields.get("problems"):
+        message = "; ".join(map(str, fields["problems"]))
+    where = ""
+    if exc_info and exc_info[2] is not None:
+        tb = traceback.extract_tb(exc_info[2])
+        if tb:
+            frame = tb[-1]
+            where = f"{os.path.basename(frame.filename)}, line {frame.lineno}, in {frame.name}"
+    if event in ISSUE_HELP:
+        title, meaning, action = ISSUE_HELP[event]
+    else:
+        title = event.replace("_", " ").capitalize()
+        general = ERROR_KIND_HELP.get(kind)
+        meaning = (f"Something went wrong: {general}." if general
+                   else "Something went wrong in the app.")
+        action = ("If it keeps happening, restart the app. Use Diagnostics → Copy "
+                  "to send the details to the developer.")
+    technical = f"{kind}: {message}" if kind else message
+    return {"title": title, "meaning": meaning, "action": action,
+            "technical": technical.strip(": "), "where": where}
+
+
 def log_exception(event: str, exc: Exception, **fields):
     """Log an error together with its full traceback (the list of calls that
     led to it), so problems can be diagnosed later from the log files.
@@ -453,6 +593,70 @@ def log_exception(event: str, exc: Exception, **fields):
     merged.setdefault("exception_message", str(exc))
     APP_LOG.error(   event, exc_info=(type(exc), exc, exc.__traceback__), extra={"event": event, "fields": merged})
     ERROR_LOG.error( event, exc_info=(type(exc), exc, exc.__traceback__), extra={"event": event, "fields": merged})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows scheduling: keep the audio smooth while Teams/Telemost run too
+#
+# When this window is in the background (Teams in front), Windows may put
+# the app in "EcoQoS" power-saving mode: slower clocks and the small
+# efficiency cores. Audio work must not be throttled (Microsoft: EcoQoS is
+# not for performance-critical work), so the process opts out. The audio
+# capture thread also registers with MMCSS "Pro Audio" (the Multimedia Class
+# Scheduler, used by audio apps) so a CPU burst from another app cannot
+# delay it; the logs showed one 364 ms capture stall.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def disable_power_throttling():
+    """Opt the whole process out of EcoQoS throttling (Windows 10 1709+)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PowerThrottlingState(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+        # ControlMask = EXECUTION_SPEED (1) controlled by us; StateMask 0 = off
+        state = PowerThrottlingState(1, 1, 0)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                   ctypes.c_void_p, wintypes.DWORD]
+        ok = kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), 4,  # ProcessPowerThrottling
+                                            ctypes.byref(state), ctypes.sizeof(state))
+        log_event(logging.INFO, "power_throttling_disabled", ok=bool(ok))
+        return bool(ok)
+    except Exception as e:
+        log_exception("power_throttling_failed", e)
+        return False
+
+
+def boost_audio_thread():
+    """Call from the audio capture thread: MMCSS "Pro Audio", or failing
+    that a plain above-normal thread priority. Returns what was applied."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        task_index = wintypes.DWORD(0)
+        avrt = ctypes.windll.avrt
+        avrt.AvSetMmThreadCharacteristicsW.restype = wintypes.HANDLE
+        if avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task_index)):
+            return "mmcss_pro_audio"
+    except Exception:
+        pass
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentThread.restype = ctypes.c_void_p
+        if kernel32.SetThreadPriority(ctypes.c_void_p(kernel32.GetCurrentThread()), 1):  # ABOVE_NORMAL
+            return "above_normal"
+    except Exception:
+        pass
+    return None
 
 
 def install_global_exception_hooks():
@@ -562,15 +766,23 @@ CHUNK_SAMPLES    = 512
 CHANNELS         = 1
 SAMPLE_WIDTH     = 2
 SILENCE_SEC      = 0.3     # pause that ends a phrase (sentence gaps are often ~0.25-0.4 s)
-MAX_PHRASE_SEC   = 7       # longest phrase before a forced cut. Previews show text
+MAX_PHRASE_SEC   = 10      # longest phrase before a forced cut. Previews show text
                            # live, so a longer phrase costs no visible delay but
                            # means fewer cuts through words (the main error source)
-CUT_SEARCH_SEC   = 1.5     # ...made where speech is least likely in this final window
+CUT_SEARCH_SEC   = 2.5     # ...made at the quietest word gap in this final window
 PARTIAL_INTERVAL_SEC = 0.2 # live preview cadence; the worker skips stale ones,
                            # so this self-limits to what the GPU can keep up with
 PARTIAL_MIN_SEC  = 0.5     # less audio than this makes Whisper guess wildly
 MAIN_MODEL_PREVIEW_INTERVAL_SEC = 0.45   # preview cadence when a large main model
                                          # makes the previews (see _start_session)
+# Music mode (see music.py): sung notes have no clear pauses, so the speech
+# detector chopped songs into 1 s pieces Whisper could not understand. While
+# music plays, a phrase needs a longer pause to end and may run longer, and
+# the speech threshold is lower (singing scores lower than speech).
+MUSIC_SILENCE_SEC    = 0.9
+MUSIC_MAX_PHRASE_SEC = 15
+MUSIC_VAD_DROP       = 0.15
+VOICE_GAP_DB         = 12     # separated voice this close to the mix = singing
 MIN_PHRASE_SEC   = 0.5     # shorter clips are mostly silence and make Whisper hallucinate
 MAX_READ_FAILURES = 20     # consecutive audio read errors (~1 s) before capture gives up
 WATCHDOG_SEC      = 2      # how often the UI checks that capture/workers are alive
@@ -585,6 +797,7 @@ EARLY_FINAL_SEC  = 0.1     # "early transcription on silence" (idea from Realtim
                            # pause reaches SILENCE_SEC the result is used at once (saving the
                            # ~0.2 s transcription time); if speech resumes it is thrown away.
 SILENCE_FLOOR_DBFS = -65   # below this it's digital silence: skip VAD entirely
+SOURCE_SILENT_SEC  = 5     # this long with no sound at all -> "source_silent" warning
 ONSET_PROB       = 0.2     # a speech score this high counts as "possibly speech": the time
                            # from then until the detector actually starts a phrase is logged
                            # as onset_delay_ms (how late, at this sensitivity, speech is noticed)
@@ -672,18 +885,64 @@ DEFAULT_MODEL_GPU = "Turbo — best accuracy ★"
 # Model for live previews (finished phrases always use the main model).
 # Measured preview cost on the RTX 4060 Ti: Tiny ~40 ms, Small ~90 ms,
 # Turbo ~190 ms (which saturated the GPU and delayed finished phrases).
-PREVIEW_CHOICES = {"Tiny (instant)": "tiny", "Small (balanced)": "small", "Main model": None}
+# "Off": no grey live text at all; only finished phrases are shown. Leaves
+# the GPU free for finished phrases, so it is the baseline to compare the
+# preview settings against (log_tools.py compare groups by this).
+PREVIEW_OFF = "off"
+PREVIEW_CHOICES = {"Off (final text only)": PREVIEW_OFF, "Tiny (instant)": "tiny",
+                   "Small (balanced)": "small", "Main model": None}
 
 # Local neural translation (Opus-MT via CTranslate2, ~30-55 ms on GPU).
 # Replaces the online services for these pairs: no network, no rate limits.
-OPUS_MT_REPOS = {
-    ("ru", "en"): "ooeoeo/opus-mt-ru-en-ct2-float16",
-    ("en", "ru"): "ooeoeo/opus-mt-en-ru-ct2-float16",
-}
+# Local Opus-MT translation models (University of Helsinki), converted for
+# CTranslate2 and published on Hugging Face. Each is ~150-300 MB, downloaded
+# the first time that language pair is needed. ooeoeo's float16 builds are
+# used where they exist, gaudi's for a few more languages into English.
+_OOEOEO_PAIRS = (
+    # into English
+    "ar-en bg-en cs-en da-en de-en es-en fr-en it-en ja-en ko-en ru-en tr-en vi-en zh-en "
+    # from English
+    "en-ar en-de en-es en-fr en-it en-ru en-zh "
+    # into Russian
+    "ar-ru bg-ru da-ru es-ru fr-ru ja-ru ko-ru vi-ru "
+    # between other languages
+    "de-es de-fr ar-de ar-es ar-fr ar-it ar-tr").split()
+OPUS_MT_REPOS = {tuple(pair.split("-")): f"ooeoeo/opus-mt-{pair}-ct2-float16"
+                 for pair in _OOEOEO_PAIRS}
+OPUS_MT_REPOS.update({(src, "en"): f"gaudi/opus-mt-{src}-en-ctranslate2"
+                      for src in ("uk", "pl", "nl", "hi")})
+# Many languages -> English in one model: used when no direct model exists
+OPUS_MT_MUL_EN = "gaudi/opus-mt-mul-en-ctranslate2"
+
+
+_MT_LOADERS_LOCK = threading.Lock()
+
+
+def opus_repo(src, tgt):
+    """Hugging Face repository of the local model for src -> tgt, or None."""
+    if (src, tgt) in OPUS_MT_REPOS:
+        return OPUS_MT_REPOS[(src, tgt)]
+    if tgt == "en" and src not in ("en", "auto"):
+        return OPUS_MT_MUL_EN
+    return None
+
+
+def local_route(src, tgt):
+    """Pairs to translate through locally: [(src, tgt)] if a model exists,
+    [(src, "en"), ("en", tgt)] via English, or [] (use the online service)."""
+    if src == tgt or "auto" in (src, tgt):
+        return []
+    if opus_repo(src, tgt):
+        return [(src, tgt)]
+    if tgt != "en" and opus_repo(src, "en") and opus_repo("en", tgt):
+        return [(src, "en"), ("en", tgt)]
+    return []
 
 # Menu name -> (Whisper language code, online-translation language code).
 # They differ only for Chinese (Google needs "zh-CN").
 LANGUAGES = {
+    # Source only: Whisper detects the language of every phrase
+    "Auto-detect":        ("auto", "auto"),
     "English":            ("en", "en"),
     "Russian":            ("ru", "ru"),
     "Arabic":             ("ar", "ar"),
@@ -701,7 +960,30 @@ LANGUAGES = {
     "Spanish":            ("es", "es"),
     "Turkish":            ("tr", "tr"),
     "Ukrainian":          ("uk", "uk"),
+    "Bulgarian":          ("bg", "bg"),
+    "Polish":             ("pl", "pl"),
+    "Czech":              ("cs", "cs"),
 }
+
+# ── Automatic language detection ─────────────────────────────────────────
+# Whisper guesses the language of each finished phrase from the audio
+# encoding it already made (~4 ms). A German song or a Bulgarian advert in
+# "Russian" mode used to come out as German/Bulgarian text "translated" by
+# the Russian->English model (logs). Now such a phrase is transcribed in its
+# own language, labelled, and translated via English. The switch needs a
+# clear verdict, because short or sung Russian is sometimes misjudged (a
+# 0.9 s clip scored Spanish 0.38 in the tests):
+LANG_SWITCH_PROB  = 0.70   # the other language must score at least this
+LANG_SOURCE_MAX   = 0.15   # ...and the expected language at most this
+LANG_MIN_SPEECH_SEC = 1.5  # ...on at least this much speech
+AUTO_LANG_PROB    = 0.50   # Auto-detect: below this on a short clip, keep the last language
+# Names for the label shown before a phrase in another language
+LANGUAGE_NAMES = {code: name for name, (code, _) in LANGUAGES.items() if code != "auto"}
+TARGET_LANGUAGES = [name for name in LANGUAGES if LANGUAGES[name][0] != "auto"]
+LANGUAGE_NAMES.update({"bg": "Bulgarian", "be": "Belarusian", "sr": "Serbian", "pl": "Polish",
+                       "cs": "Czech", "sv": "Swedish", "fi": "Finnish", "kk": "Kazakh",
+                       "he": "Hebrew", "hu": "Hungarian", "ro": "Romanian", "da": "Danish",
+                       "no": "Norwegian", "lv": "Latvian", "lt": "Lithuanian", "et": "Estonian"})
 
 # ── UI colours ────────────────────────────────────────────────────────────────
 # Colours used by the window. A pair means (light theme, dark theme).
@@ -1481,6 +1763,7 @@ class AudioCaptureThread(threading.Thread):
         self.partial_slot      = partial_slot
         self.early_slot        = early_slot  # early (speculative) finals, see EARLY_FINAL_SEC
         self.preview_interval_sec = PARTIAL_INTERVAL_SEC   # may be raised by the window
+        self.music_scene = None      # music.MusicScene, set by the window (music mode)
         self.mute_evt          = mute_evt   # set while our own TTS is audible on this device
         self.phrase_queue      = phrase_queue
         self.status_cb         = status_cb
@@ -1496,6 +1779,43 @@ class AudioCaptureThread(threading.Thread):
     def stop(self):
         """Ask the thread to stop; it finishes after its current audio block."""
         self._stop_evt.set()
+
+    def _report_source(self, silent, silent_sec):
+        """The captured device went silent (no app playing) or came back.
+        Logs it with the apps that have sound sessions, and tells the user.
+        The app list is read on a short-lived thread (Windows audio API
+        calls can take tens of ms; the capture loop must not wait)."""
+        device = getattr(self, "device_label", None) or f"device {self.device_index}"
+
+        def report():
+            sessions = audio_sessions_snapshot()
+            if silent:
+                log_event(logging.WARNING, "source_silent", device_index=self.device_index,
+                          silent_sec=silent_sec, playing_apps=sessions,
+                          hint="no sound reaches the device: the playing app stopped or "
+                               "plays to a different device")
+            else:
+                log_event(logging.INFO, "source_resumed", device_index=self.device_index,
+                          silent_sec=silent_sec, playing_apps=sessions)
+        threading.Thread(target=report, name="source-check", daemon=True).start()
+        self.status_cb("🔇 No sound is playing on this device" if silent else "Listening…")
+
+    @staticmethod
+    def _best_cut(levels_db, speech_probs, search_blocks):
+        """Index of the block to end a forced cut on: the quietest moment in
+        the last `search_blocks` blocks. In continuous speech the speech score
+        stays ~0.9 even inside words, so using it alone cut through words
+        ("Вродали" for "продали" in the logs). Loudness dips mark the real
+        gaps between words, so each block is scored by its loudness averaged
+        with its neighbours (one loud click doesn't matter), plus the speech
+        score as a tie-breaker (20 dB per 100 %)."""
+        n = len(levels_db)
+        start = max(1, n - search_blocks)
+        def score(i):
+            window = range(i - 1, min(n, i + 2))
+            return (sum(levels_db[j] for j in window) / len(window)
+                    + 20 * sum(speech_probs[j] for j in window) / len(window))
+        return min(range(start, n - 1), key=score)
 
     def _flush(self, seq, blocks, min_blocks, label="Phrase", resample=None, meta=None):
         """Send one finished phrase to the transcription worker.
@@ -1524,6 +1844,7 @@ class AudioCaptureThread(threading.Thread):
 
     def run(self):
         """Thread entry point: create PortAudio, run the capture, always clean up."""
+        log_event(logging.INFO, "audio_thread_priority", applied=boost_audio_thread())
         pa     = pyaudio.PyAudio()
         try:
             self._run(pa)
@@ -1642,6 +1963,16 @@ class AudioCaptureThread(threading.Thread):
         blocks_per_sec          = open_rate / chunk_sz                 # ~31 blocks per second
         silence_blocks_needed   = max(1, int(SILENCE_SEC * blocks_per_sec))       # pause that ends a phrase
         max_phrase_blocks       = int(MAX_PHRASE_SEC * blocks_per_sec)            # longest phrase before a cut
+        # The same two limits while music plays (music mode)
+        speech_limits = (silence_blocks_needed, max_phrase_blocks)
+        music_limits  = (max(1, int(MUSIC_SILENCE_SEC * blocks_per_sec)),
+                         int(MUSIC_MAX_PHRASE_SEC * blocks_per_sec))
+        # Every second, the last second of audio goes to the music detector
+        # (music.MusicScene.feed), so it can switch within ~2 s, also when
+        # nothing is said and no phrase arrives.
+        scene_blocks = max(1, int(round(blocks_per_sec)))
+        scene_buffer = deque(maxlen=scene_blocks)
+        was_music = False
         cut_search_blocks       = int(CUT_SEARCH_SEC * blocks_per_sec)            # where to look for the cut
         preview_interval_blocks = max(1, int(self.preview_interval_sec * blocks_per_sec))  # time between previews
         min_phrase_blocks       = max(1, int(MIN_PHRASE_SEC * blocks_per_sec))    # shorter = treat as noise
@@ -1656,9 +1987,11 @@ class AudioCaptureThread(threading.Thread):
         phrase_blocks, phrase_speech_probs = [], []  # the current phrase's audio blocks and the
                                                      # VAD speech score of each block
         chunk_sec     = chunk_sz / open_rate  # duration of one block, in seconds
+        source_silent_blocks = int(SOURCE_SILENT_SEC / chunk_sec)
         stats         = PerfWindow()          # timings for the capture_stats log line
         last_read_t   = None                  # when the previous block was read
         speech_frames = frames = 0            # blocks judged speech / all blocks (for stats)
+        silent_frames = silent_run = 0        # blocks of no sound at all (total / current run)
         # Per-phrase measurements, logged with the phrase's trace:
         # when its speech started, the level of each block, its loudest peak,
         # and how many previews were made of it.
@@ -1812,6 +2145,21 @@ class AudioCaptureThread(threading.Thread):
             level_db, peak_db = levels_dbfs(data)
             speech_probability = speech_prob() if level_db > SILENCE_FLOOR_DBFS else 0.0
             speech_threshold  = self.vad_threshold
+            # Music mode: longer phrases and a lower speech threshold
+            if self.music_scene is not None:
+                scene_buffer.append(data)
+                if len(scene_buffer) == scene_blocks:
+                    self.music_scene.feed(np.frombuffer(_resample(b"".join(scene_buffer)),
+                                                        dtype=np.int16))
+                    scene_buffer.clear()
+            in_music = bool(self.music_scene is not None and self.music_scene.active)
+            if in_music != was_music:
+                was_music = in_music
+                self.status_cb("♪ Music detected: tuned for lyrics" if in_music
+                               else "Listening…")
+            silence_blocks_needed, max_phrase_blocks = music_limits if in_music else speech_limits
+            if in_music:
+                speech_threshold = max(0.15, speech_threshold - MUSIC_VAD_DROP)
             # Hysteresis: easier to stay in speech than to enter it, so brief
             # dips inside words don't end the phrase.
             speaking = speech_probability >= (speech_threshold - VAD_HYSTERESIS if in_speech else speech_threshold)
@@ -1830,13 +2178,28 @@ class AudioCaptureThread(threading.Thread):
             speech_frames += speaking
             if level_db > -99:
                 stats.add("level_dbfs", level_db)
+            # ── Is anything playing? A loopback device delivers exact zeros
+            #    when no app plays sound; the stream itself keeps running.
+            #    Log when the source goes quiet / comes back, with which apps
+            #    were playing, so "nothing was heard" can be traced to the
+            #    source (a paused browser tab) or to this program.
+            if level_db <= SILENCE_FLOOR_DBFS:
+                silent_frames += 1
+                silent_run += 1
+                if silent_run == source_silent_blocks:
+                    self._report_source(silent=True, silent_sec=SOURCE_SILENT_SEC)
+            else:
+                if silent_run >= source_silent_blocks:
+                    self._report_source(silent=False, silent_sec=round(silent_run * chunk_sec, 1))
+                silent_run = 0
             if stats.due():
                 log_event(logging.INFO, "capture_stats", device_index=self.device_index,
                           chunk_ms=round(chunk_sec * 1000, 1),
                           speech_pct=round(100 * speech_frames / max(1, frames), 1),
+                          silent_pct=round(100 * silent_frames / max(1, frames), 1),
                           vad_threshold=round(speech_threshold, 3),
                           speech_score_histogram=prob_histogram, **stats.summary())
-                frames = speech_frames = 0
+                frames = speech_frames = silent_frames = 0
                 prob_histogram = [0] * 10
 
             # ── Step 2: track whether we are inside a phrase ─────────────
@@ -1890,8 +2253,7 @@ class AudioCaptureThread(threading.Thread):
             elif len(phrase_blocks) >= max_phrase_blocks:
                 # Cut where speech is least likely (a word gap) near the end,
                 # carrying the remainder into the next phrase.
-                start = len(phrase_speech_probs) - cut_search_blocks
-                cut   = start + min(range(cut_search_blocks), key=lambda i: phrase_speech_probs[start + i])
+                cut = self._best_cut(phrase_levels_db, phrase_speech_probs, cut_search_blocks)
                 early_offer_len = None  # an early final never applies to a forced cut
                 self._flush(seq, phrase_blocks[:cut + 1], min_phrase_blocks, "max", _resample,
                             phrase_meta(cut + 1))
@@ -2000,7 +2362,10 @@ class WhisperModelLoader(threading.Thread):
             cores = psutil.cpu_count(logical=False) or os.cpu_count() or 4
         except ImportError:
             cores = max(1, (os.cpu_count() or 4) // 2)
-        kwargs["cpu_threads"] = cores
+        # On the GPU the CPU threads only do small jobs; 24 of them per model
+        # (one model each for final text, previews, ...) just compete with
+        # Teams/Telemost for the CPU, so the GPU gets a few.
+        kwargs["cpu_threads"] = min(GPU_CPU_THREADS, cores) if device == "cuda" else cores
             
         try:
             from faster_whisper.utils import download_model
@@ -2169,13 +2534,57 @@ def clean_translation(source: str, translated: str) -> str:
 
 
 def collapse_repetitions(text: str) -> str:
-    """Shorten runaway repetition ("А-а-а-а-а-а…" ×50, a Whisper loop seen in
-    the logs) to three repeats, keeping the separator style."""
+    """Shorten runaway repetition: one word ("А-а-а-а-а-а…" ×50) to three
+    repeats, and a repeated phrase ("я хочу быть человеком, я хочу быть
+    человеком, …" ×20 in the logs, a Whisper loop on a song chorus) to two."""
     import re
+    # Phrase loops first: 2-12 words repeated 3+ times -> keep two
+    text = re.sub(r"(\b(?:\w+[\s,]+){1,11}?\w+)(?:[\s,.!?…-]+\1\b){2,}",
+                  lambda m: f"{m.group(1)}, {m.group(1)}…", text, flags=re.IGNORECASE)
     def shorten(m):
         word, sep = m.group(1), m.group(2)
         return sep.join([word] + [word.lower()] * 2)
-    return re.sub(r"\b(\w+)([-\s,]+)(?:\1\2?){3,}\b", shorten, text, flags=re.IGNORECASE)
+    return re.sub(r"\b(\w+)([-\s,.!?]+)(?:\1\2?){3,}\b", shorten, text, flags=re.IGNORECASE)
+
+
+def audio_sessions_snapshot() -> list:
+    """Which apps have sound sessions on the default playback device, and
+    whether they are playing right now (Windows Core Audio, via pycaw).
+    Logged when the captured device goes silent or comes back, so a source
+    app that stopped (e.g. a browser tab pausing) can be told apart from a
+    problem in this program. Returns [] if pycaw is missing."""
+    try:
+        import comtypes
+        from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+        comtypes.CoInitialize()
+        out = {}
+        for session in AudioUtilities.GetAllSessions():
+            name = session.Process.name() if session.Process else "system sounds"
+            try:
+                peak = session._ctl.QueryInterface(IAudioMeterInformation).GetPeakValue()
+            except Exception:
+                peak = None
+            state = {0: "inactive", 1: "active", 2: "expired"}.get(session.State, session.State)
+            prev = out.get(name)
+            # One entry per app: the loudest / most active of its sessions
+            if prev is None or (peak or 0) > (prev["peak"] or 0) or state == "active":
+                out[name] = {"state": state, "peak": round(peak, 3) if peak is not None else None}
+        return [dict(app=k, **v) for k, v in out.items()
+                if v["state"] == "active" or (v["peak"] or 0) > 0]
+    except Exception as e:
+        return [{"error": type(e).__name__}]
+
+
+def is_music_loop(text: str) -> bool:
+    """True for the loops Whisper produces on music or humming: one letter
+    held ("Аааааааааа"), or one word repeated ("Спустя. Спустя. Спустя.
+    Спустя." in the logs). Real speech almost never looks like this."""
+    import re
+    letters = [c for c in text.lower() if c.isalpha()]
+    if len(letters) >= 8 and max(letters.count(c) for c in set(letters)) / len(letters) > 0.8:
+        return True
+    words = re.findall(r"\w+", text.lower())
+    return len(words) >= 4 and len(set(words)) == 1
 
 
 def is_hallucination(text: str) -> bool:
@@ -2186,7 +2595,8 @@ def is_hallucination(text: str) -> bool:
     if any(f in text_lower for f in HALLUCINATION_FRAGMENTS):
         return True
     normalized = "".join(ch for ch in text_lower if ch.isalnum() or ch == " ").strip()
-    return not normalized or " ".join(normalized.split()) in HALLUCINATIONS
+    return (not normalized or " ".join(normalized.split()) in HALLUCINATIONS
+            or is_music_loop(text))
 
 
 def plain_device_name(label: str) -> str:
@@ -2308,10 +2718,11 @@ class LocalTranslator:
         # _src_tokenizer / _tgt_tokenizer: split text into, and join it back from,
         # the sub-word pieces the model uses (sentencepiece).
         self.pair = (src, tgt)
-        path = snapshot_download(OPUS_MT_REPOS[(src, tgt)])
+        path = snapshot_download(opus_repo(src, tgt))
         device = "cuda" if WHISPER_DEVICE == "cuda" else "cpu"
         self._translator = ctranslate2.Translator(
-            path, device=device, compute_type="float16" if device == "cuda" else "int8")
+            path, device=device, compute_type="float16" if device == "cuda" else "int8",
+            intra_threads=2 if device == "cuda" else 4)
         self._src_tokenizer = spm.SentencePieceProcessor(model_file=os.path.join(path, "source.spm"))
         self._tgt_tokenizer = spm.SentencePieceProcessor(model_file=os.path.join(path, "target.spm"))
 
@@ -2564,6 +2975,15 @@ class TranscriptionWorker(threading.Thread):
         self.model        = model
         self.model_lock   = INFERENCE_LOCK
         self.src_whisper  = src_whisper
+        # "Auto-detect": the language is decided per phrase (lang_now is the
+        # latest one, used for previews and the next prompt)
+        self.auto_source  = src_whisper == "auto"
+        self.lang_now     = "en" if self.auto_source else src_whisper
+        self._last_shown_lang = None
+        # Languages heard recently (newest first), plus the target language:
+        # the candidates for a short, unclear phrase
+        self._recent_langs = [LANGUAGES.get(tgt_lang_key, ("en", "en"))[0]]
+        self.translator_for = None    # window's _translator_for: any local pair
         self.src_lang_key = src_lang_key
         self.tgt_lang_key = tgt_lang_key
         self.phrase_queue = phrase_queue
@@ -2582,6 +3002,13 @@ class TranscriptionWorker(threading.Thread):
         self.session_id   = session_id      # unique per app launch (run_id restarts at 1)
         self.config       = config or {}    # settings in force, copied into every phrase_trace
         self.early_slot   = early_slot      # early finals from the capture thread
+        self.music_scene  = None            # music.MusicScene (set by the window)
+        self._skip_context = False          # True while decoding a phrase in music mode
+        self._last_vocals  = None           # separated voice of the last phrase (saved by _record)
+        # Automatic language detection (set by the window) and the target
+        # language code (a phrase already in it needs no translation)
+        self.auto_language = True
+        self.tgt_whisper = LANGUAGES.get(tgt_lang_key, ("en", "en"))[0]
         self._early       = None            # (seq, phrase blocks, recognise() result, ms) kept
                                             # until the matching final arrives
         self.record_audio = record_audio
@@ -2590,7 +3017,7 @@ class TranscriptionWorker(threading.Thread):
         tgt_code          = LANGUAGES.get(tgt_lang_key, ("en", "en"))[0]
         # Whisper can translate to English itself (not the turbo model);
         # a local Opus-MT translator, when loaded, is preferred for any pair.
-        self._whisper_can_translate = (tgt_code == "en" and src_whisper != "en")
+        self._whisper_can_translate = (tgt_code == "en" and src_whisper not in ("en", "auto"))
         self._translator_src = translator
         # _last_final: number of the last finished phrase (older previews are
         # skipped); _last_preview: the last preview sent (repeats are skipped);
@@ -2618,13 +3045,23 @@ class TranscriptionWorker(threading.Thread):
             with wave.open(str(path), "wb") as w:
                 w.setnchannels(1); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
                 w.writeframes(audio_bytes)
-            old = sorted(RECORD_DIR.glob("*.wav"))[:-RECORD_KEEP]
+            # Music mode: also keep the separated voice ("…_s12.vocals.wav"),
+            # so log_tools.py can compare recognition on the mix and the voice.
+            vocals, self._last_vocals = self._last_vocals, None
+            if vocals is not None:
+                import numpy as np
+                with wave.open(str(path.with_suffix(".vocals.wav")), "wb") as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
+                    w.writeframes((np.clip(vocals, -1, 1) * 32767).astype(np.int16).tobytes())
+            old = sorted(f for f in RECORD_DIR.glob("*.wav")
+                         if not f.name.endswith(".vocals.wav"))[:-RECORD_KEEP]
             for f in old:
                 # A file can be locked (open in another program): skip it and
                 # try again next time, instead of failing this recording.
                 try:
                     f.unlink(missing_ok=True)
                     f.with_suffix(".ref.json").unlink(missing_ok=True)
+                    f.with_suffix(".vocals.wav").unlink(missing_ok=True)
                 except OSError:
                     pass
             return path.name
@@ -2645,16 +3082,29 @@ class TranscriptionWorker(threading.Thread):
         return (self.translator is None and self._whisper_can_translate
                 and "turbo" not in (getattr(model, "_size_name", "") or ""))
 
-    def _mt(self, text):
-        """Translate with Opus-MT; returns (text, ms) or (None, 0) if unavailable."""
-        translator = self.translator
-        if translator is None or not text:
+    def _mt(self, text, src=None):
+        """Translate locally with Opus-MT from `src` (default: the expected
+        language) to the target, directly or via English. Returns (text, ms),
+        or (None, 0) if no local model is available or ready (the window
+        then uses the online translator)."""
+        src = src or self.src_whisper
+        if not text:
+            return None, 0.0
+        if self.translator_for is not None:
+            hops = local_route(src, self.tgt_whisper)
+            translators = [self.translator_for(*pair) for pair in hops]
+            translators = [t() if callable(t) else t for t in translators]
+        else:                                # tests: only the one given translator
+            translators = [self.translator] if src == self.src_whisper else []
+        if not translators or any(t is None for t in translators):
             return None, 0.0
         t0 = time.perf_counter()
         try:
-            out = clean_translation(text, translator.translate(text))
+            out = text
+            for translator in translators:
+                out = clean_translation(out, translator.translate(out))
         except Exception as e:
-            log_exception("local_translation_failed", e, chars=len(text))
+            log_exception("local_translation_failed", e, chars=len(text), src=src)
             return None, 0.0
         return out, round((time.perf_counter() - t0) * 1000, 2)
 
@@ -2675,7 +3125,7 @@ class TranscriptionWorker(threading.Thread):
         self._vad_opts  = VadOptions(min_silence_duration_ms=300, speech_pad_ms=200)
         self._n_frames  = self.model.feature_extractor.nb_max_frames
 
-    def _decode(self, audio_np, tasks, model=None, beam_size=1):
+    def _decode(self, audio_np, tasks, model=None, beam_size=1, detect=False):
         """Return one text per task. VAD runs once (CPU) and trims silence,
         AGC levels the clip, the GPU encodes it once, then all tasks decode as
         one batch from copies of that encoding. Whisper's encoder always
@@ -2717,6 +3167,8 @@ class TranscriptionWorker(threading.Thread):
             # Note: CUDA calls are asynchronous, so encode_ms can be partly
             # absorbed into decode_ms; their sum is the reliable GPU figure.
             info["encode_ms"] = round((time.perf_counter() - t) * 1000, 2)
+            if detect and self.auto_source:
+                self._detect_auto(model, enc, info)
             t = time.perf_counter()
             results = model.model.generate(
                 enc, self._prompts_for(tasks, model),
@@ -2724,6 +3176,26 @@ class TranscriptionWorker(threading.Thread):
                 return_no_speech_prob=True,
                 return_scores=True, suppress_blank=True)
             info["decode_ms"] = round((time.perf_counter() - t) * 1000, 2)
+            # Language check (finished phrases only). If the phrase is
+            # clearly in another language, decode it again in that
+            # language, plus Whisper's own translation into English.
+            other = (self._detect_language(model, enc, info)
+                     if detect and not self.auto_source else None)
+            if other:
+                t = time.perf_counter()
+                single_enc = enc
+                if len(tasks) > 1:   # enc holds one copy per task: keep one
+                    single_enc = ctranslate2.StorageView.from_array(np.asarray(enc)[:1])
+                # Transcribe only: Turbo was trained without the translate
+                # task (tests: its "English" just repeated the German).
+                alt_tasks = ["transcribe"]
+                results = [model.model.generate(
+                    single_enc, [self._lang_prompt(model, other, task)], beam_size=beam_size,
+                    max_length=self._max_length(info, ["transcribe"], model),
+                    return_no_speech_prob=True, return_scores=True, suppress_blank=True)[0]
+                    for task in alt_tasks]
+                info["lang_switched"] = other
+                info["lang_decode_ms"] = round((time.perf_counter() - t) * 1000, 2)
         texts, dropped = [], []
         info["no_speech_prob"], info["avg_logprob"] = [], []
         for r in results:
@@ -2743,6 +3215,10 @@ class TranscriptionWorker(threading.Thread):
             info["dropped_text"] = dropped
         info["tokens"] = sum(len(r.sequences_ids[0]) for r in results)
         info["_token_ids"] = [list(r.sequences_ids[0]) for r in results]
+        if info.get("lang_switched"):
+            # One transcription in the other language; same shape as tasks
+            texts = [texts[0]] * len(tasks)
+            info["_token_ids"] = info["_token_ids"][:1] * len(tasks)
         return texts, info
 
     def _retry_if_suspicious(self, audio_np, tasks, texts, token_ids, info):
@@ -2791,11 +3267,11 @@ class TranscriptionWorker(threading.Thread):
         <|transcribe|> etc. by one, so Turbo's ids sent to a Tiny/Small
         preview model asked it for the wrong task (garbled, 4x slower
         previews). Ordinary text tokens are shared, so context carries over."""
-        model_key = id(model)
+        model_key = (id(model), self.lang_now)     # Auto-detect: per language
         if model_key not in self._special:
             tokenizer = model.hf_tokenizer
             token_id_of = lambda t: tokenizer.token_to_id(t)
-            head = [token_id_of("<|startoftranscript|>"), token_id_of(f"<|{self.src_whisper}|>")]
+            head = [token_id_of("<|startoftranscript|>"), token_id_of(f"<|{self.lang_now}|>")]
             tail = [token_id_of("<|notimestamps|>")]
             self._special[model_key] = {
                 "prompts": {"transcribe": head + [token_id_of("<|transcribe|>")] + tail,
@@ -2805,6 +3281,74 @@ class TranscriptionWorker(threading.Thread):
                 "text_vocab": token_id_of("<|endoftext|>"),   # ids below this are plain text
             }
         return self._special[model_key]
+
+    def _lang_prompt(self, model, lang, task):
+        """Start-of-decoding tokens for another language (no context):
+        <|startoftranscript|> <|de|> <|transcribe|> <|notimestamps|>."""
+        tok = self._tokens_for(model)["tokenizer"]
+        return [tok.token_to_id("<|startoftranscript|>"), tok.token_to_id(f"<|{lang}|>"),
+                tok.token_to_id(f"<|{task}|>"), tok.token_to_id("<|notimestamps|>")]
+
+    def _detect_auto(self, model, enc, info):
+        """Auto-detect mode: decide this phrase's language before decoding
+        it. A clear verdict (or enough speech) changes lang_now; an unsure
+        one on a short clip keeps the previous language (a second of singing
+        can look like Spanish). Earlier text in another language is dropped
+        from the context."""
+        try:
+            guesses = model.model.detect_language(enc)[0]
+        except Exception as e:
+            info["lang_error"] = str(e)
+            return
+        probs = {code.strip("<|>"): float(p) for code, p in guesses}
+        top, top_p = max(probs.items(), key=lambda kv: kv[1])
+        info["lang"], info["lang_prob"] = top, round(top_p, 3)
+        info["lang_top3"] = {k: round(v, 3) for k, v in
+                             sorted(probs.items(), key=lambda kv: -kv[1])[:3]}
+        sure = top_p >= AUTO_LANG_PROB or (info.get("speech_sec") or 0) >= LANG_MIN_SPEECH_SEC * 2
+        # Unsure (a short or unclear clip): prefer a language already heard in
+        # this session, or the target language, if it is at all plausible.
+        # The simulator showed both bad choices: keeping a language that
+        # scores ~0 ("Annyeong!" for Russian) and trusting a weak top guess
+        # (Japanese 0.4 for the first second of Russian speech).
+        if not sure:
+            familiar = [l for l in self._recent_langs if probs.get(l, 0.0) >= 0.05]
+            if familiar:
+                top = max(familiar, key=lambda l: probs.get(l, 0.0))
+                sure = True
+            elif probs.get(self.lang_now, 0.0) < 0.10:
+                sure = True              # nothing familiar fits: the best guess
+            info["lang_unsure"] = True
+        if sure and top != self.lang_now:
+            info["lang_changed_from"] = self.lang_now
+            self.lang_now = top
+            self._history = {k: [] for k in self._history}
+        info["lang_used"] = self.lang_now
+        if self.lang_now in self._recent_langs:
+            self._recent_langs.remove(self.lang_now)
+        self._recent_langs.insert(0, self.lang_now)
+        del self._recent_langs[6:]
+
+    def _detect_language(self, model, enc, info):
+        """Whisper's language guess for this phrase (from the encoder output,
+        ~4 ms). Records the top languages in info; returns the language to
+        switch to, or None to keep the expected one."""
+        try:
+            guesses = model.model.detect_language(enc)[0]
+        except Exception as e:
+            info["lang_error"] = str(e)
+            return None
+        probs = {code.strip("<|>"): float(p) for code, p in guesses}
+        top, top_p = max(probs.items(), key=lambda kv: kv[1])
+        src_p = probs.get(self.src_whisper, 0.0)
+        info["lang"], info["lang_prob"] = top, round(top_p, 3)
+        info["src_lang_prob"] = round(src_p, 3)
+        info["lang_top3"] = {k: round(v, 3) for k, v in
+                             sorted(probs.items(), key=lambda kv: -kv[1])[:3]}
+        if (top != self.src_whisper and top_p >= LANG_SWITCH_PROB and src_p <= LANG_SOURCE_MAX
+                and (info.get("speech_sec") or 0) >= LANG_MIN_SPEECH_SEC):
+            return top
+        return None
 
     def _max_length(self, info, tasks, model):
         """Longest output allowed for this clip: about 15 tokens per second of
@@ -2828,6 +3372,8 @@ class TranscriptionWorker(threading.Thread):
         special_tokens = self._tokens_for(model)
         histories = [[i for i in (self._history.get(t) or []) if i < special_tokens["text_vocab"]]
                  for t in tasks]
+        if self._skip_context:   # lyrics: earlier phrases (talk) would mislead
+            histories = [[] for _ in tasks]
         # A batch needs <|startoftranscript|> at the same position in every
         # prompt, so give each task the same number of context tokens.
         context_len = min(len(h) for h in histories)
@@ -2973,7 +3519,7 @@ class TranscriptionWorker(threading.Thread):
                 lock_wait_ms = info.get("lock_wait_ms", 0.0)
                 # Text still suspect after a retry is not fed back as context:
                 # that is how one "Спасибо." turned the next phrase into another.
-                if text and not info.get("still_suspicious"):
+                if text and not info.get("still_suspicious") and not info.get("lang_switched"):
                     self._remember(tasks, token_ids,
                                    [text, translated] if whisper_translates else [text])
                 # ── Step 6: record everything about this phrase in one log line
@@ -3019,8 +3565,9 @@ class TranscriptionWorker(threading.Thread):
                 # The settings in force (model, preview model, sensitivity …),
                 # so log_tools.py compare can group results by setting.
                 trace.update({f"cfg_{k}": v for k, v in self.config.items()})
-                trace["cfg_preview_model"] = getattr(self.preview_model or self.model,
-                                                     "_size_name", None)
+                trace["cfg_preview_model"] = (PREVIEW_OFF if self.partial_slot is None else
+                                              getattr(self.preview_model or self.model,
+                                                      "_size_name", None))
                 log_event(logging.INFO, "phrase_trace", **trace)
                 totals = self._session
                 totals["phrases"] += 1
@@ -3059,10 +3606,29 @@ class TranscriptionWorker(threading.Thread):
         Returns a dict with the texts, translation and timing details."""
         whisper_translates = self.local_translate
         tasks = ["transcribe", "translate"] if whisper_translates else ["transcribe"]
-        texts, info = self._decode(audio_np, tasks)
-        token_ids = info.pop("_token_ids", [])
-        texts, token_ids, info = self._retry_if_suspicious(
-            audio_np, tasks, texts, token_ids, info)
+        music = self._music_prepare(audio_np)
+        audio_np = music.pop("_audio", audio_np)
+        if music.pop("_no_voice", False):     # instrumental music: nothing to say
+            log_event(logging.INFO, "transcription_skipped_instrumental", worker_id=self.wid,
+                      **{k: v for k, v in music.items() if not k.startswith("_")})
+            return {"tasks": tasks, "token_ids": [[] for _ in tasks], "info": dict(music),
+                    "whisper_translates": whisper_translates, "text": "",
+                    "translated": "" if whisper_translates else None,
+                    "engine": "none", "mt_ms": 0.0}
+        self._skip_context = bool(music.get("music_mode"))
+        try:
+            texts, info = self._decode(audio_np, tasks, detect=True)
+            token_ids = info.pop("_token_ids", [])
+            if not info.get("lang_switched"):    # retries are tuned for the expected language
+                texts, token_ids, info = self._retry_if_suspicious(
+                    audio_np, tasks, texts, token_ids, info)
+        finally:
+            self._skip_context = False
+        info.update(music)        # scores and mode go into the phrase's log line
+        lang = info.get("lang_switched")
+        if lang:
+            return self._other_language_result(lang, texts, token_ids, info, tasks,
+                                               whisper_translates)
         text       = collapse_repetitions(texts[0])
         translated = collapse_repetitions(texts[1]) if whisper_translates else None
         engine     = "whisper" if whisper_translates else "online"
@@ -3073,6 +3639,18 @@ class TranscriptionWorker(threading.Thread):
             translated = "" if whisper_translates else None
         elif whisper_translates and is_hallucination(translated):
             translated = ""
+        elif self.auto_source:
+            lang = info.get("lang_used") or self.lang_now
+            if lang == self.tgt_whisper:
+                translated, engine = text, "none (already target language)"
+            else:
+                out, mt_ms = self._mt(text, src=lang)
+                if out is not None:
+                    translated, engine = out, f"opus-mt-{lang}"
+            # Label the text when the language changes ("[German] …")
+            if lang != self._last_shown_lang:
+                text = f"[{LANGUAGE_NAMES.get(lang, lang.upper())}] {text}"
+                self._last_shown_lang = lang
         elif not whisper_translates:
             # None from _mt means "no local translator": the window will
             # then send the text to the online translator.
@@ -3082,6 +3660,96 @@ class TranscriptionWorker(threading.Thread):
         return {"tasks": tasks, "token_ids": token_ids, "info": info,
                 "whisper_translates": whisper_translates, "text": text,
                 "translated": translated, "engine": engine, "mt_ms": mt_ms}
+
+    def _other_language_result(self, lang, texts, token_ids, info, tasks, whisper_translates):
+        """A phrase in another language than expected (German song, Bulgarian
+        advert …). Show it labelled ("[German] …") and translate it:
+          - already in the target language: shown as it is
+          - otherwise: the online translator, told the detected language
+            (no local model exists for German/Bulgarian/…; Turbo cannot
+            translate). Offline, it says so instead of guessing.
+        With "Detect other languages" off, it is labelled but not translated
+        (the Russian model only produced nonsense from German)."""
+        text = collapse_repetitions(texts[0])
+        name = LANGUAGE_NAMES.get(lang, lang.upper())
+        engine, mt_ms, translated = f"whisper-{lang}", 0.0, ""
+        if is_hallucination(text):
+            log_event(logging.INFO, "transcription_discarded", worker_id=self.wid, text=text,
+                      lang=lang)
+            text = ""
+        tgt_google = LANGUAGES.get(self.tgt_lang_key, ("en", "en"))[1]
+        if text and not self.auto_language:
+            info["foreign_not_translated"] = True
+            translated = f"({name} - not translated: 'Detect other languages' is off)"
+        elif text and lang == self.tgt_whisper:
+            translated, engine = text, "none (already target language)"
+        elif text and self._mt(text, src=lang)[0] is not None:
+            translated, mt_ms = self._mt(text, src=lang)
+            engine = f"opus-mt-{lang}"
+        elif text:
+            t0 = time.perf_counter()
+            try:
+                translated = _translate_cached(text, lang, tgt_google) or ""
+                engine = f"online-{lang}"
+            except Exception as e:
+                info["translation_error"] = f"{type(e).__name__}: {e}"
+                translated = f"(no offline translation for {name})"
+            mt_ms = round((time.perf_counter() - t0) * 1000, 1)
+        log_event(logging.INFO, "language_switched", worker_id=self.wid, lang=lang,
+                  lang_prob=info.get("lang_prob"), expected=self.src_whisper,
+                  src_lang_prob=info.get("src_lang_prob"), text=text[:120],
+                  auto=self.auto_language, engine=engine)
+        return {"tasks": tasks, "token_ids": token_ids, "info": info,
+                "whisper_translates": whisper_translates,
+                "text": f"[{name}] {text}" if text else "",
+                "translated": translated if text else ("" if whisper_translates else None),
+                "engine": engine, "mt_ms": mt_ms}
+
+    def _music_prepare(self, audio_np):
+        """Music mode: classify the phrase (speech / singing / music) and, if
+        music is playing and the vocal separator is ready, remove the
+        instruments so Whisper hears the voice. Returns the fields to log,
+        plus "_audio" (the cleaned audio) when separation ran."""
+        import numpy as np
+        scene = self.music_scene
+        if scene is None:
+            return {}
+        try:
+            out = scene.judge(audio_np)
+            if out.get("music_mode") and scene.separator is not None:
+                t0 = time.perf_counter()
+                voice = scene.separator.separate(audio_np)
+                peak = float(np.abs(voice).max()) if len(voice) else 0.0
+                out["separation_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                # Level kept (voice) vs removed (music), in dBFS
+                rms = lambda x: 10 * np.log10(float(np.mean(x ** 2)) + 1e-12)
+                out["voice_db"], out["music_removed_db"] = (round(rms(voice), 1),
+                                                            round(rms(audio_np - voice), 1))
+                mix_db = rms(audio_np)
+                # A voice in the music (singing) if what is kept is within
+                # VOICE_GAP_DB of the whole mix; otherwise instrumental only:
+                # skip Whisper, which would only invent text.
+                out["singing"] = scene.singing = out["voice_db"] > mix_db - VOICE_GAP_DB
+                if not out["singing"]:
+                    out["_no_voice"] = True
+                elif peak > 1e-3:
+                    out["_audio"] = (voice / peak * min(0.9, max(peak, 0.3))).astype(np.float32)
+                self._last_vocals = out.get("_audio", voice)
+            return out
+        except Exception as e:
+            self._music_failures = getattr(self, "_music_failures", 0) + 1
+            log_exception("music_processing_failed", e, worker_id=self.wid,
+                          failures=self._music_failures)
+            if self._music_failures >= 3:
+                # Same error on every phrase: switch music mode off for this
+                # session (speech recognition carries on) instead of flooding
+                # the window and log with the same error.
+                self.music_scene = None
+                log_event(logging.WARNING, "music_processing_disabled",
+                          reason=f"{type(e).__name__}: {e}", failures=self._music_failures)
+                self.status_cb("⚠ Music mode switched off after repeated errors "
+                               "(see Diagnostics)")
+            return {}
 
     def _process_partial(self, seq, audio_bytes, t_capture, t_start):
         """Make a quick preview of an unfinished phrase and send ("partial", …).
@@ -3150,6 +3818,118 @@ class TranscriptionWorker(threading.Thread):
 # diagnostics, the watchdog and logging.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Resource measurements (logged every STATS_INTERVAL_SEC as resource_stats)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Below these, other apps (or this one) may start to stutter.
+LOW_RAM_MB, LOW_GPU_MEM_MB, HIGH_SYSTEM_CPU_PCT = 2048, 1024, 85
+
+
+def collect_resource_stats(app) -> dict:
+    """Measure CPU, RAM and GPU use. CPU figures are "% of one core" (can
+    exceed 100) and also "% of the whole machine". `app` keeps the previous
+    readings between calls (CPU use is time used since the last reading)."""
+    fields = {}
+    try:
+        import psutil
+        if getattr(app, "_psutil_process", None) is None:
+            app._psutil_process = psutil.Process()
+            app._psutil_process.cpu_percent(None)
+            app._thread_times, app._other_times = {}, {}
+        proc, logical = app._psutil_process, psutil.cpu_count() or 1
+        cpu = proc.cpu_percent(None)
+        mem, vm = proc.memory_info(), psutil.virtual_memory()
+        fields.update(
+            process_cpu_pct=round(cpu, 1),                       # % of one core
+            process_cpu_machine_pct=round(cpu / logical, 1),     # % of all cores
+            rss_mb=round(mem.rss / 2**20),
+            private_mb=round(getattr(mem, "private", 0) / 2**20),
+            page_faults=getattr(mem, "num_page_faults", None),
+            mem_available_mb=round(vm.available / 2**20),
+            mem_used_pct=vm.percent,
+            threads=proc.num_threads())
+        # Whole-machine CPU from our own previous reading (psutil.cpu_percent
+        # keeps one shared "since last call" counter that the Diagnostics page
+        # also uses every second, which made this read 0).
+        times = psutil.cpu_times()
+        busy, total = sum(times) - times.idle, sum(times)
+        last = getattr(app, "_sys_cpu_last", None)
+        app._sys_cpu_last = (busy, total)
+        if last and total > last[1]:
+            fields["system_cpu_pct"] = round((busy - last[0]) / (total - last[1]) * 100, 1)
+        try:
+            freq = psutil.cpu_freq()
+            fields["cpu_freq_mhz"] = round(freq.current) if freq else None
+        except Exception:
+            pass
+        # Which of our threads use the CPU (named Python threads; others are
+        # library threads: CUDA, CTranslate2, Qt, audio driver).
+        names = {t.native_id: t.name for t in threading.enumerate()}
+        interval = max(1e-3, time.monotonic() - getattr(app, "_res_last_t", time.monotonic() - 10))
+        app._res_last_t = time.monotonic()
+        per_thread, now_times = {}, {}
+        for th in proc.threads():
+            total = th.user_time + th.system_time
+            now_times[th.id] = total
+            used = total - app._thread_times.get(th.id, total)
+            if used > 0:
+                key = names.get(th.id, "native")
+                per_thread[key] = per_thread.get(key, 0) + used
+        app._thread_times = now_times
+        fields["thread_cpu_pct"] = {k: round(v / interval * 100, 1) for k, v in
+                                    sorted(per_thread.items(), key=lambda kv: -kv[1])[:6]}
+        # The busiest other apps: shows whether Teams/Telemost were short of CPU.
+        others, now_other = [], {}
+        for p in psutil.process_iter(["pid", "name", "cpu_times"]):
+            ct = p.info.get("cpu_times")
+            if ct is None or p.info["pid"] in (0, proc.pid):
+                continue
+            total = ct.user + ct.system
+            now_other[p.info["pid"]] = total
+            used = total - app._other_times.get(p.info["pid"], total)
+            if used > 0:
+                others.append((used, p.info["name"]))
+        app._other_times = now_other
+        others.sort(reverse=True)
+        fields["top_other_apps"] = {n: round(u / interval * 100, 1) for u, n in others[:5]}
+    except Exception:
+        pass
+    if WHISPER_DEVICE == "cuda":
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+            gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+            fields.update(gpu_util_pct=gpu_util.gpu, gpu_mem_used_mb=gpu_mem.used // 2**20,
+                          gpu_mem_free_mb=gpu_mem.free // 2**20,
+                          gpu_temp_c=pynvml.nvmlDeviceGetTemperature(gpu_handle, 0),
+                          gpu_sm_clock_mhz=pynvml.nvmlDeviceGetClockInfo(gpu_handle, 1))
+            try:   # our own share of GPU memory (Windows often doesn't report it)
+                own = [p.usedGpuMemory for p in pynvml.nvmlDeviceGetComputeRunningProcesses(gpu_handle)
+                       if p.pid == os.getpid() and p.usedGpuMemory]
+                if own:
+                    fields["gpu_mem_app_mb"] = own[0] // 2**20
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return fields
+
+
+def resource_warnings(fields) -> list:
+    """Plain-language problems in a resource_stats reading."""
+    problems = []
+    if (fields.get("mem_available_mb") or 1e9) < LOW_RAM_MB:
+        problems.append(f"low RAM: {fields['mem_available_mb']} MB free")
+    if (fields.get("gpu_mem_free_mb") or 1e9) < LOW_GPU_MEM_MB:
+        problems.append(f"low GPU memory: {fields['gpu_mem_free_mb']} MB free")
+    if (fields.get("system_cpu_pct") or 0) > HIGH_SYSTEM_CPU_PCT:
+        problems.append(f"CPU busy: {fields['system_cpu_pct']} % of the whole machine")
+    return problems
+
+
 class InterpreterApp(ctk.CTk):
 
     """The main window, and the "conductor" that starts and stops everything.
@@ -3206,6 +3986,7 @@ class InterpreterApp(ctk.CTk):
         self._psutil_process                = None
         self._preview_loader      = None
         self._preview_enabled     = False
+        self._previews_off        = False   # Previews set to "Off"
         self._mt_loaders          = {}   # (src, tgt) -> TranslatorLoader
         self._initialised         = False
         self._active_mode         = None
@@ -3493,9 +4274,10 @@ class InterpreterApp(ctk.CTk):
                      font=ctk.CTkFont(size=13)).grid(row=2, column=0, sticky="w", pady=2)
         language_row = ctk.CTkFrame(outer, fg_color="transparent")
         language_row.grid(row=2, column=1, sticky="w")
-        lang_names = sorted(LANGUAGES.keys())
+        lang_names = sorted(TARGET_LANGUAGES)
+        source_names = ["Auto-detect"] + lang_names   # the language of each phrase is detected
         self.src_menu = ctk.CTkOptionMenu(
-            language_row, variable=self.src_var, values=lang_names, width=155,
+            language_row, variable=self.src_var, values=source_names, width=155,
             command=self._on_manual_lang_change)
         self.src_menu.grid(row=0, column=0)
         ctk.CTkLabel(language_row, text="  →  ",
@@ -3829,7 +4611,8 @@ class InterpreterApp(ctk.CTk):
         # partial_slot carries only the newest preview audio.
         worker_count = getattr(self._model_loader, "worker_count", NUM_WORKERS)
         self.phrase_queue  = queue.Queue(maxsize=max(worker_count * 4, 8))
-        self._partial_slot = LatestSlot()
+        # No preview slot when previews are Off: capture then never offers one.
+        self._partial_slot = None if self._previews_off else LatestSlot()
         self._early_slot   = LatestSlot()   # early finals (EARLY_FINAL_SEC)
         # Everything that can change speed or accuracy, recorded once per
         # session (session_config) and copied into every phrase_trace, so
@@ -3901,9 +4684,11 @@ class InterpreterApp(ctk.CTk):
         # every 0.2 s kept the GPU at 100 % and made finished phrases wait
         # (logs: 120 ms median, 331 ms p95; 561 previews thrown away). Make
         # them every 0.45 s instead; small preview models keep 0.2 s.
-        if not self._preview_enabled and MODELS.get(self.model_var.get()) in (
-                "large-v3-turbo", "medium"):
+        if (not self._preview_enabled and not self._previews_off
+                and MODELS.get(self.model_var.get()) in (
+                "large-v3-turbo", "medium")):
             self._capture_thread.preview_interval_sec = MAIN_MODEL_PREVIEW_INTERVAL_SEC
+        self._capture_thread.music_scene = self._ensure_music_scene()
         self._capture_thread.start()
 
         # ── Translation workers (TRANSLATION_WORKERS parallel) ────────────
@@ -3932,6 +4717,18 @@ class InterpreterApp(ctk.CTk):
                 early_slot=self._early_slot,
                 session_id=self.session_id,
                 config=session_config)
+            worker.music_scene = self._ensure_music_scene()
+            # Automatic language detection: "auto_language" in the settings
+            # (the Fluent window's "Detect other languages" box)
+            worker.auto_language = bool(load_settings().get("auto_language", True))
+            worker.translator_for = self._translator_for
+            # Languages of both modes (e.g. Russian and English): likely
+            # candidates when Auto-detect is unsure about a short phrase
+            for _device, *names in getattr(self, "_mode_state", []):
+                for name in names:
+                    code = LANGUAGES.get(name, ("auto",))[0]
+                    if code != "auto" and code not in worker._recent_langs:
+                        worker._recent_langs.append(code)
             worker.start()
             self._workers.append(worker)
 
@@ -4054,13 +4851,34 @@ class InterpreterApp(ctk.CTk):
         self._ensure_preview_model()
         self._restart_session()
 
+    def _ensure_music_scene(self):
+        """The music detector (music.py), created once and kept across
+        sessions so its models load only once. "music_mode": false in
+        interpreter.settings.json turns it off; "vocal_separation": false
+        keeps the detection but skips removing the instruments."""
+        scene = getattr(self, "_music_scene", None)
+        if scene is None:
+            settings = load_settings()
+            try:
+                from music import MusicScene
+                scene = MusicScene(enabled=bool(settings.get("music_mode", True)),
+                                   separate=bool(settings.get("vocal_separation", True)),
+                                   log=lambda event, **k: log_event(logging.INFO, event, **k))
+            except Exception as e:
+                log_exception("music_scene_unavailable", e)
+                scene = None
+            self._music_scene = scene
+        return scene if scene is not None and scene.enabled else None
+
     def _ensure_preview_model(self):
         """Load the chosen preview model alongside the main model. Not needed
         when it is the same as the main model."""
         size = PREVIEW_CHOICES[self.preview_choice_var.get()]
         # Plain mirror of the Tk settings: _preview_model() runs on the worker
         # thread, and Tk variables may only be touched from the UI thread.
-        self._preview_enabled = size is not None and size != MODELS[self.model_var.get()]
+        self._previews_off = size == PREVIEW_OFF
+        self._preview_enabled = (size not in (None, PREVIEW_OFF)
+                                 and size != MODELS[self.model_var.get()])
         if not self._preview_enabled:
             return
         if self._preview_loader is None or self._preview_loader.model_size != size:
@@ -4072,12 +4890,16 @@ class InterpreterApp(ctk.CTk):
         """Start loading the Opus-MT model for this pair (first use downloads
         ~300 MB) and return a callable the worker polls; until it is ready,
         translation falls back to Whisper/online."""
-        if (src, tgt) not in OPUS_MT_REPOS:
+        if opus_repo(src, tgt) is None:
             return None
-        loader = self._mt_loaders.get((src, tgt))
-        if loader is None:
-            loader = self._mt_loaders[(src, tgt)] = TranslatorLoader(src, tgt)
-            loader.start()
+        # Workers call this too (a phrase in a new language): one loader per pair
+        with _MT_LOADERS_LOCK:
+            loader = self._mt_loaders.get((src, tgt))
+            if loader is None:
+                loader = self._mt_loaders[(src, tgt)] = TranslatorLoader(src, tgt)
+                loader.start()
+                log_event(logging.INFO, "local_translator_load_started", pair=f"{src}-{tgt}",
+                          repo=opus_repo(src, tgt))
         return lambda l=loader: l.translator if l.ready.is_set() else None
 
     def _preview_model(self):
@@ -4155,47 +4977,31 @@ class InterpreterApp(ctk.CTk):
 
     def _log_resources(self):
         """Every STATS_INTERVAL_SEC: CPU, memory, GPU load and the UI thread's
-        responsiveness, so slowdowns can be tied to resource limits."""
-        # Collect figures into `fields`, then log them all as one line.
-        # Each measurement is wrapped in try/except: if a library is missing or
-        # fails, the other figures are still logged.
-        fields = {}
-        try:
-            # CPU and memory, from psutil. cpu_percent() measures since its previous
-            # call, so the very first call only starts the measurement. 100 % =
-            # one CPU core fully busy. rss = memory the app is using.
-            import psutil
-            if self._psutil_process is None:
-                self._psutil_process = psutil.Process()
-                self._psutil_process.cpu_percent(None)
-            fields.update(
-                process_cpu_pct=round(self._psutil_process.cpu_percent(None), 1),
-                system_cpu_pct=psutil.cpu_percent(None),
-                rss_mb=round(self._psutil_process.memory_info().rss / 2**20),
-                threads=self._psutil_process.num_threads())
-        except Exception:
-            pass
-        # GPU figures from NVIDIA's management library (NVML, via pynvml):
-        # how busy the GPU is, memory used, temperature and clock speed.
-        if WHISPER_DEVICE == "cuda":
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-                gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-                fields.update(gpu_util_pct=gpu_util.gpu, gpu_mem_used_mb=gpu_mem.used // 2**20,
-                              gpu_temp_c=pynvml.nvmlDeviceGetTemperature(gpu_handle, 0),
-                              gpu_sm_clock_mhz=pynvml.nvmlDeviceGetClockInfo(gpu_handle, 1))
-            except Exception:
-                pass
-        # Also log how many messages are waiting in each queue (a growing queue
-        # means something is falling behind) and the window's responsiveness.
-        log_event(logging.INFO, "resource_stats", listening=self.is_listening,
-                  run_id=self._run_id, result_queue=self.result_queue.qsize(),
-                  phrase_queue=self.phrase_queue.qsize(),
-                  translation_queue=self._translation_queue.qsize(),
-                  **fields, **self._ui_stats.summary())
+        responsiveness, so slowdowns can be tied to resource limits. Also
+        which of our threads use the CPU, how much is left for other apps
+        (Teams, Telemost) and which apps use the most, and a resource_warning
+        when the computer is running short."""
+        # Measuring takes ~100 ms (it lists every process), so it runs on a
+        # short-lived background thread instead of freezing the window.
+        base = dict(listening=self.is_listening, run_id=self._run_id,
+                    result_queue=self.result_queue.qsize(),
+                    phrase_queue=self.phrase_queue.qsize(),
+                    translation_queue=self._translation_queue.qsize(),
+                    **self._ui_stats.summary())
+
+        def measure():
+            t0 = time.perf_counter()
+            fields = collect_resource_stats(self)
+            fields["probe_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            self._last_resources = fields     # for the Diagnostics page
+            log_event(logging.INFO, "resource_stats", **base, **fields)
+            warnings = resource_warnings(fields)
+            if warnings:
+                log_event(logging.WARNING, "resource_warning", problems=warnings,
+                          **{k: fields.get(k) for k in ("system_cpu_pct", "mem_available_mb",
+                                                         "gpu_mem_free_mb", "gpu_util_pct",
+                                                         "top_other_apps")})
+        threading.Thread(target=measure, name="resource-probe", daemon=True).start()
         # Run again in STATS_INTERVAL_SEC seconds.
         self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
 
@@ -4561,6 +5367,8 @@ if __name__ == "__main__":
     # default; `python interpreter.py --classic` opens the original window.
     install_global_exception_hooks()
     instance_lock = acquire_single_instance()
+    if instance_lock is not None:
+        disable_power_throttling()
     if instance_lock is None:
         log_event(logging.WARNING, "second_instance_refused")
         import ctypes

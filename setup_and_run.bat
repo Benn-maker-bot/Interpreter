@@ -35,6 +35,10 @@ echo.
 REM -- Step 2: install / update the required packages
 echo Installing core packages...
 pip install -r requirements.txt --quiet
+REM faster-whisper pulls in the CPU-only onnxruntime, which hides the GPU
+REM build used by music mode; swap it back.
+pip uninstall -y onnxruntime >nul 2>&1
+pip install --force-reinstall --no-deps onnxruntime-gpu==1.23.2 --quiet
 
 REM -- Step 3: ask CTranslate2 (the Whisper engine) how many CUDA GPUs it sees
 echo.

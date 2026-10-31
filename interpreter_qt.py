@@ -58,7 +58,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentI
                             MessageBoxBase, PrimaryPushButton, PushButton, SimpleCardWidget,
                             Slider, SmoothScrollArea, StrongBodyLabel, SubtitleLabel,
                             TableWidget, TextEdit, Theme, TitleLabel, TogglePushButton,
-                            setTheme, setThemeColor)
+                            setCustomStyleSheet, setTheme, setThemeColor)
 
 import interpreter as core
 from interpreter import (InterpreterApp, LANGUAGES, continuation_join, trailing_marks_length, MODELS, PREVIEW_CHOICES, Speaker,
@@ -135,10 +135,15 @@ class IssueHandler(logging.Handler):
 
     def emit(self, record):
         fields = getattr(record, "fields", {}) or {}
-        detail = fields.get("exception_message") or fields.get("problem") or \
-            fields.get("error") or ""
-        self.sink.append((time.strftime("%H:%M:%S"), record.levelname,
-                          getattr(record, "event", record.getMessage()), str(detail)[:160]))
+        event = getattr(record, "event", record.getMessage())
+        try:
+            help_ = core.explain_issue(event, fields, record.exc_info)
+        except Exception:
+            help_ = {"title": event, "meaning": "", "action": "",
+                     "technical": str(fields.get("exception_message", "")), "where": ""}
+        # (time, level, event, short detail, plain-language explanation)
+        self.sink.append((time.strftime("%H:%M:%S"), record.levelname, event,
+                          help_["technical"][:160], help_))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +332,7 @@ class QtInterpreterApp(FluentWindow):
     _configure_speaker        = InterpreterApp._configure_speaker
     _on_preview_choice        = InterpreterApp._on_preview_choice
     _ensure_preview_model     = InterpreterApp._ensure_preview_model
+    _ensure_music_scene       = InterpreterApp._ensure_music_scene
     _translator_for           = InterpreterApp._translator_for
     _preview_model            = InterpreterApp._preview_model
     _watchdog                 = InterpreterApp._watchdog
@@ -366,8 +372,9 @@ class QtInterpreterApp(FluentWindow):
         self._run_id = 0
         self._traces, self._first_preview = {}, {}
         self._ui_stats = PerfWindow()
-        self._last_poll_t = self._psutil_process = None
+        self._last_poll_t = self._diag_psutil_process = None
         self._preview_loader, self._preview_enabled = None, False
+        self._previews_off = False
         self._mt_loaders = {}
         self._initialised = False
         self._active_mode = None
@@ -388,6 +395,7 @@ class QtInterpreterApp(FluentWindow):
         self._peak_recent = -100.0
         self._issues = deque(maxlen=40)         # recent warnings/errors
         self._issue_count_seen = 0
+        self._issue_groups = {}                 # event -> count, times, explanation
         self._watchdog_restarts = 0
         self._nvml = None                       # GPU monitoring handle
         core.ERROR_LOG.addHandler(IssueHandler(self._issues))
@@ -551,10 +559,12 @@ class QtInterpreterApp(FluentWindow):
         self.out_combo.setCurrentText(fiio or (out_labels[0] if out_labels else ""))
         self.replay_check = CheckBox("Hear input through output (VB-Audio cables only)")
         self.replay_check.setChecked(bool(vb) and "[loopback]" not in (friend or "").lower())
-        langs = sorted(LANGUAGES)
+        # Source list starts with "Auto-detect" (the language of each phrase
+        # is detected); a target must be a real language.
+        targets = sorted(core.TARGET_LANGUAGES)
         self.src_combo, self.tgt_combo = ComboBox(), ComboBox()
-        self.src_combo.addItems(langs)
-        self.tgt_combo.addItems(langs)
+        self.src_combo.addItems(["Auto-detect"] + targets)
+        self.tgt_combo.addItems(targets)
         self.model_combo = ComboBox()
         self.model_combo.addItems(list(MODELS))
         saved = load_settings()
@@ -582,6 +592,16 @@ class QtInterpreterApp(FluentWindow):
         lang_row.addWidget(self.src_combo)
         lang_row.addWidget(BodyLabel("→"))
         lang_row.addWidget(self.tgt_combo)
+        # Automatic language detection (see LANG_SWITCH_PROB in interpreter.py)
+        self.auto_lang_check = CheckBox("Detect other languages")
+        self.auto_lang_check.setToolTip(
+            "If a phrase is clearly in another language (e.g. a German song while\n"
+            "listening for Russian), recognise it in that language, label it\n"
+            "[German] and translate it. Off: label it but don't translate it.")
+        self.auto_lang_check.setChecked(bool(load_settings().get("auto_language", True)))
+        self.auto_lang_check.stateChanged.connect(self._on_auto_language)
+        lang_row.addSpacing(16)
+        lang_row.addWidget(self.auto_lang_check)
         lang_row.addStretch(1)
         grid.addLayout(lang_row, 2, 1, 1, 4)
         grid.addWidget(label("Model", "Whisper model for the final text"), 3, 0)
@@ -627,7 +647,10 @@ class QtInterpreterApp(FluentWindow):
         self.heard_label = StrongBodyLabel("Heard")
         self.translated_label = StrongBodyLabel("Translation")
         # Text size (caption guidance: readers must control the size)
+        # The label shares the row with the buttons: when both sat in the same
+        # grid cell, the label covered the buttons and swallowed their clicks.
         size_row = QHBoxLayout()
+        size_row.addWidget(self.translated_label)
         size_row.addStretch(1)
         size_row.addWidget(CaptionLabel("Text size"))
         for text, step in (("A−", -1), ("A+", 1)):
@@ -637,14 +660,13 @@ class QtInterpreterApp(FluentWindow):
             b.setToolTip("Smaller / larger transcript text")
             b.clicked.connect(lambda _=False, d=step: self._change_text_size(d))
             size_row.addWidget(b)
-        panes.addLayout(size_row, 0, 1, Qt.AlignRight)
+        panes.addLayout(size_row, 0, 1)
         self.heard_box, self.translated_box = TextEdit(), TextEdit()
         self._text_size = int(load_settings().get("text_size", 13))
         for box in (self.heard_box, self.translated_box):
             box.setReadOnly(True)
-            box.setFont(QFont("Segoe UI", self._text_size))
+        self._apply_text_size()
         panes.addWidget(self.heard_label, 0, 0)
-        panes.addWidget(self.translated_label, 0, 1)
         panes.addWidget(self.heard_box, 1, 0)
         panes.addWidget(self.translated_box, 1, 1)
         root.addLayout(panes, 1)
@@ -686,6 +708,15 @@ class QtInterpreterApp(FluentWindow):
         self.sens_slider.valueChanged.connect(lambda v: self._on_sensitivity(v / 100))
         return page
 
+    def _on_auto_language(self, *_):
+        """'Detect other languages' ticked/unticked: save and apply now
+        (the workers read the flag for each phrase; no restart needed)."""
+        on = self.auto_lang_check.isChecked()
+        core.save_settings(auto_language=on)
+        for worker in getattr(self, "_workers", []):
+            worker.auto_language = on
+        log_event(logging.INFO, "auto_language_changed", enabled=on)
+
     def _toggle_settings(self):
         """Settings button: show or hide the settings card (remembered)."""
         show = not self.settings_card.isVisible()
@@ -693,11 +724,18 @@ class QtInterpreterApp(FluentWindow):
         self.settings_btn.setChecked(show)
         core.save_settings(show_settings=show)
 
+    def _apply_text_size(self):
+        """The Fluent theme's stylesheet fixes the text box font size, which
+        overrides setFont(), so the size goes in the widget's own custom
+        stylesheet (kept when the theme changes)."""
+        qss = f"TextEdit {{ font: {self._text_size}pt 'Segoe UI'; }}"
+        for box in (self.heard_box, self.translated_box):
+            setCustomStyleSheet(box, qss, qss)
+
     def _change_text_size(self, step):
         """A−/A+ buttons: change the transcript font size (9-28 pt), saved."""
         self._text_size = max(9, min(28, self._text_size + step))
-        for box in (self.heard_box, self.translated_box):
-            box.setFont(QFont("Segoe UI", self._text_size))
+        self._apply_text_size()
         core.save_settings(text_size=self._text_size)
 
     @staticmethod
@@ -1015,7 +1053,7 @@ class QtInterpreterApp(FluentWindow):
         self.issues_card.setTitle("Recent issues (warnings and errors)")
         self.issues_text = TextEdit()
         self.issues_text.setReadOnly(True)
-        self.issues_text.setFont(QFont("Consolas", 9))
+        self.issues_text.setFont(QFont("Segoe UI", 10))
         self.issues_text.setMinimumHeight(150)
         self.issues_text.setPlainText("No warnings or errors since the app opened.")
         self.issues_card.viewLayout.addWidget(self.issues_text)
@@ -1125,9 +1163,13 @@ class QtInterpreterApp(FluentWindow):
             overall, colour = "Healthy — listening", OK
         else:
             overall, colour = "Idle", WARN
-        recent_errors = [i for i in self._issues if i[1] in ("ERROR", "CRITICAL")]
-        if recent_errors and colour == OK:
-            overall, colour = f"Listening — {len(recent_errors)} recent error(s), see below", WARN
+        # Count kinds of problem, not repeats (one error on every phrase is one problem)
+        problems = [g["help"]["title"] for g in self._issue_groups.values()
+                    if g["level"] in ("ERROR", "CRITICAL")]
+        if problems and colour == OK:
+            overall = (f"Listening — problem: {problems[0]}" if len(problems) == 1
+                       else f"Listening — {len(problems)} problems, see Recent issues below")
+            colour = WARN
         h.set("Overall", overall, colour)
         since = self._listening_since
         h.set("Listening for", time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - since))
@@ -1158,12 +1200,16 @@ class QtInterpreterApp(FluentWindow):
         r = self.resource_card
         try:
             import psutil
-            if self._psutil_process is None:
-                self._psutil_process = psutil.Process()
-                self._psutil_process.cpu_percent(None)
-            cpu = self._psutil_process.cpu_percent(None)
-            r.set("CPU (this app)", f"{cpu:.0f} %", judge(cpu, 150, 400))
-            r.set("Memory (this app)", f"{self._psutil_process.memory_info().rss / 2**20:.0f} MB")
+            if self._diag_psutil_process is None:
+                self._diag_psutil_process = psutil.Process()
+                self._diag_psutil_process.cpu_percent(None)
+            cpu = self._diag_psutil_process.cpu_percent(None)
+            # psutil counts 100 % per core, so a busy app can show over 100 %
+            # (up to 100 % x the number of logical cores). Show both forms.
+            whole = cpu / (psutil.cpu_count() or 1)
+            r.set("CPU (this app)", f"{whole:.1f} % of PC  ({cpu:.0f} % of one core)",
+                  judge(whole, 10, 25))
+            r.set("Memory (this app)", f"{self._diag_psutil_process.memory_info().rss / 2**20:.0f} MB")
         except Exception:
             r.set("CPU (this app)", "psutil not installed", MUTED)
         if WHISPER_DEVICE != "cuda":
@@ -1187,21 +1233,68 @@ class QtInterpreterApp(FluentWindow):
             r.set("GPU load", "nvidia-ml-py not available", MUTED)
 
     def _refresh_issues(self):
+        """Group the recent problems by kind for the Diagnostics page, and pop
+        up a plain-language note the FIRST time each kind of error happens.
+        Repeats only raise its count (one error on every phrase used to stack
+        five identical pop-ups over the settings)."""
         issues = list(self._issues)
         self._watchdog_restarts = sum(1 for i in issues if i[2] == "watchdog_restart")
         if len(issues) == self._issue_count_seen:
             return
         new = issues[self._issue_count_seen:] if len(issues) > self._issue_count_seen else []
         self._issue_count_seen = len(issues)
-        self.issues_text.setPlainText("\n".join(f"{t}  {lvl:<8} {ev}  {detail}"
-                                                for t, lvl, ev, detail in reversed(issues))
-                                      or "No warnings or errors since the app opened.")
-        # Pop-up for new errors so they're noticed even on the Interpreter page
-        for t, lvl, ev, detail in new:
+        for t, lvl, ev, detail, help_ in new:
+            g = self._issue_groups.setdefault(ev, {"first": t, "count": 0, "level": lvl,
+                                                   "help": help_})
+            g["count"] += 1
+            g["last"], g["help"] = t, help_
             if lvl in ("ERROR", "CRITICAL"):
-                InfoBar.error(title=ev, content=detail or "See Diagnostics → Recent issues",
-                              orient=Qt.Horizontal, isClosable=True,
-                              position=InfoBarPosition.TOP_RIGHT, duration=6000, parent=self)
+                g["level"] = lvl
+        self._render_issue_groups()
+        for t, lvl, ev, detail, help_ in new:
+            if lvl not in ("ERROR", "CRITICAL") and ev not in self.POPUP_WARNINGS:
+                continue
+            g = self._issue_groups[ev]
+            if g.get("popped"):
+                continue            # already shown: the count on Diagnostics goes up
+            g["popped"] = True
+            text = f"{help_['meaning']}\n\nWhat to do: {help_['action']}"
+            bar = (InfoBar.error if lvl in ("ERROR", "CRITICAL") else InfoBar.warning)(
+                title=help_["title"], content=text, orient=Qt.Vertical, isClosable=True,
+                position=InfoBarPosition.BOTTOM_RIGHT, duration=15000, parent=self)
+            details = PushButton()
+            details.setText("Details")
+            details.clicked.connect(lambda _=False, b=bar: (self.switchTo(self.diag_page), b.close()))
+            bar.addWidget(details)
+            bar.setToolTip(f"{help_['technical']}\n{help_['where']}\n"
+                           "Full details: Diagnostics → Recent issues")
+
+    # Warnings worth a pop-up too (all errors pop up)
+    POPUP_WARNINGS = ("music_processing_disabled", "resource_warning")
+
+    def _render_issue_groups(self):
+        """Recent issues card: one entry per kind of problem, newest first,
+        with a plain explanation, what to do, and the technical details."""
+        if not self._issue_groups:
+            self.issues_text.setPlainText("No warnings or errors since the app opened.")
+            return
+        blocks = []
+        for ev, g in sorted(self._issue_groups.items(), key=lambda kv: kv[1]["last"], reverse=True):
+            h = g["help"]
+            times = (f"{g['count']} times, {g['first']}–{g['last']}" if g["count"] > 1
+                     else f"at {g['last']}")
+            lines = [f"{'ERROR' if g['level'] in ('ERROR', 'CRITICAL') else 'Warning'}: "
+                     f"{h['title']}  ({times})",
+                     f"  What it means: {h['meaning']}",
+                     f"  What to do:    {h['action']}"]
+            if h.get("technical"):
+                lines.append(f"  Technical:     {h['technical']}")
+            if h.get("where"):
+                lines.append(f"  Where:         {h['where']}  (log event: {ev})")
+            else:
+                lines.append(f"  Log event:     {ev}")
+            blocks.append("\n".join(lines))
+        self.issues_text.setPlainText("\n\n".join(blocks))
 
     def _refresh_phrase_table(self, ph):
         t = self.phrase_table
@@ -1288,6 +1381,7 @@ if __name__ == "__main__":
     # Keep the lock in a variable: if it were discarded, Python would close
     # the file at once and release the lock.
     instance_lock = core.acquire_single_instance()
+    core.disable_power_throttling()
     if instance_lock is None:
         import ctypes
         ctypes.windll.user32.MessageBoxW(None, "Voice Interpreter is already running.",
