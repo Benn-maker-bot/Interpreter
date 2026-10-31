@@ -2,7 +2,8 @@
 simulate.py — test the interpreter with recorded audio instead of a device
 ========================================================================
 
-Plays a playlist of test clips (from fetch_testdata.py) through the REAL
+Plays a playlist of test clips (from make_testdata.py, or fetch_testdata.py
+with --data real) through the REAL
 pipeline: the same audio capture thread (speech detection, phrase cutting,
 music detection), transcription worker (Whisper, language detection, vocal
 separation, translation) and settings as the app. Only the sound card is
@@ -36,6 +37,7 @@ Options:
     --model M       Whisper model size (default large-v3-turbo)
     --no-music      turn music mode off
     --offline       don't use the online translator
+    --data D        synth (default: single-language TTS clips) or real
 """
 
 import argparse
@@ -56,6 +58,9 @@ import interpreter as I                         # noqa: E402
 import log_tools as LT                          # noqa: E402
 
 TESTDATA = APP_DIR / "testdata"
+DATA_SETS = {"synth": TESTDATA / "synth",     # make_testdata.py: TTS voices, made-up music
+             "real": TESTDATA}                # fetch_testdata.py: FLEURS + Jamendo
+DATA_DIR = DATA_SETS["synth"]                 # chosen with --data
 RATE = 16000
 
 
@@ -93,12 +98,16 @@ class Playlist:
         silence = np.zeros(int(gap_sec * RATE), np.int16)
         parts.append(silence); pos += len(silence)
         for clip in clips:
-            with wave.open(str(TESTDATA / clip["file"])) as w:
+            with wave.open(str(DATA_DIR / clip["file"])) as w:
                 audio = np.frombuffer(w.readframes(w.getnframes()), np.int16)
             parts.append(audio)
             # The span ends where the speech ends: FLEURS clips have ~1 s of
             # silence at the end, which made "pause -> text" negative.
-            self.spans.append([pos, pos + speech_end(audio)])
+            # Synthetic clips know exactly where the vocals end (songs carry
+            # on with music after them).
+            end = (int(clip["vocal_end"] * RATE) if "vocal_end" in clip else speech_end(audio))
+            start = int(clip.get("vocal_start", 0) * RATE)
+            self.spans.append([pos + start, pos + end])
             pos += len(audio)
             parts.append(silence); pos += len(silence)
         parts.append(np.zeros(4 * RATE, np.int16))        # tail: let the last phrase end
@@ -244,7 +253,7 @@ def build(args, playlist):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def choose_clips(args):
-    rows = [json.loads(l) for l in open(TESTDATA / "manifest.jsonl", encoding="utf-8")]
+    rows = [json.loads(l) for l in open(DATA_DIR / "manifest.jsonl", encoding="utf-8")]
     kinds = set(args.kinds.split(","))
     langs = set(args.langs.split(",")) if args.langs else None
     groups = {}
@@ -367,9 +376,13 @@ def main():
     ap.add_argument("--sensitivity", type=float, default=0.5)
     ap.add_argument("--no-music", action="store_true")
     ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--data", default="synth", choices=tuple(DATA_SETS))
     args = ap.parse_args()
-    if not (TESTDATA / "manifest.jsonl").exists():
-        sys.exit("No test data: run  .venv\\Scripts\\python fetch_testdata.py  first.")
+    global DATA_DIR
+    DATA_DIR = DATA_SETS[args.data]
+    if not (DATA_DIR / "manifest.jsonl").exists():
+        maker = "make_testdata.py" if args.data == "synth" else "fetch_testdata.py"
+        sys.exit(f"No test data: run  .venv\\Scripts\\python {maker}  first.")
 
     clips = choose_clips(args)
     playlist = Playlist(clips, args.gap)

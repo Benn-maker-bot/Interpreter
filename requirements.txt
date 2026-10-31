@@ -46,5 +46,8 @@ psutil>=5.9                 # CPU and memory use; physical core count
 pycaw>=20251023            # which apps are playing sound (logged when the source goes silent)
 nvidia-ml-py>=12            # GPU load, memory, clock speed and temperature
 
+# ── Simulator test data (make_testdata.py) ───────────────────────────────
+edge-tts>=7.0               # neural voices in many languages for synthetic test clips
+
 # ── Building a standalone .exe (build_exe.bat) ───────────────────────────
 pyinstaller>=6.0.0
