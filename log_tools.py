@@ -15,6 +15,11 @@ Run it from the project folder with the project's Python, for example:
                                                     …only entries from that time on
     .venv\\Scripts\\python log_tools.py accuracy        check the recognised words
     .venv\\Scripts\\python log_tools.py accuracy 2026-10-31T14:00 large-v3
+    .venv\\Scripts\\python log_tools.py compare         speed and accuracy per setting
+    .venv\\Scripts\\python log_tools.py compare 2026-10-31T16:00 --ref
+                                                    …also create missing references
+    .venv\\Scripts\\python log_tools.py sensitivity     how sensitivity and input level
+                                                    affect detection and accuracy
 
 report
     Reads the "phrase_trace" lines (one per finished phrase), "phrase_displayed"
@@ -32,6 +37,14 @@ accuracy
     each recording (.ref.json) so the big model only runs once per phrase.
     Results are broken down by model and by error type, and every phrase
     with differences is listed so you can see exactly what went wrong.
+
+compare
+    One row per combination of settings you used (main model, preview model,
+    sensitivity, compute type): number of phrases, how fast text appeared
+    (end of speech -> final text, and speech start -> first preview), how
+    often the early transcription was used, how often results looked doubtful,
+    how close the last preview was to the final text, and the word error
+    rate. Use it after trying different settings to see which works best.
 
 Timestamps in the log look like 2026-10-31T14:00:00.000+00:00; any prefix of
 one (such as 2026-10-31T14) works as a start time.
@@ -460,10 +473,214 @@ def build_accuracy(since=None, ref_model="large-v3"):
 
 
 
+def build_compare(since=None, fill_refs=False, ref_model="large-v3"):
+    """Compare speed and accuracy between the settings you tried.
+
+    Every finished phrase is logged with the settings in force (cfg_* fields,
+    from this version on). Phrases are grouped by (model, preview model,
+    sensitivity, compute type) and each group gets one row: how many phrases,
+    how fast text appeared, how often the early transcription was used, how
+    often a result looked doubtful, how close the last preview was to the
+    final text, and the word error rate against the reference transcripts
+    (only for phrases whose reference is cached, unless fill_refs=True, which
+    runs the reference model for the missing ones)."""
+    import sys
+    sys.path.insert(0, str(APP_DIR))
+    from interpreter import RECORD_DIR, _add_cuda_dll_dirs
+
+    entries = [e for p in iter_log_files(LOG_PATH) for e in read_jsonl(p)
+               if not since or e.get("ts", "") >= since]
+    traces = [e for e in entries if e.get("event") == "phrase_trace"]
+    # phrase_displayed lines hold the screen timings; match them to their
+    # phrase by (app launch, session, phrase number)
+    displayed = {(e.get("session_id"), e.get("run_id"), e.get("seq")): e
+                 for e in entries if e.get("event") == "phrase_displayed"}
+    if fill_refs:
+        _add_cuda_dll_dirs()
+    model_holder = {}
+
+    groups = {}
+    for t in traces:
+        sens = t.get("cfg_sensitivity")
+        key = (t.get("cfg_model") or t.get("model") or "?",
+               t.get("cfg_preview_model") or "?",
+               f"{sens:.1f}" if isinstance(sens, (int, float)) else "?",
+               t.get("cfg_compute_type") or "?")
+        g = groups.setdefault(key, {"pause_to_text": [], "first_preview": [], "process": [],
+                                    "early": [], "suspicious": [], "preview_agree": [],
+                                    "errors": 0, "ref_words": 0, "n": 0})
+        g["n"] += 1
+        d = displayed.get((t.get("session_id"), t.get("run_id"), t.get("seq")))
+        if d:
+            g["pause_to_text"].append(d.get("speech_end_to_text_ms"))
+            g["first_preview"].append(d.get("first_preview_ms"))
+        g["process"].append(t.get("process_ms"))
+        g["early"].append(1 if t.get("early_used") else 0)
+        g["suspicious"].append(1 if t.get("suspicious") else 0)
+        # How much of the final text the last preview already had right
+        final_w, prev_w = _words(t.get("text")), _words(t.get("last_preview"))
+        if final_w and prev_w:
+            errs, _, _ = _align(final_w, prev_w)
+            g["preview_agree"].append(max(0.0, 1 - errs / len(final_w)) * 100)
+        # Word error rate against the reference, where one is available
+        wav = RECORD_DIR / t["audio_file"] if t.get("audio_file") else None
+        if wav and wav.exists() and (fill_refs or wav.with_suffix(".ref.json").exists()):
+            ref_text = _reference_text(model_holder, ref_model, wav, t.get("src_lang"))
+            ref_words = _words(ref_text)
+            if ref_words and not any(h in ref_text.lower() for h in REF_HALLUCINATIONS):
+                errs, _, _ = _align(ref_words, _words(t.get("text")))
+                g["errors"] += errs
+                g["ref_words"] += len(ref_words)
+
+    med = lambda v: _pct(v, 0.5)
+    fmt = lambda v, unit="": "-" if v is None else f"{v:.0f}{unit}"
+    out = [f"Settings comparison ({len(traces)} phrases)",
+           "  pause->text = end of speech to final text on screen (median); "
+           "1st preview = speech start to first live text;",
+           "  early = phrases whose early transcription was used; preview ok = share of "
+           "the final words the last preview already had right.\n",
+           f"  {'model':<15}{'preview':<15}{'sens':>5} {'compute':<13}{'phrases':>7}"
+           f"{'pause->text':>12}{'1st preview':>12}{'process':>9}{'early':>7}"
+           f"{'doubtful':>9}{'preview ok':>11}{'WER':>8}"]
+    for key in sorted(groups, key=lambda k: -groups[k]["n"]):
+        g = groups[key]
+        n = g["n"]
+        wer = f"{g['errors'] / g['ref_words']:.1%}" if g["ref_words"] else "-"
+        out.append(f"  {key[0]:<15}{key[1]:<15}{key[2]:>5} {key[3]:<13}{n:>7}"
+                   f"{fmt(med(g['pause_to_text']), ' ms'):>12}"
+                   f"{fmt(med(g['first_preview']), ' ms'):>12}"
+                   f"{fmt(med(g['process']), ' ms'):>9}"
+                   f"{100 * sum(g['early']) / n:>6.0f}%{100 * sum(g['suspicious']) / n:>8.0f}%"
+                   f"{fmt(med(g['preview_agree']), '%'):>11}{wer:>8}")
+    out.append("\n  '?' = not recorded (phrases logged before settings were added to each "
+               "phrase). WER '-' = no reference yet: run `compare --ref` to create them.")
+    return "\n".join(out)
+
+
+def build_sensitivity(since=None):
+    """How the Speech sensitivity setting and the input level affect results.
+
+    Sensitivity (0-100 %) does not change the volume: it sets how sure the
+    speech detector must be (threshold = 0.85 - 0.7 x sensitivity) before
+    audio counts as speech. Too low: quiet or unclear speech is missed and
+    phrase starts are detected late (first words clipped). Too high: noise or
+    music starts phrases that turn out empty. This report shows, from the logs:
+      1. results per sensitivity setting,
+      2. results per input level (how loud the speech was),
+      3. how much audio WOULD count as speech at each sensitivity, worked out
+         from the logged speech-score histograms (so a setting can be chosen
+         without trying them all)."""
+    import sys
+    sys.path.insert(0, str(APP_DIR))
+    from interpreter import RECORD_DIR
+
+    entries = [e for p in iter_log_files(LOG_PATH) for e in read_jsonl(p)
+               if not since or e.get("ts", "") >= since]
+    traces = [e for e in entries if e.get("event") == "phrase_trace"]
+
+    def ref_words_for(t):
+        """Reference words for a phrase if its reference transcript is cached."""
+        if not t.get("audio_file"):
+            return None
+        r = (RECORD_DIR / t["audio_file"]).with_suffix(".ref.json")
+        if not r.exists():
+            return None
+        text = json.loads(r.read_text(encoding="utf-8"))["text"]
+        if any(h in text.lower() for h in REF_HALLUCINATIONS):
+            return None
+        return _words(text) or None
+
+    def summarise(rows):
+        """One table row: phrases, empty (noise) phrases, onset delay, WER,
+        first word missed, plus level details."""
+        errs = words = first_missed = with_ref = 0
+        for t in rows:
+            ref = ref_words_for(t)
+            if ref:
+                app = _words(t.get("text"))
+                e, _, _ = _align(ref, app)
+                errs += e
+                words += len(ref)
+                with_ref += 1
+                first_missed += ref[0] not in app[:3]
+        n = len(rows)
+        return {
+            "n": n,
+            "empty": 100 * sum(not t.get("text") for t in rows) / n,
+            "onset": _pct([t.get("onset_delay_ms") for t in rows], 0.5),
+            "wer": f"{errs / words:.1%}" if words else "-",
+            "first": f"{100 * first_missed / with_ref:.0f}%" if with_ref else "-",
+            "level": _pct([t.get("rms_dbfs") for t in rows], 0.5),
+            "nospeech": _pct([max(t["no_speech_prob"]) if isinstance(t.get("no_speech_prob"), list)
+                              and t["no_speech_prob"] else None for t in rows], 0.5),
+            "doubtful": 100 * sum(bool(t.get("suspicious")) for t in rows) / n,
+            "agc": _pct([t.get("agc_gain_db") for t in rows], 0.5),
+        }
+
+    fmt = lambda v, f="{:.0f}": "-" if v is None else f.format(v)
+    out = [f"Sensitivity and input level ({len(traces)} phrases)\n",
+           "1) By Speech sensitivity  (threshold = how sure the detector must be)",
+           "   empty = phrases started by noise that contained no words; onset = how late",
+           "   the start of speech was detected (ms); first word = phrases whose first",
+           "   word was missed (needs references: run `compare --ref` first).",
+           f"   {'sensitivity':>11} {'threshold':>9} {'phrases':>8} {'empty':>6} {'onset':>7}"
+           f" {'first word':>10} {'WER':>7}"]
+    by_sens = {}
+    for t in traces:
+        thr = t.get("vad_threshold")
+        if isinstance(thr, (int, float)):
+            sens = round((0.85 - thr) / 0.7 * 10) / 10   # back to the 0..1 slider value
+            by_sens.setdefault(max(0.0, min(1.0, sens)), []).append(t)
+    for sens in sorted(by_sens):
+        r = summarise(by_sens[sens])
+        out.append(f"   {sens * 100:>10.0f}% {0.85 - 0.7 * sens:>9.2f} {r['n']:>8} {r['empty']:>5.0f}%"
+                   f" {fmt(r['onset']):>7} {r['first']:>10} {r['wer']:>7}")
+
+    out += ["", "2) By input level of the speech  (AGC = gain added before Whisper)",
+            f"   {'level (dBFS)':>13} {'phrases':>8} {'WER':>7} {'no-speech':>10}"
+            f" {'doubtful':>9} {'AGC dB':>7}"]
+    bands = [(-99, -45), (-45, -38), (-38, -32), (-32, -26), (-26, -20), (-20, 0)]
+    for lo, hi in bands:
+        rows = [t for t in traces if isinstance(t.get("rms_dbfs"), (int, float))
+                and lo <= t["rms_dbfs"] < hi]
+        if rows:
+            r = summarise(rows)
+            out.append(f"   {f'{lo} to {hi}':>13} {r['n']:>8} {r['wer']:>7} "
+                       f"{fmt(r['nospeech'], '{:.2f}'):>10} {r['doubtful']:>8.0f}% "
+                       f"{fmt(r['agc'], '{:.1f}'):>7}")
+
+    hist = [0] * 10
+    for e in entries:
+        if e.get("event") == "capture_stats" and isinstance(e.get("speech_score_histogram"), list):
+            hist = [a + b for a, b in zip(hist, e["speech_score_histogram"])]
+    total = sum(hist)
+    out += ["", "3) What-if: share of audible audio that would count as speech at each setting"]
+    if total:
+        out.append("   (from the speech-score histograms; scores fall into 0.1-wide bins, so"
+                   " each value is approximate)")
+        for sens in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0):
+            thr = 0.85 - 0.7 * sens
+            above = sum(hist[i] for i in range(10) if (i + 0.5) / 10 >= thr)
+            out.append(f"   sensitivity {sens * 100:>3.0f}%  threshold {thr:.2f}  ->"
+                       f" {100 * above / total:5.1f}% of audible audio counted as speech")
+    else:
+        out.append("   (no histograms yet: they are logged from this version on)")
+
+    out += ["", "How to read this: pick the lowest sensitivity whose 'first word' and WER",
+            "are still good (fewer noise-triggered 'empty' phrases), or raise it if",
+            "onset delays are long and first words go missing."]
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "report":
         print(build_report(sys.argv[2] if len(sys.argv) > 2 else None))
+    elif len(sys.argv) > 1 and sys.argv[1] == "sensitivity":
+        print(build_sensitivity(sys.argv[2] if len(sys.argv) > 2 else None))
+    elif len(sys.argv) > 1 and sys.argv[1] == "compare":
+        args = [a for a in sys.argv[2:] if a != "--ref"]
+        print(build_compare(args[0] if args else None, fill_refs="--ref" in sys.argv))
     elif len(sys.argv) > 1 and sys.argv[1] == "accuracy":
         print(build_accuracy(sys.argv[2] if len(sys.argv) > 2 else None,
                              sys.argv[3] if len(sys.argv) > 3 else "large-v3"))

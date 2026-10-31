@@ -11,6 +11,7 @@ pyaudiowpatch>=0.2.12.9     # records audio; this PyAudio fork can also record w
                             # an output device (e.g. FiiO) plays ("WASAPI loopback")
 numpy>=1.26.0               # fast maths on audio samples
 scipy>=1.11.0               # high-quality resampling (48 kHz -> Whisper's 16 kHz)
+soxr>=0.3                   # faster resampling (~3x scipy); scipy is the fallback
 
 # ── Speech recognition (Whisper) ─────────────────────────────────────────
 faster-whisper>=1.0.3       # runs OpenAI's Whisper models quickly; also provides
