@@ -15,3 +15,6 @@ dist/
 interpreter.log.summary.json
 interpreter.settings.json
 logs/
+
+# Phrase audio saved for accuracy analysis
+recordings/

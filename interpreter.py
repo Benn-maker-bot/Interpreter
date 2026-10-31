@@ -207,7 +207,6 @@ def install_global_exception_hooks():
     threading.excepthook = _threading_excepthook
 
 
-install_global_exception_hooks()
 log_event(logging.INFO, "app_module_loaded",
           app_dir=str(APP_DIR), log_path=str(LOG_PATH), error_log_path=str(ERROR_LOG_PATH))
 
@@ -268,17 +267,64 @@ SAMPLE_RATE      = 16_000
 CHUNK_SAMPLES    = 512
 CHANNELS         = 1
 SAMPLE_WIDTH     = 2
-SILENCE_SEC      = 0.4     # pause that ends a phrase
-MAX_PHRASE_SEC   = 4       # longest phrase before a forced cut...
-CUT_SEARCH_SEC   = 1.5     # ...made at the quietest moment in this final window
-PAUSE_RATIO      = 0.25    # mid-speech, "quiet" means below this fraction of the
-                           # speaker's level (call audio rarely hits true silence)
-PARTIAL_INTERVAL_SEC = 0.35 # live preview cadence; the worker skips stale ones,
-                            # so this self-limits to what the GPU can keep up with
-PARTIAL_MIN_SEC  = 0.8     # less audio than this makes Whisper guess wildly
+SILENCE_SEC      = 0.3     # pause that ends a phrase (sentence gaps are often ~0.25-0.4 s)
+MAX_PHRASE_SEC   = 7       # longest phrase before a forced cut. Previews show text
+                           # live, so a longer phrase costs no visible delay but
+                           # means fewer cuts through words (the main error source)
+CUT_SEARCH_SEC   = 1.5     # ...made where speech is least likely in this final window
+PARTIAL_INTERVAL_SEC = 0.2 # live preview cadence; the worker skips stale ones,
+                           # so this self-limits to what the GPU can keep up with
+PARTIAL_MIN_SEC  = 0.5     # less audio than this makes Whisper guess wildly
 MIN_PHRASE_SEC   = 0.5     # shorter clips are mostly silence and make Whisper hallucinate
-CAL_MULTIPLIER   = 1.3
-DEFAULT_SENS     = 0.6
+VAD_WINDOW_SEC   = 0.25    # audio context given to Silero VAD per decision
+VAD_HYSTERESIS   = 0.15    # once in speech, stay until probability drops this far below
+PREROLL_SEC      = 0.3     # audio kept from before VAD fired, so first words aren't clipped
+SILENCE_FLOOR_DBFS = -65   # below this it's digital silence: skip VAD entirely
+DEFAULT_SENS     = 0.5     # speech sensitivity 0..1; higher catches quieter/less clear speech
+AGC_TARGET_DBFS  = -20     # clips are normalised to this RMS before Whisper...
+AGC_MAX_GAIN_DB  = 30      # ...boosting quiet audio by at most this much
+AGC_PEAK_DBFS    = -1      # and never letting peaks exceed this
+NO_SPEECH_PROB   = 0.6     # Whisper's rule: discard only if no-speech prob is above
+LOGPROB_FLOOR    = -1.0    # this AND the average token log-prob is below this
+CONTEXT_TOKENS   = 96      # previous text fed back as context (Whisper's default)
+CONTEXT_RESET_SEC = 6      # forget the context after this long without a phrase
+RECORD_DIR       = Path(__file__).resolve().parent / "recordings"
+RECORD_KEEP      = 400     # newest phrase recordings kept for accuracy checks
+
+
+def vad_threshold_for(sensitivity: float) -> float:
+    """Map the 0..1 sensitivity slider to a Silero speech probability
+    threshold: 0 -> 0.85 (only clear speech), 1 -> 0.15 (almost anything)."""
+    return 0.85 - 0.7 * max(0.0, min(1.0, sensitivity))
+
+
+def levels_dbfs(data: bytes):
+    """RMS and peak of an int16 block in dBFS (0 dBFS = full scale)."""
+    import numpy as np
+    x = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+    if x.size == 0:
+        return -100.0, -100.0
+    rms  = float(np.sqrt(np.mean(x * x)))
+    peak = float(np.max(np.abs(x)))
+    to_db = lambda v: 20 * math.log10(v / 32768.0) if v > 0 else -100.0
+    return max(-100.0, to_db(rms)), max(-100.0, to_db(peak))
+
+
+def apply_agc(audio_np):
+    """Automatic gain control for one clip (float32, -1..1): bring speech to
+    a consistent level for Whisper and VAD, with a gain cap so silence isn't
+    amplified into noise and a peak limit so nothing clips."""
+    import numpy as np
+    rms = float(np.sqrt(np.mean(audio_np * audio_np))) if audio_np.size else 0.0
+    if rms < 1e-6:
+        return audio_np, 0.0
+    gain = 10 ** (AGC_TARGET_DBFS / 20) / rms
+    gain = min(gain, 10 ** (AGC_MAX_GAIN_DB / 20))
+    peak = float(np.max(np.abs(audio_np))) * gain
+    limit = 10 ** (AGC_PEAK_DBFS / 20)
+    if peak > limit:
+        gain *= limit / peak
+    return (audio_np * gain).astype(np.float32), 20 * math.log10(gain)
 
 # VB-Audio virtual cables appear as "CABLE-A Output", "CABLE Output", etc.
 # Voicemeeter mix buses are deliberately excluded so we capture the raw cable.
@@ -472,7 +518,8 @@ def _translate_cached(text: str, src: str, tgt: str) -> str:
                 state["cooldown"] = min(_PROVIDER_COOLDOWN_MAX,
                                         max(_PROVIDER_COOLDOWN_BASE, state["cooldown"] * 2))
                 state["until"]    = time.monotonic() + state["cooldown"]
-            log_event(logging.WARNING, "translation_rate_limited",
+            # INFO: a blocked service is retried after each cooldown by design
+            log_event(logging.INFO, "translation_rate_limited",
                       provider=name, cooldown_s=state["cooldown"], error=str(e))
             errors.append(f"{name}: rate limited")
         except Exception as e:
@@ -870,15 +917,46 @@ class LoopbackOutputThread(threading.Thread):
 # Audio capture + VAD
 # ─────────────────────────────────────────────────────────────────────────────
 
+STATS_INTERVAL_SEC = 10   # how often each component logs its perf summary
+
+
+class PerfWindow:
+    """Collects samples per metric and summarises them as n/p50/p95/max for a
+    periodic stats log line, then resets. Cheap enough for the audio loop."""
+    def __init__(self):
+        self._data = {}
+        self.started = time.monotonic()
+
+    def add(self, name, value):
+        self._data.setdefault(name, []).append(value)
+
+    def due(self):
+        return time.monotonic() - self.started >= STATS_INTERVAL_SEC
+
+    def summary(self):
+        out = {}
+        for name, vals in self._data.items():
+            v = sorted(vals)
+            out[name] = {"n": len(v), "p50": round(v[len(v) // 2], 2),
+                         "p95": round(v[min(len(v) - 1, int(len(v) * 0.95))], 2),
+                         "max": round(v[-1], 2)}
+        self._data = {}
+        self.started = time.monotonic()
+        return out
+
+
 class LatestSlot:
     """Single-item mailbox: put() overwrites, take() empties. Live previews
     only matter if current, so a stale one is replaced rather than queued."""
     def __init__(self):
         self._lock = threading.Lock()
         self._item = None
+        self.overwritten = 0   # previews dropped because a newer one arrived
 
     def put(self, item):
         with self._lock:
+            if self._item is not None:
+                self.overwritten += 1
             self._item = item
 
     def take(self):
@@ -903,16 +981,15 @@ class AudioCaptureThread(threading.Thread):
         self.level_cb          = level_cb
         self.loopback_out      = loopback_out
         self._stop_evt         = threading.Event()
-        self.energy_threshold  = 300
-        self._sensitivity_mult = DEFAULT_SENS
+        self.vad_threshold     = vad_threshold_for(DEFAULT_SENS)
 
-    def set_sensitivity(self, mult: float):
-        self._sensitivity_mult = mult
+    def set_sensitivity(self, sensitivity: float):
+        self.vad_threshold = vad_threshold_for(sensitivity)
 
     def stop(self):
         self._stop_evt.set()
 
-    def _flush(self, seq, buf, min_c, label="Phrase", resample=None):
+    def _flush(self, seq, buf, min_c, label="Phrase", resample=None, meta=None):
         # Always emit, even an empty payload, so the UI can clear the live
         # preview line for this phrase.
         payload = b""
@@ -920,7 +997,8 @@ class AudioCaptureThread(threading.Thread):
             raw     = b"".join(buf)
             payload = resample(raw) if resample else raw
         try:
-            self.phrase_queue.put((seq, payload), timeout=0.25)
+            meta = dict(meta or {}, reason=label, t_end=time.monotonic())
+            self.phrase_queue.put((seq, payload, meta), timeout=0.25)
             backlog = self.phrase_queue.qsize()
             log_event(logging.INFO, "phrase_flushed",
                       reason=label, seq=seq, bytes=len(payload),
@@ -1032,33 +1110,11 @@ class AudioCaptureThread(threading.Thread):
                           device_index=self.device_index, open_rate=open_rate)
             return
 
-        # ── Calibrate ~1 s ───────────────────────────────────────────────
-        self.status_cb("Calibrating…")
-        cal = []
-        for _ in range(int(open_rate / chunk_sz)):
-            if self._stop_evt.is_set():
-                stream.close(); return
-            try:
-                data = stream.read(chunk_sz, exception_on_overflow=False)
-                if in_channels > 1:
-                    data = downmix(data, in_channels)
-                cal.append(rms(data))
-            except Exception:
-                pass
-        if cal:
-            ambient               = sum(cal) / len(cal)
-            self.energy_threshold = max(100, ambient * CAL_MULTIPLIER)
-            self.status_cb("Ready.  Ambient " + str(round(ambient)) +
-                           "  threshold " + str(round(self.energy_threshold)))
-            log_event(logging.INFO, "audio_calibrated",
-                      ambient=round(ambient, 2),
-                      threshold=round(self.energy_threshold, 2),
-                      sensitivity=round(self._sensitivity_mult, 2),
-                      open_rate=open_rate)
-        else:
-            self.status_cb("Ready (default threshold).")
-            log_event(logging.WARNING, "audio_calibration_empty",
-                      threshold=self.energy_threshold, open_rate=open_rate)
+        # No calibration: speech is detected by Silero VAD, which judges
+        # whether audio *sounds like speech* rather than how loud it is, so it
+        # copes with any input level and with background noise or music.
+        from faster_whisper.vad import get_vad_model
+        vad = get_vad_model()
 
         per_sec   = open_rate / chunk_sz
         sil_c     = max(1, int(SILENCE_SEC * per_sec))
@@ -1067,14 +1123,30 @@ class AudioCaptureThread(threading.Thread):
         partial_c = max(1, int(PARTIAL_INTERVAL_SEC * per_sec))
         min_c     = max(1, int(MIN_PHRASE_SEC * per_sec))
         pmin_c    = max(1, int(PARTIAL_MIN_SEC * per_sec))
+        vad_c     = max(1, int(VAD_WINDOW_SEC * per_sec))
+        pre_c     = max(1, int(PREROLL_SEC * per_sec))
 
-        buf, levels  = [], []
+        recent       = deque(maxlen=max(vad_c, pre_c))
+        buf, probs   = [], []
+        chunk_sec    = chunk_sz / open_rate
+        stats        = PerfWindow()
+        last_read_t  = None
+        speech_frames = frames = 0
+        # Per-phrase measurements, logged with the phrase's trace
+        ph_t_start, ph_levels, ph_peak, ph_previews = 0.0, [], -100.0, 0
+
+        def phrase_meta(n_chunks):
+            return {"t_start": ph_t_start, "audio_sec": round(n_chunks * chunk_sec, 3),
+                    "rms_dbfs": round(sum(ph_levels) / len(ph_levels), 1) if ph_levels else None,
+                    "peak_dbfs": round(ph_peak, 1),
+                    "vad_mean": round(sum(probs) / len(probs), 3) if probs else None,
+                    "vad_threshold": round(self.vad_threshold, 3), "previews": ph_previews}
         sil_count    = 0
         in_speech    = False
         since_prev   = 0
-        speech_level = 0.0
         seq          = 0
         silence      = bytes(chunk_sz * SAMPLE_WIDTH)
+        self.status_cb("Listening…")
 
         # ── Resampler: captured at open_rate; Whisper needs SAMPLE_RATE (16 kHz)
         if open_rate != SAMPLE_RATE:
@@ -1102,15 +1174,39 @@ class AudioCaptureThread(threading.Thread):
             def _resample(raw: bytes) -> bytes:
                 return raw
 
+        import numpy as np
+
+        def speech_prob() -> float:
+            # Silero scores 512-sample (32 ms) frames at 16 kHz; a ~250 ms
+            # window gives it context. ~0.4 ms per call on one CPU core.
+            pcm = np.frombuffer(_resample(b"".join(list(recent)[-vad_c:])), dtype=np.int16)
+            n = (len(pcm) // 512) * 512
+            if n == 0:
+                return 0.0
+            t0 = time.perf_counter()
+            out = vad(pcm[-n:].astype(np.float32) / 32768.0)
+            stats.add("vad_ms", (time.perf_counter() - t0) * 1000)
+            return float(out[-2:].mean())
+
         while not self._stop_evt.is_set():
             try:
                 data = stream.read(chunk_sz, exception_on_overflow=False)
+                now = time.monotonic()
+                if last_read_t is not None:
+                    # >> chunk duration means the loop fell behind the device
+                    stats.add("read_gap_ms", (now - last_read_t) * 1000)
+                last_read_t = now
+                try:
+                    stats.add("backlog_frames", stream.get_read_available())
+                except Exception:
+                    pass
                 if in_channels > 1:
                     data = downmix(data, in_channels)
             except Exception as e:
                 log_exception("audio_stream_read_failed", e)
                 time.sleep(0.01)
                 continue
+            loop_t0 = time.perf_counter()
 
             # Our own text-to-speech playing on the captured device must not
             # be transcribed as the friend speaking.
@@ -1121,19 +1217,36 @@ class AudioCaptureThread(threading.Thread):
             if self.loopback_out is not None:
                 self.loopback_out.push(data)
 
-            level     = rms(data)
-            threshold = self.energy_threshold * self._sensitivity_mult
-            self.level_cb(level, threshold)
+            recent.append(data)
+            rms_db, peak_db = levels_dbfs(data)
+            prob = speech_prob() if rms_db > SILENCE_FLOOR_DBFS else 0.0
+            thr  = self.vad_threshold
+            # Hysteresis: easier to stay in speech than to enter it, so brief
+            # dips inside words don't end the phrase.
+            speaking = prob >= (thr - VAD_HYSTERESIS if in_speech else thr)
+            self.level_cb(rms_db, peak_db, speaking)
+            frames += 1
+            speech_frames += speaking
+            if rms_db > -99:
+                stats.add("level_dbfs", rms_db)
+            if stats.due():
+                log_event(logging.INFO, "capture_stats", device_index=self.device_index,
+                          chunk_ms=round(chunk_sec * 1000, 1),
+                          speech_pct=round(100 * speech_frames / max(1, frames), 1),
+                          vad_threshold=round(thr, 3), **stats.summary())
+                frames = speech_frames = 0
 
-            if in_speech:
-                loud = level > max(threshold, PAUSE_RATIO * speech_level)
-            else:
-                loud = level > threshold
-            if loud:
+            if speaking:
                 if not in_speech:
-                    in_speech, speech_level = True, level
+                    in_speech = True
+                    # Pre-roll: VAD needs a frame or two to fire, so include
+                    # the audio just before it did or the first word is clipped.
+                    pre = list(recent)[-pre_c:-1]
+                    buf, probs = pre, [thr] * len(pre)
+                    since_prev = len(buf)
+                    ph_t_start = time.monotonic() - len(pre) * chunk_sec
+                    ph_levels, ph_peak, ph_previews = [], -100.0, 0
                     self.status_cb("🎙 Speech…")
-                speech_level = 0.95 * speech_level + 0.05 * level
                 sil_count = 0
             elif in_speech:
                 sil_count += 1
@@ -1141,28 +1254,38 @@ class AudioCaptureThread(threading.Thread):
                 continue
 
             buf.append(data)
-            levels.append(level)
+            probs.append(prob)
+            ph_levels.append(rms_db)
+            ph_peak = max(ph_peak, peak_db)
             since_prev += 1
             if sil_count >= sil_c:
-                self._flush(seq, buf, min_c, "end", _resample)
+                self._flush(seq, buf, min_c, "end", _resample, phrase_meta(len(buf)))
                 seq += 1
-                buf, levels, sil_count, since_prev, in_speech = [], [], 0, 0, False
+                buf, probs, sil_count, since_prev, in_speech = [], [], 0, 0, False
             elif len(buf) >= max_c:
-                # Cut at the quietest chunk (likely a word gap) near the end,
+                # Cut where speech is least likely (a word gap) near the end,
                 # carrying the remainder into the next phrase.
-                start = len(levels) - cut_win
-                cut   = start + min(range(cut_win), key=lambda i: levels[start + i])
-                self._flush(seq, buf[:cut + 1], min_c, "max", _resample)
+                start = len(probs) - cut_win
+                cut   = start + min(range(cut_win), key=lambda i: probs[start + i])
+                self._flush(seq, buf[:cut + 1], min_c, "max", _resample,
+                            phrase_meta(cut + 1))
                 seq += 1
-                buf, levels = buf[cut + 1:], levels[cut + 1:]
-                since_prev  = len(buf)
-            elif (since_prev >= partial_c and len(buf) >= pmin_c
+                buf, probs = buf[cut + 1:], probs[cut + 1:]
+                since_prev = len(buf)
+                ph_t_start = time.monotonic() - len(buf) * chunk_sec
+                ph_levels, ph_peak, ph_previews = ph_levels[cut + 1:], -100.0, 0
+            elif (since_prev >= partial_c and len(buf) >= pmin_c and sil_count == 0
                     and self.partial_slot is not None):
-                self.partial_slot.put((seq, _resample(b"".join(buf))))
+                # sil_count == 0: once a pause starts the final is ~0.3 s away;
+                # a preview started now would hold the GPU and delay it.
+                self.partial_slot.put((seq, _resample(b"".join(buf)),
+                                       time.monotonic(), ph_t_start))
+                ph_previews += 1
                 since_prev = 0
+            stats.add("loop_ms", (time.perf_counter() - loop_t0) * 1000)
 
         if buf:
-            self._flush(seq, buf, min_c, "final", _resample)
+            self._flush(seq, buf, min_c, "final", _resample, phrase_meta(len(buf)))
         if stream is not None:
             stream.close()
         log_event(logging.INFO, "audio_capture_stopped", open_rate=open_rate)
@@ -1221,8 +1344,12 @@ class WhisperModelLoader(threading.Thread):
         # count / 2 on SMT CPUs; hyperthreads slow CTranslate2 down). On GPU the
         # CPU threads still run feature extraction and VAD.
         kwargs = dict(device=device, compute_type=compute_type)
-        cores = os.cpu_count() or 4
-        kwargs["cpu_threads"] = max(1, cores // 2 if cores > 4 else cores)
+        try:
+            import psutil
+            cores = psutil.cpu_count(logical=False) or os.cpu_count() or 4
+        except ImportError:
+            cores = max(1, (os.cpu_count() or 4) // 2)
+        kwargs["cpu_threads"] = cores
             
         try:
             from faster_whisper.utils import download_model
@@ -1232,6 +1359,7 @@ class WhisperModelLoader(threading.Thread):
                            f"can take a few minutes)…")
             log_event(logging.INFO, "whisper_model_download_started", model_size=model_size)
         model = WhisperModel(model_size, **kwargs)
+        model._size_name = model_size
         self.status_cb("Pre-warming model…")
         import numpy as np
         dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
@@ -1301,6 +1429,72 @@ def plain_device_name(label: str) -> str:
     """'🔊 Speakers (FiiO Q series) [Loopback]' -> 'Speakers (FiiO Q series)'."""
     import re
     return re.sub(r"^[^\w(]+", "", label).replace(" [Loopback]", "").strip()
+
+
+class DbMeter(ctk.CTkCanvas):
+    """Segmented LED-style level meter in dBFS, after broadcast PPMs:
+    -60..0 dBFS, green below -18, amber to -6, red above; instant attack,
+    20 dB/s fall-back, and a peak-hold marker that holds 1.5 s. Segments are
+    drawn once and only recoloured, so updating costs almost nothing."""
+    FLOOR_DB, SEG_DB = -60.0, 1.5
+    FALL_DB_PER_SEC, HOLD_SEC = 20.0, 1.5
+    TICKS = (-60, -48, -36, -24, -18, -12, -6, -3, 0)
+    ZONES = ((-18, "#2ECC71", "#123d24"), (-6, "#F1C40F", "#4a3f0c"), (0.1, "#E74C3C", "#4a1712"))
+
+    def __init__(self, master, **kw):
+        super().__init__(master, height=30, highlightthickness=0, bg="#1d1e1e", **kw)
+        self._segs, self._lit = [], []
+        self._rms = self._peak = self.FLOOR_DB
+        self._peak_t = 0.0
+        self._last_t = time.monotonic()
+        self.bind("<Configure>", lambda e: self._layout())
+
+    def _colours(self, db):
+        for top, on, off in self.ZONES:
+            if db < top:
+                return on, off
+        return self.ZONES[-1][1:]
+
+    def _layout(self):
+        self.delete("all")
+        w = max(100, self.winfo_width())
+        n = int(-self.FLOOR_DB / self.SEG_DB)
+        seg_w = (w - 8) / n
+        self._segs = []
+        for i in range(n):
+            db = self.FLOOR_DB + (i + 1) * self.SEG_DB
+            on, off = self._colours(db - 0.01)
+            x0 = 4 + i * seg_w
+            rid = self.create_rectangle(x0, 3, x0 + seg_w - 2, 17, fill=off, width=0)
+            self._segs.append((db, rid, on, off))
+        self._lit = [None] * n
+        for t in self.TICKS:
+            x = 4 + (t - self.FLOOR_DB) / -self.FLOOR_DB * (w - 8)
+            self.create_text(min(max(x, 8), w - 8), 25, text=str(t), fill="gray60",
+                             font=("Segoe UI", 7))
+
+    def update_level(self, rms_db, peak_db):
+        now = time.monotonic()
+        dt, self._last_t = now - self._last_t, now
+        fall = self.FALL_DB_PER_SEC * dt
+        self._rms = max(rms_db, self._rms - fall)
+        if peak_db >= self._peak:
+            self._peak, self._peak_t = peak_db, now
+        elif now - self._peak_t > self.HOLD_SEC:
+            self._peak = max(peak_db, self._peak - fall)
+        self._paint()
+
+    def reset(self):
+        self._rms = self._peak = self.FLOOR_DB
+        self._paint()
+
+    def _paint(self):
+        hold_idx = int((self._peak - self.FLOOR_DB) / self.SEG_DB) - 1
+        for i, (db, rid, on, off) in enumerate(self._segs):
+            state = on if (db <= self._rms or i == hold_idx) else off
+            if self._lit[i] != state:
+                self.itemconfigure(rid, fill=state)
+                self._lit[i] = state
 
 
 class Speaker(threading.Thread):
@@ -1407,7 +1601,8 @@ class TranscriptionWorker(threading.Thread):
     """
     def __init__(self, wid, model, src_whisper, src_lang_key, tgt_lang_key,
                  phrase_queue, result_queue, status_cb,
-                 partial_slot: "LatestSlot | None" = None):
+                 partial_slot: "LatestSlot | None" = None,
+                 preview_model=None, run_id=0, record_audio=False):
         super().__init__(daemon=True, name=f"transcription-worker-{wid}")
         self.wid          = wid
         self.model        = model
@@ -1419,6 +1614,14 @@ class TranscriptionWorker(threading.Thread):
         self.result_queue = result_queue
         self.status_cb    = status_cb
         self.partial_slot = partial_slot
+        # Optional smaller model just for live previews (e.g. Tiny: ~30 ms vs
+        # ~110 ms for Small); finished phrases still use the main model. May be
+        # a callable, re-checked per preview, so a model that finishes loading
+        # after the session started is picked up straight away.
+        self._preview_model_src = preview_model
+        self.run_id       = run_id
+        self.record_audio = record_audio
+        self._stats       = PerfWindow()
         self._stop_evt    = threading.Event()
         tgt_code          = LANGUAGES.get(tgt_lang_key, ("en", "en"))[0]
         self.local_translate = tgt_code == "en" and src_whisper != "en"
@@ -1429,7 +1632,30 @@ class TranscriptionWorker(threading.Thread):
         self._stop_evt.set()
         self.phrase_queue.put(None)
 
-    NO_SPEECH_PROB = 0.6
+    def _record(self, seq, audio_bytes):
+        """Save the phrase audio (16 kHz mono WAV) for accuracy analysis;
+        keeps the newest RECORD_KEEP files. Returns the path or None."""
+        if not self.record_audio:
+            return None
+        try:
+            import wave
+            RECORD_DIR.mkdir(exist_ok=True)
+            path = RECORD_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_r{self.run_id}_s{seq}.wav"
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
+                w.writeframes(audio_bytes)
+            old = sorted(RECORD_DIR.glob("*.wav"))[:-RECORD_KEEP]
+            for f in old:
+                f.unlink(missing_ok=True)
+            return path.name
+        except Exception as e:
+            log_exception("phrase_record_failed", e)
+            return None
+
+    @property
+    def preview_model(self):
+        src = self._preview_model_src
+        return src() if callable(src) else src
 
     def _prepare(self):
         """Prompt tokens and VAD options, built once per worker."""
@@ -1440,44 +1666,112 @@ class TranscriptionWorker(threading.Thread):
         tail = [ids("<|notimestamps|>")]
         self._prompts = {"transcribe": head + [ids("<|transcribe|>")] + tail,
                          "translate":  head + [ids("<|translate|>")] + tail}
+        self._sot_prev  = ids("<|startofprev|>")
+        # Previous finished text per task, fed back as context so each chunk
+        # is decoded knowing what came before (fixes words lost at cuts).
+        self._history   = {"transcribe": [], "translate": []}
+        self._history_t = 0.0
         self._tokenizer = tok
         self._vad_opts  = VadOptions(min_silence_duration_ms=300, speech_pad_ms=200)
         self._n_frames  = self.model.feature_extractor.nb_max_frames
 
-    def _decode(self, audio_np, tasks):
-        """Return one text per task. VAD runs once (CPU); the GPU then encodes
-        and decodes all tasks as a single batch, which costs little more than
-        one task because Whisper's encoder always processes a padded 30 s
-        window."""
+    def _decode(self, audio_np, tasks, model=None):
+        """Return one text per task. VAD runs once (CPU) and trims silence,
+        AGC levels the clip, the GPU encodes it once, then all tasks decode as
+        one batch from copies of that encoding. Whisper's encoder always
+        processes a padded 30 s window, so encoding once instead of per task
+        saves ~20-30% of the GPU time."""
         import numpy as np
         import ctranslate2
         from faster_whisper.vad import get_speech_timestamps
+        model = model or self.model
+        info = {"audio_sec": round(len(audio_np) / SAMPLE_RATE, 3)}
+        t = time.perf_counter()
         stamps = get_speech_timestamps(audio_np, self._vad_opts)
+        info["vad_ms"] = round((time.perf_counter() - t) * 1000, 2)
         if not stamps:
-            return ["" for _ in tasks], 0.0
-        audio_np = audio_np[stamps[0]["start"]:stamps[-1]["end"]]
-        feats = self.model.feature_extractor(audio_np)[:, :self._n_frames]
+            info["no_speech"] = True
+            return ["" for _ in tasks], info
+        audio_np, info["agc_gain_db"] = apply_agc(audio_np[stamps[0]["start"]:stamps[-1]["end"]])
+        info["agc_gain_db"] = round(info["agc_gain_db"], 1)
+        info["speech_sec"] = round(len(audio_np) / SAMPLE_RATE, 3)
+        t = time.perf_counter()
+        feats = model.feature_extractor(audio_np)[:, :self._n_frames]
         if feats.shape[1] < self._n_frames:
             feats = np.pad(feats, ((0, 0), (0, self._n_frames - feats.shape[1])))
-        batch = ctranslate2.StorageView.from_array(
-            np.ascontiguousarray(np.stack([feats] * len(tasks)), dtype=np.float32))
+        single = ctranslate2.StorageView.from_array(
+            np.ascontiguousarray(feats[None], dtype=np.float32))
+        info["mel_ms"] = round((time.perf_counter() - t) * 1000, 2)
         lock_t0 = time.perf_counter()
         with self.model_lock:
-            lock_wait_ms = round((time.perf_counter() - lock_t0) * 1000, 2)
-            enc = self.model.model.encode(batch, to_cpu=False)
-            results = self.model.model.generate(
-                enc, [self._prompts[t] for t in tasks],
-                beam_size=1, max_length=224, return_no_speech_prob=True,
-                suppress_blank=True)
-        texts = []
-        for r in results:
-            if r.no_speech_prob > self.NO_SPEECH_PROB:
-                texts.append("")
+            t = time.perf_counter()
+            info["lock_wait_ms"] = round((t - lock_t0) * 1000, 2)
+            if len(tasks) == 1:
+                enc = model.model.encode(single, to_cpu=False)
             else:
-                texts.append(self._tokenizer.decode(r.sequences_ids[0]).strip())
-        return texts, lock_wait_ms
+                enc = model.model.encode(single, to_cpu=True)
+                enc = ctranslate2.StorageView.from_array(
+                    np.repeat(np.asarray(enc), len(tasks), axis=0))
+            # Note: CUDA calls are asynchronous, so encode_ms can be partly
+            # absorbed into decode_ms; their sum is the reliable GPU figure.
+            info["encode_ms"] = round((time.perf_counter() - t) * 1000, 2)
+            t = time.perf_counter()
+            results = model.model.generate(
+                enc, self._prompts_for(tasks),
+                beam_size=1, max_length=224, return_no_speech_prob=True,
+                return_scores=True, suppress_blank=True)
+            info["decode_ms"] = round((time.perf_counter() - t) * 1000, 2)
+        texts, dropped = [], []
+        info["no_speech_prob"], info["avg_logprob"] = [], []
+        for r in results:
+            text = self._tokenizer.decode(r.sequences_ids[0]).strip()
+            # CTranslate2 scores are length-normalised log-probs (~ avg_logprob)
+            avg_lp = float(r.scores[0]) if r.scores else 0.0
+            info["no_speech_prob"].append(round(r.no_speech_prob, 3))
+            info["avg_logprob"].append(round(avg_lp, 3))
+            # Whisper discards only when BOTH say "no speech"; using the
+            # no-speech probability alone threw away half the phrases of real
+            # call audio (music/noise raise it even when words are clear).
+            if r.no_speech_prob > NO_SPEECH_PROB and avg_lp < LOGPROB_FLOOR:
+                dropped.append(text)
+                text = ""
+            texts.append(text)
+        if any(dropped):
+            info["dropped_text"] = dropped
+        info["tokens"] = sum(len(r.sequences_ids[0]) for r in results)
+        info["_token_ids"] = [list(r.sequences_ids[0]) for r in results]
+        return texts, info
+
+    def _prompts_for(self, tasks):
+        if time.monotonic() - self._history_t > CONTEXT_RESET_SEC:
+            self._history = {k: [] for k in self._history}
+        hists = [self._history.get(t) or [] for t in tasks]
+        # A batch needs <|startoftranscript|> at the same position in every
+        # prompt, so give each task the same number of context tokens.
+        n = min(len(h) for h in hists)
+        return [([self._sot_prev] + h[len(h) - n:] if n else []) + self._prompts[t]
+                for t, h in zip(tasks, hists)]
+
+    def _remember(self, tasks, token_ids, texts):
+        """Keep accepted text as context for the next chunk."""
+        for task, ids, text in zip(tasks, token_ids, texts):
+            if text:
+                self._history[task] = (self._history[task] + ids)[-CONTEXT_TOKENS:]
+        self._history_t = time.monotonic()
 
     def run(self):
+        # An unexpected error used to kill this thread for good: phrases then
+        # piled up and were dropped for the rest of the session. Log it and
+        # carry on instead.
+        while not self._stop_evt.is_set():
+            try:
+                self._run_loop()
+                return
+            except Exception as e:
+                log_exception("transcription_worker_recovered", e, worker_id=self.wid)
+                time.sleep(0.05)
+
+    def _run_loop(self):
         import numpy as np
         self._prepare()
         tasks = ["transcribe", "translate"] if self.local_translate else ["transcribe"]
@@ -1488,21 +1782,35 @@ class TranscriptionWorker(threading.Thread):
                 item = False
             if item is None:
                 break
+            if self._stats.due():
+                slot = self.partial_slot
+                log_event(logging.INFO, "preview_stats", run_id=self.run_id,
+                          preview_model=getattr(self.preview_model or self.model,
+                                                "_size_name", None),
+                          skipped_stale=slot.overwritten if slot else 0,
+                          **self._stats.summary())
+                if slot:
+                    slot.overwritten = 0
             if item is False:
                 partial = self.partial_slot.take() if self.partial_slot else None
                 if partial and partial[0] > self._last_final:
                     self._process_partial(*partial)
+                elif partial:
+                    self._stats.add("dropped_after_final", 1)
                 continue
-            seq, audio_bytes = item
+            seq, audio_bytes, meta = item
             self._last_final = seq
+            t_dequeue = time.monotonic()
             t0 = time.perf_counter()
             try:
                 if not audio_bytes:
-                    self.result_queue.put(("final", (seq, "", "")))
+                    self.result_queue.put(("final", (seq, "", "", None)))
                     continue
                 audio_np = (np.frombuffer(audio_bytes, dtype=np.int16)
                             .astype(np.float32) / 32768.0)
-                texts, lock_wait_ms = self._decode(audio_np, tasks)
+                texts, info = self._decode(audio_np, tasks)
+                token_ids = info.pop("_token_ids", [])
+                lock_wait_ms = info.get("lock_wait_ms", 0.0)
                 text       = texts[0]
                 translated = texts[1] if self.local_translate else None
                 if is_hallucination(text):
@@ -1512,40 +1820,76 @@ class TranscriptionWorker(threading.Thread):
                     translated = "" if self.local_translate else None
                 elif self.local_translate and is_hallucination(translated):
                     translated = ""
+                if text:
+                    self._remember(tasks, token_ids,
+                                   [text, translated] if self.local_translate else [text])
                 elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-                log_event(logging.INFO, "transcription_completed",
-                          worker_id=self.wid, seq=seq, tasks=len(tasks),
-                          input_bytes=len(audio_bytes), text_chars=len(text),
-                          elapsed_ms=elapsed_ms, lock_wait_ms=lock_wait_ms,
-                          queue_backlog=self.phrase_queue.qsize())
+                t_result = time.monotonic()
+                trace = {
+                    "run_id": self.run_id, "seq": seq, "reason": meta.get("reason"),
+                    "tasks": len(tasks), "local_translate": self.local_translate,
+                    "model": getattr(self.model, "_size_name", None),
+                    "audio_sec": meta.get("audio_sec"), "rms_dbfs": meta.get("rms_dbfs"),
+                    "peak_dbfs": meta.get("peak_dbfs"), "vad_mean": meta.get("vad_mean"),
+                    "vad_threshold": meta.get("vad_threshold"), "previews": meta.get("previews"),
+                    # speech start -> phrase end detected (the audio itself + pause wait)
+                    "capture_ms": round((meta["t_end"] - meta["t_start"]) * 1000, 1)
+                                  if meta.get("t_start") else None,
+                    "queue_wait_ms": round((t_dequeue - meta["t_end"]) * 1000, 2),
+                    "process_ms": elapsed_ms,
+                    "text_chars": len(text),
+                    "translated_chars": len(translated) if translated else 0,
+                    # The words themselves, so recognition can be checked
+                    # against the saved audio (log_tools.py accuracy)
+                    "text": text, "translation": translated, "src_lang": self.src_whisper,
+                    "context_tokens": len(self._history.get("transcribe", [])),
+                    "audio_file": self._record(seq, audio_bytes),
+                    "queue_backlog": self.phrase_queue.qsize(),
+                }
+                trace.update({k: v for k, v in info.items() if k != "audio_sec"})
+                log_event(logging.INFO, "phrase_trace", **trace)
+                trace["t_end"], trace["t_result"] = meta["t_end"], t_result
                 self.result_queue.put(("metric", ("transcription_ms", elapsed_ms)))
                 self.result_queue.put(("metric", ("lock_wait_ms",     lock_wait_ms)))
                 if self._stop_evt.is_set():
                     break   # session restarted: don't leak into the new one
                 # translated None => the UI sends it for online translation
-                self.result_queue.put(("final", (seq, text, translated)))
+                self.result_queue.put(("final", (seq, text, translated, trace)))
             except Exception as e:
-                self.result_queue.put(("final", (seq, "", "")))
+                self.result_queue.put(("final", (seq, "", "", None)))
                 self.result_queue.put(("status", f"Worker {self.wid}: {e}"))
                 log_exception("transcription_failed", e,
                               worker_id=self.wid,
                               input_bytes=len(audio_bytes) if audio_bytes else 0)
 
-    def _process_partial(self, seq, audio_bytes):
+    def _process_partial(self, seq, audio_bytes, t_capture, t_start):
         import numpy as np
         try:
+            # How old the preview audio already is when we pick it up
+            self._stats.add("age_ms", (time.monotonic() - t_capture) * 1000)
             audio_np = (np.frombuffer(audio_bytes, dtype=np.int16)
                         .astype(np.float32) / 32768.0)
             tasks = ["transcribe", "translate"] if self.local_translate else ["transcribe"]
             t0 = time.perf_counter()
-            texts, _ = self._decode(audio_np, tasks)
+            texts, info = self._decode(audio_np, tasks, model=self.preview_model)
+            self._stats.add("preview_is_main_model", int(self.preview_model is None))
+            info.pop("_token_ids", None)
+            if "dropped_text" in info:
+                self._stats.add("dropped_no_speech", 1)
+            self._stats.add("process_ms", (time.perf_counter() - t0) * 1000)
+            self._stats.add("audio_sec", info.get("audio_sec", 0))
+            for k in ("vad_ms", "mel_ms", "encode_ms", "decode_ms", "lock_wait_ms"):
+                if k in info:
+                    self._stats.add(k, info[k])
             heard = texts[0] if not is_hallucination(texts[0]) else ""
             translated = (texts[1] if self.local_translate and heard
                           and not is_hallucination(texts[1]) else None)
             preview = (seq, heard, translated)
             if heard and preview != self._last_preview and not self._stop_evt.is_set():
                 self._last_preview = preview
-                self.result_queue.put(("partial", preview))
+                self.result_queue.put(("partial", preview + (t_start, time.monotonic())))
+            else:
+                self._stats.add("not_shown", 1)   # empty, hallucination or unchanged
                 self.result_queue.put(("metric", ("partial_ms",
                                                   round((time.perf_counter() - t0) * 1000, 2))))
         except Exception as e:
@@ -1561,8 +1905,8 @@ class InterpreterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Voice Interpreter")
-        self.geometry("980x800")
-        self.minsize(820, 640)
+        self.geometry("980x720")
+        self.minsize(760, 480)
 
         self.session_id = str(uuid.uuid4())
         self.result_queue = queue.Queue()
@@ -1583,6 +1927,14 @@ class InterpreterApp(ctk.CTk):
         self._whisper_model       = None
         self.is_listening         = False
         self._muted               = False
+        self._run_id              = 0
+        self._traces              = {}   # seq -> trace awaiting online translation
+        self._first_preview       = {}   # seq -> ms from speech start to first preview
+        self._ui_stats            = PerfWindow()
+        self._last_poll_t         = None
+        self._proc                = None
+        self._preview_loader      = None
+        self._preview_enabled     = False
         self._initialised         = False
         self._active_mode         = None
         self._start_retry_after_id = None
@@ -1627,7 +1979,9 @@ class InterpreterApp(ctk.CTk):
         saved_model = load_settings().get("model")
         self.model_var      = ctk.StringVar(
             value=saved_model if saved_model in MODELS else _DEFAULT_MODEL)
-        self.sensitivity_var = ctk.DoubleVar(value=DEFAULT_SENS)
+        self.sensitivity_var = ctk.DoubleVar(
+            value=float(load_settings().get("sensitivity", DEFAULT_SENS)))
+        self._sens_log_after = None
         self.src_var        = ctk.StringVar(value="English")
         self.tgt_var        = ctk.StringVar(value="Russian")
 
@@ -1642,6 +1996,7 @@ class InterpreterApp(ctk.CTk):
         self._build_status_bar()
 
         self._apply_mode(0, switch_source=True)
+        self._fit_to_screen()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         log_event(logging.INFO, "app_initialized",
                   session_id=self.session_id,
@@ -1650,10 +2005,54 @@ class InterpreterApp(ctk.CTk):
                   input_device_count=len(input_labels),
                   output_device_count=len(output_labels))
         self._preload_model()
+        self._ensure_preview_model()
         self._initialised = True
         self._start_session()
         self.after(30,   self._poll_queue)
+        self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
         self.after(1000, self._refresh_diagnostics)
+
+    # ── Window placement ──────────────────────────────────────────────────
+
+    WANT_W, WANT_H = 1000, 760   # logical px; shrunk to fit smaller screens
+
+    @staticmethod
+    def _work_area():
+        """Usable screen area in physical pixels (excludes the taskbar,
+        wherever it is docked): (left, top, right, bottom)."""
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(r), 0):  # SPI_GETWORKAREA
+                return r.left, r.top, r.right, r.bottom
+        return None
+
+    def _fit_to_screen(self):
+        """Size the window to fit the usable screen area and centre it there.
+        Windows' default placement put the 800 px-tall window (2000 physical
+        px at 250 % scaling) partly below the screen on a 4K monitor."""
+        self.update_idletasks()
+        from customtkinter import ScalingTracker
+        scale = ScalingTracker.get_window_scaling(self)
+        area = self._work_area()
+        if area is None:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            area = (0, 0, int(sw * scale), int(sh * scale))
+        left, top, right, bottom = area
+        # Title bar + borders, which geometry() sizes exclude (~40 px at 100 %)
+        chrome = int(40 * scale)
+        avail_w = (right - left) / scale
+        avail_h = (bottom - top - chrome) / scale
+        need_h = self.winfo_reqheight() / scale    # what the layout asks for
+        w = int(min(self.WANT_W, avail_w * 0.96))
+        h = int(min(max(self.WANT_H, need_h), avail_h * 0.96))
+        x = left + int(((right - left) - w * scale) / 2)
+        y = top + int(((bottom - top) - (h * scale + chrome)) / 2)
+        self.minsize(min(760, w), min(480, h))
+        self.geometry(f"{w}x{h}+{max(left, x)}+{max(top, y)}")
+        log_event(logging.INFO, "window_placed", scaling=scale, work_area=list(area),
+                  size_logical=[w, h], layout_needs_h=round(need_h), position=[x, y])
 
     # ── Model ─────────────────────────────────────────────────────────────
 
@@ -1674,6 +2073,7 @@ class InterpreterApp(ctk.CTk):
             self._stop_session(keep_mode=True)
         self._whisper_model = None
         self._preload_model()
+        self._ensure_preview_model()
         self._restart_session()
 
     # ── Header ────────────────────────────────────────────────────────────
@@ -1684,10 +2084,10 @@ class InterpreterApp(ctk.CTk):
         hdr.grid_columnconfigure(0, weight=1)
 
         title_row = ctk.CTkFrame(hdr, fg_color="transparent")
-        title_row.grid(row=0, column=0, pady=(14, 2))
+        title_row.grid(row=0, column=0, pady=(8, 8))
 
         ctk.CTkLabel(title_row, text="🎙  Voice Interpreter",
-                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0)
+                     font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0)
 
         hw_text  = " GPU " if WHISPER_DEVICE == "cuda" else " CPU "
         hw_color = COL_OK  if WHISPER_DEVICE == "cuda" else COL_INFO
@@ -1702,42 +2102,56 @@ class InterpreterApp(ctk.CTk):
             fg_color=COL_WARN, corner_radius=4, text_color="white")
         self.live_status_badge.grid(row=0, column=2, padx=(10, 0))
 
-        ctk.CTkLabel(hdr,
-                     text="Powered by Whisper AI  ·  Bidirectional real-time translation",
+        ctk.CTkLabel(title_row,
+                     text="   Whisper AI  ·  real-time translation",
                      font=ctk.CTkFont(size=12),
-                     text_color=("gray50", "gray60")).grid(row=1, column=0, pady=(0, 12))
+                     text_color=("gray50", "gray60")).grid(row=0, column=3, padx=(6, 0))
 
     # ── Quick switch ──────────────────────────────────────────────────────
 
     def _build_quick_switch(self):
         qs = ctk.CTkFrame(self, fg_color=("gray88", "gray20"), corner_radius=10)
-        qs.grid(row=1, column=0, sticky="ew", padx=20, pady=(14, 0))
+        qs.grid(row=1, column=0, sticky="ew", padx=16, pady=(10, 0))
         qs.grid_columnconfigure(0, weight=1)
         qs.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(qs, text="QUICK SWITCH",
-                     font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color=("gray50", "gray55")).grid(
-            row=0, column=0, columnspan=2, pady=(8, 4))
         self._mode_btns = []
         for col, (label, emoji, src, tgt) in enumerate([
             ("My Voice", "🎤", "English", "Russian"),
             ("Friend",   "🔊", "Russian", "English"),
         ]):
             btn = ctk.CTkButton(
-                qs, text=f"{emoji}  {label}\n{src} → {tgt}",
+                qs, text=f"{emoji}  {label}   {src} → {tgt}",
                 font=ctk.CTkFont(size=14, weight="bold"),
-                height=68, corner_radius=8,
+                height=44, corner_radius=8,
                 fg_color=COL_INACTIVE, hover_color=COL_IN_HOVER,
                 command=lambda i=col: self._on_mode_btn(i))
-            btn.grid(row=1, column=col, sticky="ew",
-                     padx=(12, 6) if col == 0 else (6, 12), pady=(0, 12))
+            btn.grid(row=0, column=col, sticky="ew",
+                     padx=(10, 5) if col == 0 else (5, 5), pady=10)
             self._mode_btns.append(btn)
+
+        # Action buttons share the row (they used to take a row of their own)
+        btns = ctk.CTkFrame(qs, fg_color="transparent")
+        btns.grid(row=0, column=2, padx=(5, 10), pady=10)
+        self.mute_btn = ctk.CTkButton(
+            btns, text="🔇  Mute", width=110, height=44,
+            command=self._toggle_mute)
+        self.mute_btn.grid(row=0, column=0, padx=(0, 6))
+        self.tts_btn = ctk.CTkButton(
+            btns, text="🔇  Speak: Off", width=125, height=44,
+            fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
+            text_color=("gray10", "gray90"),
+            command=self._toggle_tts)
+        self.tts_btn.grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(btns, text="Clear", width=64, height=44,
+                      fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
+                      text_color=("gray10", "gray90"),
+                      command=self._clear).grid(row=0, column=2)
 
     # ── Controls ──────────────────────────────────────────────────────────
 
     def _build_controls(self, input_labels, output_labels):
         outer = ctk.CTkFrame(self, fg_color="transparent")
-        outer.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 0))
+        outer.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 0))
         outer.grid_columnconfigure(1, weight=1)
 
         # Audio input
@@ -1798,58 +2212,45 @@ class InterpreterApp(ctk.CTk):
             r3, variable=self.model_var, values=list(MODELS.keys()), width=230,
             command=lambda _: self._reload_model_if_changed())
         self.model_menu.grid(row=0, column=0, padx=(0, 20))
-        ctk.CTkLabel(r3, text="Sensitivity:",
+        ctk.CTkLabel(r3, text="Speech sensitivity:",
                      font=ctk.CTkFont(size=13)).grid(row=0, column=1)
         self.sens_slider = ctk.CTkSlider(
-            r3, from_=0.1, to=1.5, variable=self.sensitivity_var,
+            r3, from_=0.0, to=1.0, variable=self.sensitivity_var,
             width=160, command=self._on_sensitivity)
         self.sens_slider.grid(row=0, column=2, padx=(8, 4))
-        self.sens_label = ctk.CTkLabel(r3, text=f"{DEFAULT_SENS}×",
-                                       font=ctk.CTkFont(size=12), width=36)
+        self.sens_label = ctk.CTkLabel(
+            r3, text=f"{round(self.sensitivity_var.get() * 100)}%",
+            font=ctk.CTkFont(size=12), width=40)
         self.sens_label.grid(row=0, column=3)
-
-        # Action buttons
-        btns = ctk.CTkFrame(outer, fg_color="transparent")
-        btns.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        self.mute_btn = ctk.CTkButton(
-            btns, text="🔇  Mute", width=165,
-            command=self._toggle_mute)
-        self.mute_btn.grid(row=0, column=0, padx=(0, 8))
-        self.tts_btn = ctk.CTkButton(
-            btns, text="🔇  Speak: Off", width=130,
-            fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
-            text_color=("gray10", "gray90"),
-            command=self._toggle_tts)
-        self.tts_btn.grid(row=0, column=1, padx=(0, 8))
-        ctk.CTkButton(btns, text="Clear", width=70,
-                      fg_color=("gray75", "gray30"), hover_color=("gray65", "gray40"),
-                      text_color=("gray10", "gray90"),
-                      command=self._clear).grid(row=0, column=2)
+        saved = load_settings()
+        self.fast_preview_var = ctk.BooleanVar(value=bool(saved.get("fast_preview", True)))
+        ctk.CTkCheckBox(r3, text="⚡ Instant previews (Tiny)", variable=self.fast_preview_var,
+                        font=ctk.CTkFont(size=12),
+                        command=self._on_fast_preview_toggle).grid(row=0, column=4, padx=(16, 0))
 
     # ── Input-level meter ─────────────────────────────────────────────────
 
     def _build_meter(self):
         mf = ctk.CTkFrame(self, fg_color="transparent")
-        mf.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 0))
+        mf.grid(row=3, column=0, sticky="ew", padx=20, pady=(6, 0))
         mf.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(mf, text="Input level:",
                      font=ctk.CTkFont(size=11),
                      text_color=("gray50", "gray55"),
                      width=80, anchor="w").grid(row=0, column=0, sticky="w")
-        self.level_bar = ctk.CTkProgressBar(mf, height=14, corner_radius=4)
-        self.level_bar.set(0)
-        self.level_bar.grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        self.meter = DbMeter(mf)
+        self.meter.grid(row=0, column=1, sticky="ew", padx=(4, 8))
         self.level_text = ctk.CTkLabel(mf, text="—",
-                                       font=ctk.CTkFont(size=10),
+                                       font=ctk.CTkFont(family="Consolas", size=11),
                                        text_color=("gray50", "gray55"),
-                                       width=140, anchor="w")
+                                       width=190, anchor="w")
         self.level_text.grid(row=0, column=2)
 
     # ── Main tabbed area ──────────────────────────────────────────────────
 
     def _build_text_area(self):
         tabs = ctk.CTkTabview(self, fg_color="transparent")
-        tabs.grid(row=4, column=0, sticky="nsew", padx=20, pady=(10, 0))
+        tabs.grid(row=4, column=0, sticky="nsew", padx=20, pady=(2, 0))
         tabs.add("Interpreter")
         tabs.add("Diagnostics")
         self.main_tabs = tabs
@@ -1866,9 +2267,11 @@ class InterpreterApp(ctk.CTk):
         self.translated_label = ctk.CTkLabel(itab, text="Translation → Russian",
                                              font=ctk.CTkFont(size=12, weight="bold"))
         self.translated_label.grid(row=0, column=1, sticky="w", padx=(12, 4), pady=(4, 4))
-        self.heard_box = ctk.CTkTextbox(itab, wrap="word", font=ctk.CTkFont(size=14))
+        self.heard_box = ctk.CTkTextbox(itab, wrap="word", height=120,
+                                        font=ctk.CTkFont(size=14))
         self.heard_box.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
-        self.translated_box = ctk.CTkTextbox(itab, wrap="word", font=ctk.CTkFont(size=14))
+        self.translated_box = ctk.CTkTextbox(itab, wrap="word", height=120,
+                                             font=ctk.CTkFont(size=14))
         self.translated_box.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
         # ─── Diagnostics tab ──────────────────────────────────────────────
@@ -1899,14 +2302,15 @@ class InterpreterApp(ctk.CTk):
                           command=cmd).grid(row=0, column=col, padx=(0, 8))
 
         # Scrollable detail box
-        self.diag_box = ctk.CTkTextbox(dtab, wrap="word", font=ctk.CTkFont(size=12))
+        self.diag_box = ctk.CTkTextbox(dtab, wrap="word", height=80,
+                                       font=ctk.CTkFont(size=12))
         self.diag_box.grid(row=2, column=0, sticky="nsew")
 
     # ── Status bar ────────────────────────────────────────────────────────
 
     def _build_status_bar(self):
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=5, column=0, sticky="ew", padx=22, pady=(4, 10))
+        bar.grid(row=5, column=0, sticky="ew", padx=22, pady=(2, 8))
         bar.grid_columnconfigure(0, weight=1)
         self.status_var = ctk.StringVar(value="Loading Whisper model…")
         ctk.CTkLabel(bar, textvariable=self.status_var,
@@ -1920,18 +2324,16 @@ class InterpreterApp(ctk.CTk):
 
     # ── Level meter ───────────────────────────────────────────────────────
 
-    def _on_level(self, level, threshold):
-        self.result_queue.put(("level", (level, threshold)))
+    def _on_level(self, rms_db, peak_db, speaking):
+        self.result_queue.put(("level", (rms_db, peak_db, speaking)))
 
-    def _update_meter(self, level, threshold):
-        ceiling  = max(threshold * 4, 800)
-        fraction = min(level / ceiling, 1.0)
-        self.level_bar.set(fraction)
-        active = level > threshold
-        self.level_bar.configure(progress_color=COL_OK if active else COL_INFO)
-        pct = int(fraction * 100)
-        tag = "▐ SPEECH ▌" if active else " quiet  "
-        self.level_text.configure(text=f"{pct:3d}%  [{tag}]")
+    def _update_meter(self, rms_db, peak_db, speaking):
+        self.meter.update_level(rms_db, peak_db)
+        if rms_db <= -99:
+            self.level_text.configure(text="  -∞ dBFS   [ silent ]")
+        else:
+            tag = "▐ SPEECH ▌" if speaking else "  quiet  "
+            self.level_text.configure(text=f"{rms_db:5.1f} dBFS  [{tag}]")
 
     # ── Mode switching ────────────────────────────────────────────────────
 
@@ -2028,6 +2430,8 @@ class InterpreterApp(ctk.CTk):
                 self._start_retry_after_id = self.after(600, self._retry_start_session)
             return
         self._start_retry_after_id = None
+        self._run_id += 1
+        self._traces, self._first_preview = {}, {}
         if self._whisper_model is None and self._model_loader:
             if self._model_loader.error:
                 self.status_var.set(f"Cannot start: {self._model_loader.error}")
@@ -2136,7 +2540,10 @@ class InterpreterApp(ctk.CTk):
                 phrase_queue=self.phrase_queue,
                 result_queue=self.result_queue,
                 status_cb=lambda m: self.result_queue.put(("status", m)),
-                partial_slot=self._partial_slot)
+                partial_slot=self._partial_slot,
+                preview_model=self._preview_model,
+                run_id=self._run_id,
+                record_audio=bool(load_settings().get("record_audio", True)))
             w.start()
             self._workers.append(w)
 
@@ -2174,7 +2581,7 @@ class InterpreterApp(ctk.CTk):
         for tw in self._translation_workers:
             tw.stop()
         self._translation_workers = []
-        self.level_bar.set(0)
+        self.meter.reset()
         self.level_text.configure(text="—")
         self._set_live_status("IDLE", COL_WARN)
         log_event(logging.INFO, "session_stopped",
@@ -2219,25 +2626,121 @@ class InterpreterApp(ctk.CTk):
 
     def _on_sensitivity(self, val):
         v = round(float(val), 2)
-        self.sens_label.configure(text=f"{v}×")
+        self.sens_label.configure(text=f"{round(v * 100)}%")
         if self._capture_thr:
             self._capture_thr.set_sensitivity(v)
-        log_event(logging.INFO, "sensitivity_changed", value=v)
+        # Dragging fires dozens of events; log and save once it settles.
+        if self._sens_log_after is not None:
+            self.after_cancel(self._sens_log_after)
+        def _settled():
+            self._sens_log_after = None
+            save_settings(sensitivity=v)
+            log_event(logging.INFO, "sensitivity_changed", value=v, run_id=self._run_id,
+                      vad_threshold=round(vad_threshold_for(v), 2))
+        self._sens_log_after = self.after(500, _settled)
+
+    def _on_fast_preview_toggle(self):
+        save_settings(fast_preview=self.fast_preview_var.get())
+        self._ensure_preview_model()
+        self._restart_session()
+
+    def _ensure_preview_model(self):
+        """Load Tiny alongside the main model for instant previews (~75 MB
+        of GPU memory). Not needed when the main model is already Tiny."""
+        # Plain bool mirror of the Tk settings: _preview_model() runs on the
+        # worker thread, and Tk variables may only be touched from the UI thread.
+        self._preview_enabled = (self.fast_preview_var.get()
+                                 and MODELS[self.model_var.get()] != "tiny")
+        if not self._preview_enabled:
+            return
+        if self._preview_loader is None:
+            self._preview_loader = WhisperModelLoader(
+                model_size="tiny", status_cb=lambda m: None)
+            self._preview_loader.start()
+            log_event(logging.INFO, "preview_model_load_started", model_size="tiny")
+
+    def _preview_model(self):
+        """Called from the transcription worker thread: no Tk access here."""
+        if not self._preview_enabled:
+            return None
+        pl = self._preview_loader
+        if pl is not None and pl.ready.is_set() and pl.model is not None:
+            return pl.model
+        return None   # still loading: previews use the main model meanwhile
 
     # ── Queue poll ────────────────────────────────────────────────────────
 
+    def _log_displayed(self, seq, trace, online):
+        now = time.monotonic()
+        log_event(logging.INFO, "phrase_displayed", run_id=trace["run_id"], seq=seq,
+                  ui_ms=round((now - trace["t_result"]) * 1000, 1),
+                  # pause detected -> final text on screen
+                  speech_end_to_text_ms=round((now - trace["t_end"]) * 1000, 1),
+                  first_preview_ms=self._first_preview.pop(seq, None),
+                  online_translation_pending=online)
+        if online:
+            self._traces[seq] = trace
+
+    def _log_resources(self):
+        """Every STATS_INTERVAL_SEC: CPU, memory, GPU load and the UI thread's
+        responsiveness, so slowdowns can be tied to resource limits."""
+        fields = {}
+        try:
+            import psutil
+            if self._proc is None:
+                self._proc = psutil.Process()
+                self._proc.cpu_percent(None)
+            fields.update(
+                process_cpu_pct=round(self._proc.cpu_percent(None), 1),
+                system_cpu_pct=psutil.cpu_percent(None),
+                rss_mb=round(self._proc.memory_info().rss / 2**20),
+                threads=self._proc.num_threads())
+        except Exception:
+            pass
+        if WHISPER_DEVICE == "cuda":
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                fields.update(gpu_util_pct=util.gpu, gpu_mem_used_mb=mem.used // 2**20,
+                              gpu_temp_c=pynvml.nvmlDeviceGetTemperature(h, 0),
+                              gpu_sm_clock_mhz=pynvml.nvmlDeviceGetClockInfo(h, 1))
+            except Exception:
+                pass
+        log_event(logging.INFO, "resource_stats", listening=self.is_listening,
+                  run_id=self._run_id, result_queue=self.result_queue.qsize(),
+                  phrase_queue=self.phrase_queue.qsize(),
+                  translation_queue=self._translation_queue.qsize(),
+                  **fields, **self._ui_stats.summary())
+        self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
+
     def _poll_queue(self):
+        now = time.monotonic()
+        if self._last_poll_t is not None:
+            # >0 means the Tk thread was busy and results waited on screen
+            self._ui_stats.add("poll_lag_ms", (now - self._last_poll_t) * 1000 - 30)
+        self._last_poll_t = now
+        handled = 0
         try:
             while True:
                 kind, data = self.result_queue.get_nowait()
+                handled += 1
                 if kind == "partial":
-                    seq, heard, translated = data
+                    seq, heard, translated, t_start, t_ready = data
                     self._set_live(self.heard_box, seq, heard)
                     if translated:
                         self._set_live(self.translated_box, seq, translated)
+                    now = time.monotonic()
+                    self._ui_stats.add("preview_ui_ms", (now - t_ready) * 1000)
+                    if seq not in self._first_preview and t_start:
+                        self._first_preview[seq] = round((now - t_start) * 1000, 1)
                 elif kind == "final":
-                    seq, text, translated = data
+                    seq, text, translated, trace = data
                     self._commit(self.heard_box, seq, text)
+                    if trace and text:
+                        self._log_displayed(seq, trace, online=translated is None)
                     if translated is not None:
                         self._commit_translation(seq, translated)
                     elif text:
@@ -2262,6 +2765,12 @@ class InterpreterApp(ctk.CTk):
                 elif kind == "translated":
                     seq, text = data
                     self._commit_translation(seq, text)
+                    trace = self._traces.pop(seq, None)
+                    if trace:
+                        log_event(logging.INFO, "translation_displayed",
+                                  run_id=trace["run_id"], seq=seq,
+                                  speech_end_to_translation_ms=round(
+                                      (time.monotonic() - trace["t_end"]) * 1000, 1))
                 elif kind == "status":
                     self.status_var.set(data)
                     log_event(logging.INFO, "status_updated", status=data)
@@ -2271,6 +2780,8 @@ class InterpreterApp(ctk.CTk):
                     self._update_metric(*data)
         except queue.Empty:
             pass
+        if handled:
+            self._ui_stats.add("msgs_per_poll", handled)
         self.after(30, self._poll_queue)
 
     def _update_metric(self, name, value):
@@ -2438,6 +2949,7 @@ class InterpreterApp(ctk.CTk):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    install_global_exception_hooks()
     log_event(logging.INFO, "app_main_start")
     app = InterpreterApp()
     app.mainloop()
