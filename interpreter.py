@@ -2146,6 +2146,9 @@ class AudioCaptureThread(threading.Thread):
         phrase_start_time, phrase_levels_db, phrase_peak_db, phrase_preview_count = 0.0, [], -100.0, 0
 
         def phrase_meta(n_chunks):
+            """Facts about the phrase being sent (its first n_chunks blocks):
+            when speech started, length, loudness, speech score, previews.
+            They travel with the audio and end up in its phrase_trace."""
             return {"t_start": phrase_start_time, "audio_sec": round(n_chunks * chunk_sec, 3),
                     "rms_dbfs": round(sum(phrase_levels_db) / len(phrase_levels_db), 1) if phrase_levels_db else None,
                     "peak_dbfs": round(phrase_peak_db, 1),
@@ -3095,6 +3098,8 @@ class SpeechMeter(ctk.CTkCanvas):
         self.bind("<Configure>", lambda e: self._layout())
 
     def _layout(self):
+        """Draw the meter's fixed parts (background, threshold line, labels)
+        again for the current width; runs when the window is resized."""
         sc, w = self._s, max(100, self.winfo_width())
         self.delete("all")
         self._x0, self._x1 = 4 * sc, w - 4 * sc
@@ -3115,6 +3120,8 @@ class SpeechMeter(ctk.CTkCanvas):
         self._paint()
 
     def _paint(self):
+        """Move the bar and the threshold line to the newest values (cheap:
+        only changes coordinates, nothing is redrawn from scratch)."""
         if not hasattr(self, "_bar"):
             return
         sc, span = self._s, self._x1 - self._x0
@@ -5365,6 +5372,8 @@ class InterpreterApp(ctk.CTk):
                     **self._ui_stats.summary())
 
         def measure():
+            """Background thread: read CPU, memory and GPU figures (slow
+            Windows calls), log them, and warn if anything is running low."""
             t0 = time.perf_counter()
             fields = collect_resource_stats(self)
             fields["probe_ms"] = round((time.perf_counter() - t0) * 1000, 1)

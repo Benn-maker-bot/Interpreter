@@ -125,6 +125,9 @@ class Playlist:
     applies level_clip() to each clip (its gain is stored as clip["gain_db"])."""
 
     def __init__(self, clips, gap_sec, level=True):
+        """Load every clip's WAV file and join them, with gap_sec of silence
+        between clips and 4 s at the end. self.spans holds, per clip, the
+        sample positions where its voice starts and ends (used for scoring)."""
         parts, self.spans, pos = [], [], 0
         silence = np.zeros(int(gap_sec * RATE), np.int16)
         parts.append(silence); pos += len(silence)
@@ -169,6 +172,8 @@ class FakeStream:
         return max(0, self._due() - self.pos)
 
     def read(self, frames, exception_on_overflow=False):
+        """Like a real microphone: wait until `frames` samples' worth of
+        time has passed, then return them (silence after the playlist)."""
         while self._due() < self.pos + frames:          # wait like a real device
             time.sleep(0.002)
         chunk = self.p.samples[self.pos:self.pos + frames]
@@ -305,7 +310,11 @@ def build(args, playlist, say=print, level_cb=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def choose_clips(args):
-    rows = [json.loads(l) for l in open(DATA_DIR / "manifest.jsonl", encoding="utf-8")]
+    """The clips to play, from the chosen data set's manifest.jsonl, filtered
+    by kind (speech/song) and language, at most args.limit per language and
+    kind. They are interleaved (one of each group in turn) so the language
+    changes from clip to clip, as it would in real use."""
+    rows =[json.loads(l) for l in open(DATA_DIR / "manifest.jsonl", encoding="utf-8")]
     kinds = set(args.kinds.split(","))
     langs = set(args.langs.split(",")) if args.langs else None
     groups = {}
@@ -378,7 +387,9 @@ def score(playlist, finals, previews):
 def report(rows, args, wall_sec):
     """Print one line per (kind, language) and the overall figures."""
     def summary(rs):
-        words = sum(r["ref_words"] for r in rs)
+        """The figures for one table row (a group of clips): language right,
+        word error rate, translated, median times, music mode."""
+        words =sum(r["ref_words"] for r in rs)
         errs = sum(min(r["errors"], r["ref_words"]) for r in rs)
         lid = [r for r in rs if r["detected"]]
         lat = [r["latency_ms"] for r in rs if r["latency_ms"] is not None]
@@ -418,7 +429,9 @@ def report(rows, args, wall_sec):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    """Command-line use: read the options (see the top of this file), run
+    the simulation printing each phrase, then print the results table."""
+    ap =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", default="Auto-detect")
     ap.add_argument("--tgt", default="English")
     ap.add_argument("--kinds", default="speech,song")
@@ -491,6 +504,8 @@ def run(args, on_event=lambda kind, data: None, stop=None, level_cb=None):
     done_translations = queue.Queue()
 
     def translate_online(final, lang):
+        """Runs on a pool thread: translate one phrase via the internet,
+        store it in the phrase (final), then hand it back to the loop."""
         try:
             final["translated"] = I._translate_cached(strip_label(final["text"]),
                                                       "auto" if lang == "auto" else lang,

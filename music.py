@@ -18,9 +18,11 @@ This module provides:
                    ~15 MB, ~5 ms per phrase on the CPU): how much a phrase
                    sounds like speech, music and singing.
   VocalSeparator   UVR MDX-Net "Kim_Vocal_2" (ONNX, 63 MB): removes the
-                   instruments and keeps the voice. ~300 ms per phrase on the
-                   GPU, so it only runs on finished phrases while music plays,
-                   and only if onnxruntime can use the GPU.
+                   instruments and keeps the voice. ~250 ms per 6 s chunk on
+                   the GPU. It only runs while music plays, only if
+                   onnxruntime can use the GPU, and does the chunks of a
+                   phrase that is still going in advance (prefetch), so
+                   little is left to do when the phrase ends.
   MusicScene       remembers the last few phrases and decides whether the
                    program is in "music" mode; the audio capture and the
                    transcription worker read it to adjust themselves.
@@ -76,6 +78,8 @@ class SoundClassifier:
     """YAMNet: how much a 16 kHz clip sounds like speech, singing and music."""
 
     def __init__(self):
+        """Download YAMNet once (cached), and find which of its 521 sound
+        classes count as speech, singing and music."""
         from huggingface_hub import hf_hub_download
         self.session = _onnx_session(hf_hub_download(YAMNET_REPO, "yamnet.onnx"), gpu=False)
         with open(hf_hub_download(YAMNET_REPO, "yamnet_class_map.csv"), encoding="utf-8") as f:
@@ -112,6 +116,13 @@ class VocalSeparator:
     N_FFT, HOP, DIM_F, DIM_T, COMPENSATE, RATE = 7680, 1024, 3072, 256, 1.009, 44100
 
     def __init__(self):
+        """Download the UVR model once (cached), load it on the GPU, and
+        work out the chunk sizes and the window shapes used for every chunk.
+
+        chunk  audio one model call looks at (~5.9 s at 44.1 kHz)
+        trim   the edges of each chunk's result are thrown away (they are
+               less accurate), so chunks overlap by this much
+        step   how far apart chunks start (chunk minus both trims)"""
         from huggingface_hub import hf_hub_download
         self.session = _onnx_session(hf_hub_download(VOCAL_REPO, VOCAL_FILE), gpu=True)
         self.on_gpu = "CUDAExecutionProvider" in self.session.get_providers()
@@ -137,6 +148,8 @@ class VocalSeparator:
         return fft.rfft(frames, axis=-1, workers=2).transpose(0, 2, 1)
 
     def _istft(self, spec):
+        """The reverse of _stft: turn a spectrogram (frequencies over time)
+        back into sound, adding the overlapping frames together."""
         from scipy import fft
         frames = fft.irfft(spec.transpose(0, 2, 1), n=self.N_FFT, axis=-1, workers=2) * self.window
         out = np.zeros((spec.shape[0], len(self._norm)), np.float32)
@@ -228,6 +241,10 @@ class MusicScene:
     models in the background; until they are ready nothing changes."""
 
     def __init__(self, enabled=True, separate=True, log=None):
+        """enabled: music detection on at all. separate: also remove the
+        instruments (needs the GPU). log(event, **fields): where to log.
+        The models load in a background thread (_load), so creating this is
+        instant; `active` stays False until the classifier is ready."""
         self.enabled, self.want_separation = enabled, separate
         self.active = False            # music mode on?
         self.singing = False           # ...and a voice in it
@@ -242,6 +259,10 @@ class MusicScene:
             threading.Thread(target=self._load, name="music-models", daemon=True).start()
 
     def _load(self):
+        """Background thread: load YAMNet, then (if wanted and a GPU is
+        available) the vocal separator, and run it once on silence so its
+        first real use isn't slow. Problems are logged, never raised: music
+        mode just stays off."""
         t0 = time.perf_counter()
         try:
             self.classifier = SoundClassifier()
@@ -282,6 +303,8 @@ class MusicScene:
                          name="music-scene", daemon=True).start()
 
     def _classify_window(self, audio):
+        """Short-lived thread: measure the second's loudness, score it with
+        YAMNet (skipped if it is silent) and update the decision."""
         try:
             audio = np.asarray(audio)
             if audio.dtype == np.int16:
@@ -298,6 +321,11 @@ class MusicScene:
             self._busy = False
 
     def _update(self, scores, silent, level):
+        """Add one second's result and decide whether music mode is on:
+          ON   when 2 of the last 3 seconds score as music (>= MUSIC_ON)
+          OFF  after 2 silent seconds, or 3 seconds without music (< MUSIC_OFF)
+        Two different thresholds stop the mode flipping back and forth. Every
+        change, and a summary every STATS_SEC, is logged."""
         with self._lock:
             self._windows.append((float(scores["music"]), silent))
             st = self._stats
@@ -334,6 +362,7 @@ class MusicScene:
 
     @staticmethod
     def _new_stats():
+        """Empty counters for the next music_scene_stats log line."""
         return {"t0": time.monotonic(), "windows": 0, "silent": 0, "music_sum": 0.0,
                 "speech_sum": 0.0, "classify_ms_max": 0.0, "switches": 0}
 

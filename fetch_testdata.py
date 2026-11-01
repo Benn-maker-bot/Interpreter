@@ -113,7 +113,10 @@ def fetch_songs(lang, count, manifest):
 
 
 def main():
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+    """Download `count` clips per language (6 unless given on the command
+    line) and write the list of clips, testdata/manifest.jsonl. A language
+    that fails to download is reported and skipped; the others still work."""
+    count =int(sys.argv[1]) if len(sys.argv) > 1 else 6
     (OUT / "speech").mkdir(parents=True, exist_ok=True)
     (OUT / "songs").mkdir(parents=True, exist_ok=True)
     manifest = []
