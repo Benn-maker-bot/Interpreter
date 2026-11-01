@@ -1053,6 +1053,12 @@ LANG_SWITCH_PROB  = 0.70   # the other language must score at least this
 LANG_SOURCE_MAX   = 0.15   # ...and the expected language at most this
 LANG_MIN_SPEECH_SEC = 1.5  # ...on at least this much speech
 AUTO_LANG_PROB    = 0.50   # Auto-detect: below this on a short clip, keep the last language
+# Auto-detect: a language NOT heard recently in this session needs this much
+# certainty before the app switches to it. Live test (Russian songs, Bulgarian
+# adverts): real switches scored 0.95-0.99; wrong ones on short sung fragments
+# (Polish, Spanish, Portuguese, Turkish in a Russian song) scored 0.31-0.80.
+NEW_LANG_PROB       = 0.85
+NEW_LANG_MUSIC_PROB = 0.90  # while music plays (singing fools the detector more)
 # Names for the label shown before a phrase in another language
 LANGUAGE_NAMES = {code: name for name, (code, _) in LANGUAGES.items() if code != "auto"}
 TARGET_LANGUAGES = [name for name in LANGUAGES if LANGUAGES[name][0] != "auto"]
@@ -2569,7 +2575,8 @@ def suspicious_reasons(text: str, speech_sec: float, avg_logprob: float) -> list
 # Fragments that only ever come from Whisper's training captions (YouTube
 # subtitle credits), never from real speech; any text containing one is dropped.
 HALLUCINATION_FRAGMENTS = ("субтитр", "dimatorzok", "редактор субтитров", "корректор",
-                           "amara.org", "subtitles by")
+                           "amara.org", "subtitles by",
+                           "ご視聴ありがとうございました")   # "thanks for watching", invented on music
 
 
 CONTINUATION_MARKS = ("...", "…")
@@ -3400,6 +3407,12 @@ class TranscriptionWorker(threading.Thread):
             elif probs.get(self.lang_now, 0.0) < 0.10:
                 sure = True              # nothing familiar fits: the best guess
             info["lang_unsure"] = True
+        # A language new to this session must be clearly identified
+        in_music = bool(self.music_scene is not None and getattr(self.music_scene, "active", False))
+        need = NEW_LANG_MUSIC_PROB if in_music else NEW_LANG_PROB
+        if sure and top != self.lang_now and top not in self._recent_langs and top_p < need:
+            sure = False
+            info["lang_new_rejected"] = f"{top} {top_p:.2f} < {need}"
         if sure and top != self.lang_now:
             info["lang_changed_from"] = self.lang_now
             self.lang_now = top
