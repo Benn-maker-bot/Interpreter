@@ -42,7 +42,6 @@ function later or repeatedly on the main thread.
 """
 
 import logging
-import os
 import sys
 import threading
 import time
@@ -50,24 +49,28 @@ from collections import deque
 
 from PySide6.QtCore import Qt, QTimer, QRectF
 from PySide6.QtGui import QColor, QFont, QPainter, QTextCharFormat, QTextCursor, QGuiApplication
-from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QGridLayout, QHBoxLayout, QLabel,
                                QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget,
                                QHeaderView, QAbstractItemView)
-from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF,
-                            FluentWindow, HeaderCardWidget, InfoBar, InfoBarPosition,
+from qfluentwidgets import setThemeColor  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
+from qfluentwidgets import (  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
+                            BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF,
+                            FluentWindow, HeaderCardWidget, InfoBar, InfoBarPosition, LineEdit,
                             MessageBoxBase, PrimaryPushButton, PushButton, SimpleCardWidget,
                             Slider, SmoothScrollArea, StrongBodyLabel, SubtitleLabel,
                             TableWidget, TextEdit, Theme, TitleLabel, TogglePushButton,
-                            setCustomStyleSheet, setTheme, setThemeColor)
+                            setCustomStyleSheet, setTheme)
 
 import interpreter as core
-from interpreter import (InterpreterApp, LANGUAGES, continuation_join, trailing_marks_length, MODELS, PREVIEW_CHOICES, Speaker,
+from interpreter import (InterpreterApp, LANGUAGES, continuation_join, trailing_marks_length, MODELS, Speaker,
                          PerfWindow, get_audio_devices, find_device_by_keywords,
                          find_best_vb_input, find_best_friend_input, find_best_output_device,
                          load_settings, log_event, log_exception, vad_threshold_for,
                          NVIDIA_KEYWORDS, DEFAULT_SENS, TRANSLATION_QUEUE_MAX,
                          MAX_TEXT_HISTORY_CHARS, WATCHDOG_SEC, STATS_INTERVAL_SEC,
                          WHISPER_DEVICE, COMPUTE_TYPE, NUM_WORKERS, _DEFAULT_MODEL)
+
+PREVIEW_CHOICES: dict[str, str | None] = core.PREVIEW_CHOICES
 
 # Status colours: green = fine, amber = worth a look, red = problem
 OK, WARN, BAD, MUTED = "#2ECC71", "#F1C40F", "#E74C3C", "#9AA0A6"
@@ -161,7 +164,7 @@ class LevelMeter(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(34)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._rms = self._peak = self.FLOOR_DB   # level and peak shown, dB
         self._peak_t = 0.0                        # when the peak was reached
         self._last_t = time.monotonic()           # time of the previous update
@@ -191,7 +194,7 @@ class LevelMeter(QWidget):
 
     def paintEvent(self, _event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = self.width()
         n = int(-self.FLOOR_DB / self.SEG_DB)
         seg_w = (w - 8) / n
@@ -206,7 +209,8 @@ class LevelMeter(QWidget):
         p.setFont(f)
         for t in self.TICKS:
             x = 4 + (t - self.FLOOR_DB) / -self.FLOOR_DB * (w - 8)
-            p.drawText(QRectF(min(max(x - 14, 0), w - 28), 19, 28, 14), Qt.AlignCenter, str(t))
+            p.drawText(QRectF(min(max(x - 14, 0), w - 28), 19, 28, 14),
+                       Qt.AlignmentFlag.AlignCenter, str(t))
 
 
 class SpeechMeter(QWidget):
@@ -216,7 +220,7 @@ class SpeechMeter(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(34)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._shown, self._threshold, self._speaking = 0.0, 0.5, False
 
     def update_score(self, prob, threshold, speaking):
@@ -226,10 +230,10 @@ class SpeechMeter(QWidget):
 
     def paintEvent(self, _event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         x0, x1 = 4, self.width() - 4
         span = x1 - x0
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor("#2a2d2e"))
         p.drawRoundedRect(QRectF(x0, 2, span, 16), 4, 4)
         p.setBrush(QColor(OK if self._speaking else "#2980B9"))
@@ -244,7 +248,7 @@ class SpeechMeter(QWidget):
         for t in (0, 25, 50, 75, 100):
             x = x0 + span * t / 100
             p.drawText(QRectF(min(max(x - 16, 0), self.width() - 32), 19, 32, 14),
-                       Qt.AlignCenter, f"{t}%")
+                       Qt.AlignmentFlag.AlignCenter, f"{t}%")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,6 +319,53 @@ class ReportDialog(MessageBoxBase):
         self.cancelButton.hide()
 
 
+class ReportDialogMistake(MessageBoxBase):
+    """"Report a mistake": which phrase (newest first), what was wrong, and
+    optionally what was really said and in which language."""
+    def __init__(self, recent, parent=None):
+        super().__init__(parent)
+        self.viewLayout.addWidget(SubtitleLabel("Report a mistake"))
+        self.viewLayout.addWidget(CaptionLabel("Which phrase?"))
+        self.phrase_combo = ComboBox()
+        self._seqs = sorted(recent, reverse=True)
+        for seq in self._seqs:
+            e = recent[seq]
+            self.phrase_combo.addItem(f"{e['time']}  {e['text'][:90] or '(empty)'}")
+        self.phrase_combo.setMinimumWidth(640)
+        self.viewLayout.addWidget(self.phrase_combo)
+        self.viewLayout.addWidget(CaptionLabel("What was wrong? (tick all that apply)"))
+        self.checks = {}
+        for key, label in core.FEEDBACK_PROBLEMS.items():
+            c = CheckBox(label)
+            self.checks[key] = c
+            self.viewLayout.addWidget(c)
+        self.viewLayout.addWidget(CaptionLabel("What was really said (optional, but it makes "
+                                               "the report most useful)"))
+        self.correct_edit = LineEdit()
+        self.correct_edit.setPlaceholderText("The correct words, in the language spoken")
+        self.viewLayout.addWidget(self.correct_edit)
+        self.viewLayout.addWidget(CaptionLabel("Language actually spoken"))
+        self.lang_combo = ComboBox()
+        self._langs = [("(as detected)", None)] + sorted(
+            ((name, code) for code, name in core.LANGUAGE_NAMES.items()), key=lambda x: x[0])
+        self.lang_combo.addItems([n for n, _ in self._langs])
+        self.viewLayout.addWidget(self.lang_combo)
+        self.note_edit = LineEdit()
+        self.note_edit.setPlaceholderText("Anything else (optional)")
+        self.viewLayout.addWidget(self.note_edit)
+        self.yesButton.setText("Save report")
+        self.cancelButton.setText("Cancel")
+
+    def validate(self):
+        return any(c.isChecked() for c in self.checks.values())
+
+    def result_values(self):
+        return (self._seqs[self.phrase_combo.currentIndex()],
+                [k for k, c in self.checks.items() if c.isChecked()],
+                self.correct_edit.text(), self._langs[self.lang_combo.currentIndex()][1],
+                self.note_edit.text())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The main window
 # ─────────────────────────────────────────────────────────────────────────────
@@ -341,7 +392,10 @@ class QtInterpreterApp(FluentWindow):
     _log_resources            = InterpreterApp._log_resources
     _poll_queue               = InterpreterApp._poll_queue
     _update_metric            = InterpreterApp._update_metric
-    _commit_translation       = InterpreterApp._commit_translation
+    def _commit_translation(self, seq, text):
+        InterpreterApp._commit_translation(self, seq, text)
+        if seq in self._recent_finals:            # for "Report a mistake"
+            self._recent_finals[seq]["translation"] = text
     _on_mode_btn              = InterpreterApp._on_mode_btn
     _refresh_devices          = InterpreterApp._refresh_devices
     _on_manual_device_change  = InterpreterApp._on_manual_device_change
@@ -391,6 +445,7 @@ class QtInterpreterApp(FluentWindow):
         self._started_at = time.monotonic()     # when this window opened
         self._listening_since = None
         self._phrases = deque(maxlen=50)        # recent finished phrases (timings, text)
+        self._recent_finals = {}                # seq -> text/translation/trace ("Report a mistake")
         self._levels = deque(maxlen=320)        # recent block levels (~10 s)
         self._speech_flags = deque(maxlen=320)  # recent speech yes/no per block
         self._peak_recent = -100.0
@@ -531,7 +586,15 @@ class QtInterpreterApp(FluentWindow):
         clear_btn.setIcon(FIF.BROOM)
         clear_btn.setMinimumHeight(40)
         clear_btn.clicked.connect(self._clear)
-        for b in (self.mute_btn, self.tts_btn, clear_btn):
+        report_btn = PushButton()
+        report_btn.setText("Report a mistake")
+        report_btn.setIcon(FIF.FEEDBACK)
+        report_btn.setMinimumHeight(40)
+        report_btn.setToolTip("Mark a recent phrase as wrong. Its audio and what went wrong\n"
+                              "are saved, so the problem can be found and fixed, and the\n"
+                              "simulator can replay it to check the fix.")
+        report_btn.clicked.connect(self._report_mistake)
+        for b in (self.mute_btn, self.tts_btn, clear_btn, report_btn):
             actions.addWidget(b, 1)
         root.addLayout(actions)
 
@@ -571,7 +634,7 @@ class QtInterpreterApp(FluentWindow):
         saved = load_settings()
         self.model_combo.setCurrentText(saved.get("model") if saved.get("model") in MODELS
                                         else _DEFAULT_MODEL)
-        self.sens_slider = Slider(Qt.Horizontal)
+        self.sens_slider = Slider(Qt.Orientation.Horizontal)
         self.sens_slider.setRange(0, 100)
         self.sens_slider.setValue(int(round(float(saved.get("sensitivity", DEFAULT_SENS)) * 100)))
         self.sens_value = BodyLabel(f"{self.sens_slider.value()}%")
@@ -876,10 +939,10 @@ class QtInterpreterApp(FluentWindow):
         cur = box.textCursor()
         if start is not None:
             cur.setPosition(start)
-            cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+            cur.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
             cur.removeSelectedText()
         else:
-            cur.movePosition(QTextCursor.End)
+            cur.movePosition(QTextCursor.MoveOperation.End)
             start = cur.position()
         prev_seq, prev_words = self._last_preview_words.get(box, (None, []))
         words = text.split()
@@ -903,7 +966,7 @@ class QtInterpreterApp(FluentWindow):
         cur = QTextCursor(box.document())
         if start is not None and live_seq <= seq:
             cur.setPosition(start)
-            cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+            cur.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
             cur.removeSelectedText()
             self._live.pop(box, None)
         if not text:
@@ -920,7 +983,7 @@ class QtInterpreterApp(FluentWindow):
             cut, insert = 0, ("\n" if before.strip() else "") + text
         pos = anchor - cut
         cur.setPosition(pos)
-        cur.setPosition(anchor, QTextCursor.KeepAnchor)
+        cur.setPosition(anchor, QTextCursor.MoveMode.KeepAnchor)
         cur.insertText(insert, self._fmt(False))     # replaces the "..." if any
         if live:
             self._live[box] = (pos + len(insert), live[1])
@@ -937,13 +1000,18 @@ class QtInterpreterApp(FluentWindow):
         if extra > 0:
             cur = QTextCursor(doc)
             cur.setPosition(0)
-            cur.setPosition(extra, QTextCursor.KeepAnchor)
+            cur.setPosition(extra, QTextCursor.MoveMode.KeepAnchor)
             cur.removeSelectedText()
 
     def _log_displayed(self, seq, trace, online):
         """Log the screen timings (borrowed), and keep them for Diagnostics."""
         first_preview = self._first_preview.get(seq)
         InterpreterApp._log_displayed(self, seq, trace, online)
+        self._recent_finals[seq] = {"time": time.strftime("%H:%M:%S"), "trace": trace,
+                                    "text": trace.get("text") or "",
+                                    "translation": trace.get("translation") or ""}
+        while len(self._recent_finals) > 30:
+            self._recent_finals.pop(next(iter(self._recent_finals)))
         now = time.monotonic()
         self._phrases.append({
             "time": time.strftime("%H:%M:%S"),
@@ -961,6 +1029,35 @@ class QtInterpreterApp(FluentWindow):
             "onset": trace.get("onset_delay_ms"),
             "text": trace.get("text") or "",
         })
+
+    # ── Report a mistake ─────────────────────────────────────────────────
+
+    def _report_mistake(self):
+        """Choose a recent phrase, say what was wrong (and optionally the
+        correct text), save it with its audio for analysis and replay."""
+        if not self._recent_finals:
+            InfoBar.info(title="Nothing to report yet", content="No phrases have been shown yet.",
+                         orient=Qt.Orientation.Horizontal, isClosable=True,
+                         position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self)
+            return
+        dialog = ReportDialogMistake(self._recent_finals, self)
+        if not dialog.exec():
+            return
+        seq, problems, correct, lang, note = dialog.result_values()
+        entry = self._recent_finals[seq]
+        audio = next((w.recent_audio.get(seq) for w in self._workers
+                      if seq in getattr(w, "recent_audio", {})), None)
+        try:
+            path = core.save_feedback(seq, audio, entry["trace"], entry["text"], entry["translation"],
+                                      problems, correct, lang, note)
+        except Exception as e:
+            log_exception("report_mistake_failed", e, seq=seq)
+            return
+        InfoBar.success(title="Thank you, saved",
+                        content=("Saved with its audio" if path else "Saved (audio no longer in memory)")
+                        + " to testdata/feedback. The simulator can replay it.",
+                        orient=Qt.Orientation.Horizontal, isClosable=True,
+                        position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=self)
 
     # ── Diagnostics page ─────────────────────────────────────────────────
 
@@ -1068,8 +1165,8 @@ class QtInterpreterApp(FluentWindow):
         self.phrase_table.setColumnCount(len(cols))
         self.phrase_table.setHorizontalHeaderLabels(cols)
         self.phrase_table.verticalHeader().hide()
-        self.phrase_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.phrase_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.phrase_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.phrase_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.phrase_table.setMinimumHeight(260)
         phrases_card.viewLayout.addWidget(self.phrase_table)
         lay.addWidget(phrases_card)
@@ -1261,7 +1358,7 @@ class QtInterpreterApp(FluentWindow):
             g["popped"] = True
             text = f"{help_['meaning']}\n\nWhat to do: {help_['action']}"
             bar = (InfoBar.error if lvl in ("ERROR", "CRITICAL") else InfoBar.warning)(
-                title=help_["title"], content=text, orient=Qt.Vertical, isClosable=True,
+                title=help_["title"], content=text, orient=Qt.Orientation.Vertical, isClosable=True,
                 position=InfoBarPosition.BOTTOM_RIGHT, duration=15000, parent=self)
             details = PushButton()
             details.setText("Details")
@@ -1315,7 +1412,7 @@ class QtInterpreterApp(FluentWindow):
                     item.setForeground(QColor(judge(p["pause_to_text"], 400, 800)))
                 t.setItem(r, c, item)
         t.resizeColumnsToContents()
-        t.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        t.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
 
     def _copy_diagnostics(self):
         """Copy every Diagnostics figure as text (e.g. to paste in a message)."""
@@ -1328,7 +1425,7 @@ class QtInterpreterApp(FluentWindow):
         lines.append("\n[Recent issues]\n" + self.issues_text.toPlainText())
         QGuiApplication.clipboard().setText("\n".join(lines))
         InfoBar.success(title="Copied", content="Diagnostics copied to the clipboard",
-                        orient=Qt.Horizontal, isClosable=True,
+                        orient=Qt.Orientation.Horizontal, isClosable=True,
                         position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self)
 
     def _show_speed_report(self):

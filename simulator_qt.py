@@ -47,10 +47,12 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (QApplication, QGridLayout, QHBoxLayout, QHeaderView, QSizePolicy, QSplitter,
                                QAbstractItemView, QTableWidgetItem, QVBoxLayout, QWidget)
-from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF,
+from qfluentwidgets import setThemeColor  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
+from qfluentwidgets import (  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
+                            BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF,
                             FluentWindow, LineEdit, PrimaryPushButton, ProgressBar, PushButton,
                             SimpleCardWidget, Slider, SmoothScrollArea, StrongBodyLabel,
-                            TableWidget, TextEdit, Theme, TogglePushButton, setTheme, setThemeColor)
+                            TableWidget, TextEdit, Theme, TogglePushButton, setTheme)
 
 import interpreter as core
 import simulate as S
@@ -119,7 +121,8 @@ core.ISSUE_HELP.update({
         "Choose another source; make sure something plays on that output device."),
 })
 
-DATA_CHOICES = {"Synthetic clips": "synth", "Recorded clips": "real", "Live (Windows audio)": "live"}
+DATA_CHOICES = {"Synthetic clips": "synth", "Recorded clips": "real",
+                "Your reported phrases": "feedback", "Live (Windows audio)": "live"}
 KINDS = {"Speech and songs": "speech,song", "Speech only": "speech", "Songs only": "song"}
 PREVIEWS = {"Small": "small", "Tiny": "tiny", "Main model": "main", "Off": "off"}
 PER_LANGUAGE = ["All"] + [str(n) for n in range(1, 11)]
@@ -705,6 +708,9 @@ class SimulatorWindow(FluentWindow):
         maker = "make_testdata.py" if args.data == "synth" else "fetch_testdata.py"
         manifest = S.DATA_DIR / "manifest.jsonl"
         if not manifest.exists():
+            if args.data == "feedback":
+                return ("No reported phrases yet: in the interpreter window, use 'Report a "
+                        "mistake' on phrases it got wrong; they appear here.")
             return f"No test data yet: run  .venv\\Scripts\\python {maker}  first."
         try:
             rows = [json.loads(l) for l in open(manifest, encoding="utf-8") if l.strip()]
@@ -717,7 +723,8 @@ class SimulatorWindow(FluentWindow):
         if wanted - have:
             return (f"No {self.kinds_combo.currentText().lower()} clips in "
                     f"{', '.join(sorted(wanted - have))}. Available: {', '.join(sorted(have))}")
-        chosen = [r for r in rows if r["kind"] in kinds and (not wanted or r["lang"] in wanted)]
+        chosen = [r for r in rows if r["kind"] in kinds and (not wanted or r["lang"] in wanted)
+                  and r.get("file")]
         if not chosen:
             return "No clips match these settings."
         missing = [r["file"] for r in chosen if not (S.DATA_DIR / r["file"]).exists()]
@@ -927,7 +934,8 @@ class SimulatorWindow(FluentWindow):
         cells = [(str(n + 1), None), (r["file"], None), (r["lang"], None),
                  (r["detected"] or "—", OK if r["detected"] == r["lang"] else BAD),
                  (f"{gain:+.0f} dB" if gain is not None else "—", None),
-                 (f"{wer:.0%}", OK if wer < 0.1 else WARN if wer < 0.25 else BAD),
+                 (f"{wer:.0%}", OK if wer < 0.1 else WARN if wer < 0.25 else BAD) if r["ref_words"]
+                 else ("—", MUTED),
                  self._latency_cell(r["latency_ms"]),
                  ("on" if r["music_mode"] else "off", None), (r["hyp"] or "(nothing)", None)]
         self._put_row(cells, f"Correct: {r['ref']}\nHeard: {r['hyp']}\nTranslation: {r['translation']}")
@@ -947,14 +955,16 @@ class SimulatorWindow(FluentWindow):
                                   f"  ·  end → text median {int(np.median(lat)) if lat else '—'} ms")
 
     def _show_totals(self, rows):
-        words = sum(r["ref_words"] for r in rows)
-        if not rows or not words:
+        if not rows:
             return
+        # Reported phrases may have no correct text (then no word error rate)
+        words = sum(r["ref_words"] for r in rows)
         ok = sum(r["detected"] == r["lang"] for r in rows)
         errs = sum(min(r["errors"], r["ref_words"]) for r in rows)
         lat = [r["latency_ms"] for r in rows if r["latency_ms"] is not None]
         self.totals_label.setText(
-            f"{len(rows)} clips  ·  language right {ok}/{len(rows)}  ·  WER {errs / words:.0%}  ·  "
+            f"{len(rows)} clips  ·  language right {ok}/{len(rows)}  ·  "
+            f"WER {f'{errs / words:.0%}' if words else '—'}  ·  "
             f"pause → text median {int(np.median(lat)) if lat else '—'} ms")
 
     def _finished(self, rows, path, wall, error=None):

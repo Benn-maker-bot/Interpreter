@@ -64,6 +64,12 @@ USING THE WINDOW
                       (Speaking Russian needs a Russian voice installed in
                       Windows Settings > Time & language > Speech.)
   Clear               empty the text boxes.
+  Report a mistake    mark a recent phrase as wrong (wrong words, wrong
+                      language, bad translation, cut mid-sentence, invented
+                      or missed speech), optionally with what was really
+                      said. Its audio and details are saved in
+                      testdata\feedback\, where the simulator can replay
+                      them ("Your reported phrases") to check a fix.
   Model               Whisper model for the final text:
                         Turbo   most accurate, fast on the GPU (recommended)
                         Medium  accurate, slower
@@ -108,8 +114,11 @@ MUSIC AND SINGING
   The app notices when music is playing (YAMNet sound classifier) and
   switches to music mode by itself; the status line says "Music detected".
   In music mode:
-    - a phrase needs a longer pause to end (0.9 s) and may last 15 s, so
-      sung lines are not chopped into single syllables
+    - a phrase needs a longer pause to end (0.9 s; 0.4 s once it is
+      longer than 6 s) and may last 15 s, so sung lines are not chopped
+      into single syllables
+    - the voice is separated from the music in 6 s chunks while the
+      singing is still going, so little is left to do when it ends
     - the speech detector is more sensitive (singing scores lower)
     - the instruments are removed (UVR vocal separation, on the GPU) so
       Whisper hears only the voice; instrumental passages are skipped
@@ -130,7 +139,9 @@ FILES IN THIS FOLDER
                                logic in interpreter.py
   music.py                     music/singing detection and vocal separation
   log_tools.py                 analysis tool for the logs (see below)
-  simulate.py                  tests the app with recorded audio (see above)
+  simulate.py                  tests the app with recorded audio (see below)
+  simulator_qt.py              the simulator in a window: watch and hear it
+  make_testdata.py             builds the synthetic test clips
   fetch_testdata.py            downloads the simulator's test recordings
   requirements.txt             the Python packages needed, with comments
   setup_and_run.bat            one-click install and start
@@ -149,7 +160,16 @@ TESTING WITH RECORDED AUDIO (SIMULATOR)
   The simulator plays recordings through the real pipeline (speech
   detection, music mode, Whisper, language detection, translation) instead
   of a sound card, and scores the results against the correct text.
-      .venv\Scripts\python fetch_testdata.py
+      .venv\Scripts\python simulator_qt.py
+          the simulator in a window (in VS Code: Run and Debug ->
+          "Simulator (window)", F5). Choose the test data: synthetic clips
+          (one language each, exact text), recorded clips, your reported
+          phrases, or live audio playing in Windows (a radio stream,
+          Spotify …). Shows the clip, meters, live text and results, and
+          plays the clips on an output device of your choice.
+      .venv\Scripts\python make_testdata.py
+          builds the synthetic clips once (needs internet): computer
+          voices in 10 languages, and the same over generated music
           downloads ~30 MB of test clips once: read speech in 10 languages
           (Google FLEURS) and sung lines with music in 4 (JamendoLyrics)
       .venv\Scripts\python simulate.py
@@ -173,6 +193,14 @@ CHECKING SPEED AND ACCURACY
       .venv\Scripts\python log_tools.py compare
           one row per combination of model, Previews and sensitivity used:
           speed (pause -> text, first text) and, with --ref, accuracy
+      .venv\Scripts\python log_tools.py trend
+          headline figures per day, real use and simulations side by
+          side: empty and retried phrases, forced cuts, end of speech ->
+          text, errors, mistakes reported, GPU shared with other programs
+  Every phrase's log line also says WHY things happened: which pause
+  rule ended it, why the language was kept or changed, why text was
+  discarded or retried. Each session logs its code version and which
+  other programs were using the graphics card.
   Add a start time to look at one session only, e.g.
       .venv\Scripts\python log_tools.py report 2026-10-31T14:00
 

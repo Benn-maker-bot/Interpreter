@@ -549,6 +549,18 @@ ISSUE_HELP = {
         "much smaller '{active_model_size}' model runs on the processor instead. Recognition "
         "works but is less accurate and slower.",
         "See the error just before this one for why the chosen model failed."),
+    "phrase_dropped_queue_full": (
+        "A phrase was lost: recognition fell too far behind",
+        "{queue_size} finished phrases were already waiting to be transcribed, so phrase "
+        "{seq} ({audio_sec} s of audio) had to be dropped. The graphics card is too busy: "
+        "another program is using it, or the model is too large for it.",
+        "Close other programs using the graphics card (games, AI tools, video editors), or "
+        "choose a smaller Model or Previews: Off."),
+    "phrase_queue_backlog_high": (
+        "Recognition is falling behind",
+        "{backlog} finished phrases are waiting to be transcribed, so text appears late.",
+        "Close other programs using the graphics card, or choose a smaller Model or "
+        "Previews: Off."),
     "early_final_failed": (
         "A phrase could not be pre-transcribed",
         "To save time the app starts transcribing a phrase as soon as a pause begins. That "
@@ -857,6 +869,11 @@ MUSIC_MAX_PHRASE_SEC = 15
 # measured ~1.4 s from the end of singing to the text.
 MUSIC_SOFT_PHRASE_SEC  = 6
 MUSIC_SOFT_SILENCE_SEC = 0.4
+# Same idea for speech: 15% of phrases on real calls ran to MAX_PHRASE_SEC
+# (people who barely pause). Past this length a short gap between words ends
+# the phrase, so it isn't cut mid-word and can use the early final.
+SPEECH_SOFT_PHRASE_SEC  = 7
+SPEECH_SOFT_SILENCE_SEC = 0.2
 MUSIC_VAD_DROP       = 0.15
 VOICE_GAP_DB         = 12     # separated voice this close to the mix = singing
 MIN_PHRASE_SEC   = 0.5     # shorter clips are mostly silence and make Whisper hallucinate
@@ -965,8 +982,12 @@ DEFAULT_MODEL_GPU = "Turbo — best accuracy ★"
 # the GPU free for finished phrases, so it is the baseline to compare the
 # preview settings against (log_tools.py compare groups by this).
 PREVIEW_OFF = "off"
-PREVIEW_CHOICES = {"Off (final text only)": PREVIEW_OFF, "Tiny (instant)": "tiny",
-                   "Small (balanced)": "small", "Main model": None}
+PREVIEW_CHOICES: dict[str, str | None] = {
+    "Off (final text only)": PREVIEW_OFF,
+    "Tiny (instant)": "tiny",
+    "Small (balanced)": "small",
+    "Main model": None,
+}
 
 # Local neural translation (Opus-MT via CTranslate2, ~30-55 ms on GPU).
 # Replaces the online services for these pairs: no network, no rate limits.
@@ -1921,8 +1942,9 @@ class AudioCaptureThread(threading.Thread):
             if backlog >= PHRASE_QUEUE_BACKLOG_WARN:
                 log_event(logging.WARNING, "phrase_queue_backlog_high", backlog=backlog)
         except queue.Full:
-            log_event(logging.WARNING, "phrase_dropped_queue_full",
-                      reason=label, bytes=len(payload), chunks=len(blocks))
+            log_event(logging.ERROR, "phrase_dropped_queue_full", seq=seq,
+                      reason=label, audio_sec=round(len(payload) / 2 / SAMPLE_RATE, 1),
+                      queue_size=self.phrase_queue.maxsize)
 
     def run(self):
         """Thread entry point: create PortAudio, run the capture, always clean up."""
@@ -2051,6 +2073,8 @@ class AudioCaptureThread(threading.Thread):
                          int(MUSIC_MAX_PHRASE_SEC * blocks_per_sec))
         music_soft_blocks = int(MUSIC_SOFT_PHRASE_SEC * blocks_per_sec)
         music_soft_silence_blocks = max(1, int(MUSIC_SOFT_SILENCE_SEC * blocks_per_sec))
+        speech_soft_blocks = int(SPEECH_SOFT_PHRASE_SEC * blocks_per_sec)
+        speech_soft_silence_blocks = max(1, int(SPEECH_SOFT_SILENCE_SEC * blocks_per_sec))
         # Every second, the last second of audio goes to the music detector
         # (music.MusicScene.feed), so it can switch within ~2 s, also when
         # nothing is said and no phrase arrives.
@@ -2246,6 +2270,8 @@ class AudioCaptureThread(threading.Thread):
                 speech_threshold = max(0.15, speech_threshold - MUSIC_VAD_DROP)
                 if len(phrase_blocks) >= music_soft_blocks:
                     silence_blocks_needed = music_soft_silence_blocks
+            elif len(phrase_blocks) >= speech_soft_blocks:
+                silence_blocks_needed = speech_soft_silence_blocks
             # Hysteresis: easier to stay in speech than to enter it, so brief
             # dips inside words don't end the phrase.
             speaking = speech_probability >= (speech_threshold - VAD_HYSTERESIS if in_speech else speech_threshold)
@@ -2325,7 +2351,16 @@ class AudioCaptureThread(threading.Thread):
             blocks_since_preview += 1
             # (a) a long enough pause -> the phrase is finished
             if silent_blocks >= silence_blocks_needed:
-                self._flush(seq, phrase_blocks, min_phrase_blocks, "end", _resample, phrase_meta(len(phrase_blocks)))
+                # Why it ended (which pause rule) and how the speech score fell
+                # at the end: shows whether phrases end too early or too late.
+                rule = ("music, long phrase" if in_music and silence_blocks_needed == music_soft_silence_blocks
+                        else "music" if in_music
+                        else "speech, long phrase" if silence_blocks_needed == speech_soft_silence_blocks
+                        else "speech")
+                self._flush(seq, phrase_blocks, min_phrase_blocks, "end", _resample,
+                            dict(phrase_meta(len(phrase_blocks)), end_rule=rule,
+                                 pause_ms=round(silent_blocks * chunk_sec * 1000),
+                                 end_probs=[round(p, 2) for p in phrase_speech_probs[-silent_blocks - 3:]][:8]))
                 seq += 1
                 phrase_blocks, phrase_speech_probs, silent_blocks, blocks_since_preview, in_speech = [], [], 0, 0, False
                 early_offer_len = None
@@ -2342,7 +2377,9 @@ class AudioCaptureThread(threading.Thread):
                 cut = self._best_cut(phrase_levels_db, phrase_speech_probs, cut_search_blocks)
                 early_offer_len = None  # an early final never applies to a forced cut
                 self._flush(seq, phrase_blocks[:cut + 1], min_phrase_blocks, "max", _resample,
-                            phrase_meta(cut + 1))
+                            dict(phrase_meta(cut + 1), end_rule=f"max length ({'music' if in_music else 'speech'})",
+                                 cut_prob=round(phrase_speech_probs[cut], 2),
+                                 cut_level_db=round(phrase_levels_db[cut], 1)))
                 seq += 1
                 phrase_blocks, phrase_speech_probs = phrase_blocks[cut + 1:], phrase_speech_probs[cut + 1:]
                 blocks_since_preview = len(phrase_blocks)
@@ -2554,6 +2591,61 @@ MIN_CHARS_PER_SEC = 5.0   # good phrases ran 9-17 chars/s in the logs; at 5 the 
 MAX_COMPRESSION   = 2.4   # Whisper's own repetition-loop check
 
 
+RETRY_USELESS = {"repetitive", "stock_phrase"}   # see _retry_if_suspicious
+RECENT_AUDIO_PHRASES = 40                         # kept in memory for "Report a mistake"
+FEEDBACK_DIR = APP_DIR / "testdata" / "feedback"  # reported phrases (simulator test set)
+
+
+FEEDBACK_PROBLEMS = {
+    "words":       "Wrong or missing words",
+    "language":    "Wrong language",
+    "translation": "Bad translation",
+    "cut":         "Cut in the middle of a sentence",
+    "invented":    "Text that was never said",
+    "missed":      "Speech that was not shown at all",
+}
+
+
+def save_feedback(seq, audio, trace, recognised, translation, problems,
+                  correct_text="", actual_lang=None, note=""):
+    """Save a phrase the user reported as wrong: its audio (16 kHz WAV), what
+    was shown, what was wrong and the full phrase_trace. It is added to
+    testdata/feedback/manifest.jsonl in the simulator's format, so the
+    simulator can replay every reported phrase ("Your reported phrases") and
+    a fix can be checked against the user's real mistakes.
+    Returns the WAV path (None if the audio is no longer kept)."""
+    import json, wave
+    trace = dict(trace or {})
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = None
+    clips = FEEDBACK_DIR / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+    if audio:
+        path = clips / f"{stamp}_{seq}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(SAMPLE_RATE)
+            w.writeframes(audio)
+    row = {
+        "file": str(path.relative_to(FEEDBACK_DIR)) if path else None,
+        "kind": "song" if trace.get("music_mode") else "speech",
+        "lang": actual_lang or trace.get("lang_used") or trace.get("lang") or trace.get("src_lang"),
+        # The correct text, if the user typed it; otherwise nothing to score
+        # word errors against (the simulator then checks language and speed)
+        "text": correct_text.strip(), "verified": bool(correct_text.strip()),
+        "recognised": recognised, "translation": translation, "problems": problems,
+        "note": note, "reported_at": stamp, "session_id": trace.get("session_id"), "seq": seq,
+        "trace": {k: v for k, v in trace.items() if not k.startswith("t_")},
+    }
+    with open(FEEDBACK_DIR / "manifest.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    log_event(logging.INFO, "user_reported_mistake", seq=seq, problems=problems,
+              recognised=recognised[:200], correct_text=correct_text[:200],
+              actual_lang=actual_lang, detected_lang=trace.get("lang_used"),
+              audio_saved=bool(path), note=note[:200], music_mode=trace.get("music_mode"),
+              end_rule=trace.get("end_rule"), lang_reason=trace.get("lang_reason"))
+    return path
+
+
 def suspicious_reasons(text: str, speech_sec: float, avg_logprob: float) -> list:
     """Why a final transcription looks wrong (empty list = looks fine)."""
     import zlib
@@ -2662,6 +2754,72 @@ def audio_sessions_snapshot() -> list:
         return [{"error": type(e).__name__}]
 
 
+_APP_VERSION = None
+
+
+def app_version() -> str:
+    """The code version: git commit, plus '+changes' if files were edited
+    since (so results can be tied to the exact code that produced them)."""
+    global _APP_VERSION
+    if _APP_VERSION is None:
+        import subprocess
+        try:
+            run = lambda *a: subprocess.run(["git", *a], cwd=APP_DIR, capture_output=True, text=True,
+                                            timeout=3, creationflags=0x08000000).stdout.strip()
+            _APP_VERSION = (run("rev-parse", "--short", "HEAD") or "unknown") + \
+                           ("+changes" if run("status", "--porcelain", "--untracked-files=no") else "")
+        except Exception:
+            _APP_VERSION = "unknown"
+    return _APP_VERSION
+
+
+def gpu_snapshot() -> dict:
+    """Graphics card load, memory, and which OTHER programs use it right now.
+    Another program on the GPU slows Whisper (31 Oct: encoder 140 -> 450 ms)."""
+    out = {}
+    try:
+        import pynvml
+        import psutil
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util, mem = pynvml.nvmlDeviceGetUtilizationRates(h), pynvml.nvmlDeviceGetMemoryInfo(h)
+        out.update(gpu_load_pct=util.gpu, gpu_mem_used_mb=mem.used // 2**20,
+                   gpu_mem_total_mb=mem.total // 2**20)
+        # Programs actually computing on the GPU (% of its time, recent
+        # samples). The plain process lists name every app with a window.
+        busy = {}
+        try:
+            for s in pynvml.nvmlDeviceGetProcessUtilization(h, 0):
+                if s.pid != os.getpid() and s.smUtil >= 2:
+                    try:
+                        name = psutil.Process(s.pid).name()
+                    except Exception:
+                        name = f"pid {s.pid}"
+                    busy[name] = max(busy.get(name, 0), s.smUtil)
+        except Exception:
+            pass
+        out["gpu_other_programs_pct"] = dict(sorted(busy.items(), key=lambda kv: -kv[1])[:8])
+    except Exception as e:
+        out["gpu_error"] = type(e).__name__
+    return out
+
+
+def log_session_context(session_id, **fields):
+    """Log what the session ran in (code version, GPU load and other GPU
+    programs, apps playing sound), in the background (git and Windows audio
+    queries take ~0.1-0.3 s). Explains results that differ between sessions."""
+    def work():
+        try:
+            log_event(logging.INFO, "session_context", session_id=session_id,
+                      app_version=app_version(), python=sys.version.split()[0],
+                      playing_apps=[a.get("app") for a in audio_sessions_snapshot()
+                                    if (a.get("peak") or 0) > 0.001],
+                      **gpu_snapshot(), **fields)
+        except Exception as e:
+            log_exception("session_context_failed", e)
+    threading.Thread(target=work, daemon=True, name="session-context").start()
+
+
 def is_music_loop(text: str) -> bool:
     """True for the loops Whisper produces on music or humming: one letter
     held ("Аааааааааа"), or one word repeated ("Спустя. Спустя. Спустя.
@@ -2674,16 +2832,26 @@ def is_music_loop(text: str) -> bool:
     return len(words) >= 4 and len(set(words)) == 1
 
 
-def is_hallucination(text: str) -> bool:
-    """True if the text is empty, a known stock phrase Whisper invents on silence
-    ("thank you", "you"…), or contains a YouTube subtitle-credit fragment.
-    """
+def hallucination_reason(text: str):
+    """Why the text is treated as invented by Whisper, or None if it isn't:
+    "empty", "subtitle credit" (a YouTube caption fragment such as
+    "Субтитры сделал…"), "stock phrase" ("thank you", "you"… invented on
+    silence) or "music loop" (one letter or word repeated)."""
     text_lower = text.lower()
     if any(f in text_lower for f in HALLUCINATION_FRAGMENTS):
-        return True
+        return "subtitle credit"
     normalized = "".join(ch for ch in text_lower if ch.isalnum() or ch == " ").strip()
-    return (not normalized or " ".join(normalized.split()) in HALLUCINATIONS
-            or is_music_loop(text))
+    if not normalized:
+        return "empty"
+    if " ".join(normalized.split()) in HALLUCINATIONS:
+        return "stock phrase"
+    return "music loop" if is_music_loop(text) else None
+
+
+def is_hallucination(text: str) -> bool:
+    """True if the text is empty, a known stock phrase Whisper invents on silence
+    ("thank you", "you"…), a subtitle-credit fragment or a music loop."""
+    return hallucination_reason(text) is not None
 
 
 def plain_device_name(label: str) -> str:
@@ -3093,6 +3261,10 @@ class TranscriptionWorker(threading.Thread):
         self._skip_context = False          # True while decoding a phrase in music mode
         self._last_vocals  = None           # separated voice of the last phrase (saved by _record)
         self._sep_cache    = {}             # vocal separation done ahead for the phrase in progress
+        # Audio of the last RECENT_AUDIO_PHRASES phrases (seq -> 16 kHz PCM), so
+        # the window's "Report a mistake" can save the phrase the user flags
+        from collections import OrderedDict
+        self.recent_audio  = OrderedDict()
         # Automatic language detection (set by the window) and the target
         # language code (a phrase already in it needs no translation)
         self.auto_language = True
@@ -3321,6 +3493,12 @@ class TranscriptionWorker(threading.Thread):
         if not reasons or info.get("no_speech"):
             return texts, token_ids, info
         info["suspicious"] = reasons
+        # Log analysis (real calls + simulator): retrying a "repetitive" or
+        # "stock_phrase" result never gave a better text (0 of 26), each costing
+        # ~180 ms; "low_confidence" (80/179) and "too_short" (7/26) did help.
+        if not set(reasons) - RETRY_USELESS:
+            info["retry_skipped"] = "reasons that never improved on retry"
+            return texts, token_ids, info
         saved = self._history
         self._history = {k: [] for k in self._history}
         t0 = time.perf_counter()
@@ -3394,6 +3572,8 @@ class TranscriptionWorker(threading.Thread):
         info["lang_top3"] = {k: round(v, 3) for k, v in
                              sorted(probs.items(), key=lambda kv: -kv[1])[:3]}
         sure = top_p >= AUTO_LANG_PROB or (info.get("speech_sec") or 0) >= LANG_MIN_SPEECH_SEC * 2
+        why = (f"confident ({top_p:.2f})" if top_p >= AUTO_LANG_PROB
+               else "long enough speech" if sure else None)
         # Unsure (a short or unclear clip): prefer a language already heard in
         # this session, or the target language, if it is at all plausible.
         # The simulator showed both bad choices: keeping a language that
@@ -3404,8 +3584,12 @@ class TranscriptionWorker(threading.Thread):
             if familiar:
                 top = max(familiar, key=lambda l: probs.get(l, 0.0))
                 sure = True
+                why = f"unsure ({top_p:.2f}): chose recently heard {top}"
             elif probs.get(self.lang_now, 0.0) < 0.10:
                 sure = True              # nothing familiar fits: the best guess
+                why = f"unsure ({top_p:.2f}): best guess, current language unlikely"
+            else:
+                why = f"unsure ({top_p:.2f}): kept {self.lang_now}"
             info["lang_unsure"] = True
         # A language new to this session must be clearly identified
         in_music = bool(self.music_scene is not None and getattr(self.music_scene, "active", False))
@@ -3413,6 +3597,8 @@ class TranscriptionWorker(threading.Thread):
         if sure and top != self.lang_now and top not in self._recent_langs and top_p < need:
             sure = False
             info["lang_new_rejected"] = f"{top} {top_p:.2f} < {need}"
+            why = f"kept {self.lang_now}: new language {top} not certain enough ({top_p:.2f} < {need})"
+        info["lang_reason"] = why
         if sure and top != self.lang_now:
             info["lang_changed_from"] = self.lang_now
             self.lang_now = top
@@ -3573,6 +3759,10 @@ class TranscriptionWorker(threading.Thread):
             #               and ended (t_start/t_end), its level, VAD score …
             seq, audio_bytes, meta = item
             self._last_final = seq
+            if audio_bytes:
+                self.recent_audio[seq] = audio_bytes
+                while len(self.recent_audio) > RECENT_AUDIO_PHRASES:
+                    self.recent_audio.popitem(last=False)
             # Reset the context only after a real pause in the speech
             # gap = seconds of silence between the previous phrase and this one.
             # After a long silence the conversation has probably moved on, so the
@@ -3635,6 +3825,10 @@ class TranscriptionWorker(threading.Thread):
                     "peak_dbfs": meta.get("peak_dbfs"), "vad_mean": meta.get("vad_mean"),
                     "vad_threshold": meta.get("vad_threshold"), "previews": meta.get("previews"),
                     "onset_delay_ms": meta.get("onset_delay_ms"),
+                    # why the phrase ended: pause rule (+ pause length and the
+                    # speech score falling), or a forced cut (+ the cut point)
+                    **{k: meta[k] for k in ("end_rule", "pause_ms", "end_probs", "cut_prob",
+                                            "cut_level_db") if k in meta},
                     # speech start -> phrase end detected (the audio itself + pause wait)
                     "capture_ms": round((meta["t_end"] - meta["t_start"]) * 1000, 1)
                                   if meta.get("t_start") else None,
@@ -3728,7 +3922,11 @@ class TranscriptionWorker(threading.Thread):
         engine     = "whisper" if whisper_translates else "online"
         mt_ms      = 0.0
         if is_hallucination(text):
-            log_event(logging.INFO, "transcription_discarded", worker_id=self.wid, text=text)
+            info["discarded"] = hallucination_reason(text)
+            log_event(logging.INFO, "transcription_discarded", worker_id=self.wid, text=text,
+                      why=info["discarded"], speech_sec=info.get("speech_sec"),
+                      vad_mean=info.get("vad_mean"), music_mode=bool(music.get("music_mode")),
+                      no_speech_prob=info.get("no_speech_prob"), avg_logprob=info.get("avg_logprob"))
             text = ""
             translated = "" if whisper_translates else None
         elif whisper_translates and is_hallucination(translated):
@@ -3768,8 +3966,9 @@ class TranscriptionWorker(threading.Thread):
         name = LANGUAGE_NAMES.get(lang, lang.upper())
         engine, mt_ms, translated = f"whisper-{lang}", 0.0, ""
         if is_hallucination(text):
+            info["discarded"] = hallucination_reason(text)
             log_event(logging.INFO, "transcription_discarded", worker_id=self.wid, text=text,
-                      lang=lang)
+                      lang=lang, why=info["discarded"], speech_sec=info.get("speech_sec"))
             text = ""
         tgt_google = LANGUAGES.get(self.tgt_lang_key, ("en", "en"))[1]
         if text and not self.auto_language:
@@ -4029,6 +4228,10 @@ def collect_resource_stats(app) -> dict:
                 pass
         except Exception:
             pass
+    # Other programs computing on the GPU (they slow recognition down)
+    others = gpu_snapshot().get("gpu_other_programs_pct")
+    if others:
+        fields["gpu_other_programs_pct"] = others
     return fields
 
 
@@ -4724,7 +4927,10 @@ class InterpreterApp(ctk.CTk):
         # phrase_queue carries finished phrases (capture -> worker);
         # partial_slot carries only the newest preview audio.
         worker_count = getattr(self._model_loader, "worker_count", NUM_WORKERS)
-        self.phrase_queue  = queue.Queue(maxsize=max(worker_count * 4, 8))
+        # Room for ~30 phrases (each ≤15 s, ≤0.5 MB): a GPU stall of a minute or
+        # so is caught up later instead of losing speech (8 slots overflowed
+        # when the GPU was shared, 31 Oct). The backlog warning still fires at 6.
+        self.phrase_queue  = queue.Queue(maxsize=max(worker_count * 16, 32))
         # No preview slot when previews are Off: capture then never offers one.
         self._partial_slot = None if self._previews_off else LatestSlot()
         self._early_slot   = LatestSlot()   # early finals (EARLY_FINAL_SEC)
@@ -4866,6 +5072,8 @@ class InterpreterApp(ctk.CTk):
                   loopback=self.loopback_var.get(),
                   model_device=getattr(self._model_loader, "active_device", WHISPER_DEVICE),
                   model_compute_type=getattr(self._model_loader, "active_compute_type", COMPUTE_TYPE))
+        log_session_context(self.session_id, preview=self.preview_choice_var.get(),
+                            auto_language=bool(load_settings().get("auto_language", True)))
 
     def _retry_start_session(self):
         """Timer callback: try _start_session again (model was still loading)."""

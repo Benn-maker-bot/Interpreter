@@ -60,7 +60,8 @@ import log_tools as LT                          # noqa: E402
 REAL_PYAUDIO = I.pyaudio                      # build() swaps in a fake; live mode needs this
 TESTDATA = APP_DIR / "testdata"
 DATA_SETS = {"synth": TESTDATA / "synth",     # make_testdata.py: TTS voices, made-up music
-             "real": TESTDATA}                # fetch_testdata.py: FLEURS + Jamendo
+             "real": TESTDATA,                # fetch_testdata.py: FLEURS + Jamendo
+             "feedback": TESTDATA / "feedback"}   # phrases reported with "Report a mistake"
 DATA_DIR = DATA_SETS["synth"]                 # chosen with --data
 RATE = 16000
 
@@ -309,6 +310,8 @@ def choose_clips(args):
     langs = set(args.langs.split(",")) if args.langs else None
     groups = {}
     for r in rows:
+        if not r.get("file"):                 # a report saved without audio
+            continue
         if r["kind"] in kinds and (not langs or r["lang"] in langs):
             groups.setdefault((r["kind"], r["lang"]), []).append(r)
     if args.limit:
@@ -474,6 +477,7 @@ def run(args, on_event=lambda kind, data: None, stop=None, level_cb=None):
     capture, worker, results, session_id = build(args, playlist, lambda m: on_event("status", m),
                                                  level_cb)
     I.log_event(20, "simulation_started", session_id=session_id, clips=len(clips), **vars(args))
+    I.log_session_context(session_id, simulation=True)
 
     worker.start(); capture.start()
     if not live:

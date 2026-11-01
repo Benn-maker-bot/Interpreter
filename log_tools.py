@@ -20,6 +20,8 @@ Run it from the project folder with the project's Python, for example:
                                                     …also create missing references
     .venv\\Scripts\\python log_tools.py sensitivity     how sensitivity and input level
                                                     affect detection and accuracy
+    .venv\\Scripts\\python log_tools.py trend           headline figures per day, real use
+                                                    and simulations side by side
 
 report
     Reads the "phrase_trace" lines (one per finished phrase), "phrase_displayed"
@@ -67,7 +69,9 @@ def iter_log_files(base_path: Path):
     files = []
     if base_path.exists():
         files.append(base_path)
-    files.extend(sorted(base_path.parent.glob(base_path.name + ".*.gz")))
+    # Older copies: gzipped (.1.gz …) or, if compressing failed because
+    # another process held the file, plain (.1 …)
+    files.extend(sorted(base_path.parent.glob(base_path.name + ".*")))
     return files
 
 
@@ -754,9 +758,80 @@ def build_sensitivity(since=None):
     return "\n".join(out)
 
 
+def build_trend(since=None):
+    """Headline figures per day, real use and simulations side by side, to
+    see whether a change helped on real calls (not only in the simulator):
+    phrases, empty/invented ones, retries, wrong-language reports, forced
+    cuts, end of speech -> text, recognition time, errors, GPU sharing."""
+    import statistics
+    days = {}
+
+    def day(entry, sim):
+        d = days.setdefault((entry["ts"][:10], "simulation" if sim else "real use"),
+                            {"sessions": set(), "phrases": 0, "empty": 0, "retried": 0,
+                             "forced_cut": 0, "lang_changes": 0, "music": 0, "pause_to_text": [],
+                             "recognise": [], "errors": 0, "reported": 0, "gpu_shared": 0,
+                             "versions": set()})
+        return d
+
+    for path in iter_log_files(LOG_PATH):
+        for e in read_jsonl(path):
+            if since and e.get("ts", "") < since:
+                continue
+            ev, sid = e.get("event"), str(e.get("session_id") or "")
+            sim = sid.startswith("sim")
+            if ev == "phrase_trace":
+                d = day(e, sim)
+                d["sessions"].add(sid)
+                d["phrases"] += 1
+                d["empty"] += not e.get("text")
+                d["retried"] += "retry" in e
+                d["forced_cut"] += e.get("reason") == "max"
+                d["lang_changes"] += bool(e.get("lang_changed_from"))
+                d["music"] += bool(e.get("music_mode"))
+                rec = e.get("early_ms") if e.get("early_used") else e.get("process_ms")
+                if rec is not None:
+                    d["recognise"].append(rec)
+            elif ev == "phrase_displayed" and e.get("speech_end_to_text_ms") is not None:
+                day(e, sim)["pause_to_text"].append(e["speech_end_to_text_ms"])
+            elif ev == "user_reported_mistake":
+                day(e, False)["reported"] += 1
+            elif ev in ("session_context", "resource_stats") and \
+                    (e.get("gpu_other_programs_pct") or {}):
+                day(e, sim)["gpu_shared"] += 1
+            if ev == "session_context" and e.get("app_version"):
+                day(e, sim)["versions"].add(e["app_version"])
+            if e.get("level") in ("ERROR", "CRITICAL"):
+                day(e, sim)["errors"] += 1
+
+    med = lambda v: f"{statistics.median(v):.0f}" if v else "-"
+    pct = lambda n, d: f"{100 * n / d:.0f}%" if d else "-"
+    lines = ["Daily trend (median times in ms; % of phrases)", "",
+             f"{'day':<11}{'source':<12}{'sess':>5}{'phrases':>8}{'empty':>7}{'retry':>7}"
+             f"{'cut':>6}{'music':>7}{'lang chg':>9}{'end->text':>10}{'recog':>7}{'errors':>7}"
+             f"{'reported':>9}{'GPU shared':>11}  version"]
+    for (date, source), d in sorted(days.items()):
+        if not d["phrases"] and not d["errors"]:
+            continue
+        n = d["phrases"]
+        lines.append(f"{date:<11}{source:<12}{len(d['sessions']):>5}{n:>8}{pct(d['empty'], n):>7}"
+                     f"{pct(d['retried'], n):>7}{pct(d['forced_cut'], n):>6}{pct(d['music'], n):>7}"
+                     f"{d['lang_changes']:>9}{med(d['pause_to_text']):>10}{med(d['recognise']):>7}"
+                     f"{d['errors']:>7}{d['reported']:>9}{d['gpu_shared']:>11}  "
+                     f"{', '.join(sorted(d['versions'])) or '-'}")
+    lines += ["", "empty: transcriptions discarded as non-speech or invented; retry: decoded a "
+              "second time because the text looked wrong; cut: phrase forced to end at the time "
+              "limit; end->text: end of speech to text on screen (real use only); recog: "
+              "recognition time; reported: 'Report a mistake' uses; GPU shared: log lines where "
+              "another program was computing on the graphics card."]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "report":
+    if len(sys.argv) > 1 and sys.argv[1] == "trend":
+        print(build_trend(sys.argv[2] if len(sys.argv) > 2 else None))
+    elif len(sys.argv) > 1 and sys.argv[1] == "report":
         print(build_report(sys.argv[2] if len(sys.argv) > 2 else None))
     elif len(sys.argv) > 1 and sys.argv[1] == "sensitivity":
         print(build_sensitivity(sys.argv[2] if len(sys.argv) > 2 else None))
