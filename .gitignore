@@ -11,7 +11,7 @@ dist/
 
 # Runtime logs written next to interpreter.py
 *.jsonl
-*.jsonl.*.gz
+*.jsonl.*
 interpreter.log.summary.json
 interpreter.settings.json
 logs/

@@ -105,6 +105,14 @@ core.ISSUE_HELP.update({
         "The simulator window failed to update once",
         "Showing a result in the window raised an error; the simulation itself carries on.",
         "If it repeats, copy the details (they include the line of code) for the developer."),
+    "sim_wrong_python": (
+        "The simulator is running in the wrong Python",
+        "It was started with {python} (Python {python_version}) instead of the project's own "
+        "environment ({expected}). Package versions there can differ, so results and speed "
+        "may not match the interpreter app.",
+        "In VS Code use Run and Debug -> 'Simulator (window)' (F5), or choose the .venv "
+        "interpreter: Ctrl+Shift+P -> 'Python: Select Interpreter'. From a terminal: "
+        ".venv\\Scripts\\python simulator_qt.py"),
     "sim_live_device_failed": (
         "The live audio source could not be opened",
         "Windows refused to record from '{device}'.",
@@ -211,7 +219,8 @@ class SimulatorWindow(FluentWindow):
     # Warnings and errors: grouped on the Issues page, first of each kind pops up
     _refresh_issues = QtInterpreterApp._refresh_issues
     _render_issue_groups = QtInterpreterApp._render_issue_groups
-    POPUP_WARNINGS = QtInterpreterApp.POPUP_WARNINGS + ("sim_pipeline_stalled", "sim_clip_missing")
+    POPUP_WARNINGS = QtInterpreterApp.POPUP_WARNINGS + ("sim_pipeline_stalled", "sim_clip_missing",
+                                                        "sim_wrong_python")
 
     CLIP_COLUMNS = ["#", "Clip", "Language", "Heard as", "Gain", "WER", "Pause → text", "Music",
                     "Recognised"]
@@ -259,7 +268,22 @@ class SimulatorWindow(FluentWindow):
         self._slow_timer.start(1000)
         log_event(logging.INFO, "sim_gui_opened", session_id=self.session_id,
                   output_devices=len(self._output_list), loopback_devices=len(self._loopbacks),
-                  output=self.out_combo.currentText())
+                  output=self.out_combo.currentText(), python=sys.executable,
+                  python_version=sys.version.split()[0])
+        self._check_environment()
+
+    def _check_environment(self):
+        """Warn if this isn't the project's .venv Python: another Python may
+        have different (or missing) package versions, so results and speed
+        can differ from the app's."""
+        from pathlib import Path
+        venv = (Path(__file__).resolve().parent / ".venv").resolve()
+        if Path(sys.prefix).resolve() != venv:
+            log_event(logging.WARNING, "sim_wrong_python", python=sys.executable,
+                      python_version=sys.version.split()[0], expected=str(venv / "Scripts" / "python.exe"))
+            self.status_label.setText(f"⚠ Running in {sys.executable}, not the project's .venv "
+                                      "(see Issues).")
+            set_colour(self.status_label, WARN)
 
     def _reset_run_state(self):
         self._finals, self._previews, self._scored = [], [], 0
