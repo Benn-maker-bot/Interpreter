@@ -1,4 +1,33 @@
 {
     "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
-    "python.terminal.activateEnvironment": true
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.typeCheckingMode": "basic",
+    "accessibility.dimUnfocused.enabled": true,
+    "accessibility.dimUnfocused.opacity": 0.6,
+    "editor.cursorBlinking": "solid",
+    "editor.minimap.enabled": false,
+    "editor.stickyScroll.enabled": true,
+    "editor.bracketPairColorization.enabled": true,
+    "editor.guides.bracketPairs": "active",
+    "editor.smoothScrolling": true,
+    "workbench.tips.enabled": false,
+    "terminal.integrated.minimumContrastRatio": 4.5,
+    "autoDocstring.docstringFormat": "google",
+    "files.associations": { "notes.md": "markdown" },
+    "cSpell.words": [
+        "behaviour",
+        "Consolas",
+        "colours",
+        "customtkinter",
+        "fiio",
+        "gmtime",
+        "initialised",
+        "interp",
+        "nvml",
+        "qfluentwidgets",
+        "recognise",
+        "Segoe",
+        "unticked",
+        "unmute"
+    ]
 }

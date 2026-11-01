@@ -129,6 +129,15 @@ MUSIC AND SINGING
   singing" section.
 
 
+UNDERSTANDING THE PROJECT
+-------------------------
+  docs\START_HERE.md is the place to begin: short guides with diagrams
+  (MAP.md), what each file is for (FILES.md), step-by-step recipes
+  (HOW_TO.md), the tuning numbers (TUNING.md), a glossary, and tips for
+  a calm VS Code setup (VSCODE.md). In VS Code, press Ctrl+Shift+V on a
+  .md file to read it formatted. notes.md is a scratch pad for ideas.
+
+
 FILES IN THIS FOLDER
 --------------------
   interpreter.py               the application (start it with this file)

@@ -12,6 +12,11 @@ shows the English translation next to them. It can also do the reverse
 This file is the whole application. It is long, so this guide explains the
 big picture first. Every class and function below also has its own comment.
 
+NEW TO THE PROJECT? Start with docs/START_HERE.md: short guides with
+diagrams (docs/MAP.md), a file guide, how-to recipes, the tuning numbers
+and a glossary. In VS Code press Ctrl+Shift+O to jump to any class or
+function in this file by name.
+
 
 HOW A PIECE OF SPEECH TRAVELS THROUGH THE PROGRAM
 -------------------------------------------------
@@ -27,7 +32,9 @@ HOW A PIECE OF SPEECH TRAVELS THROUGH THE PROGRAM
 
   2. DETECT SPEECH  Each block is scored by Silero VAD (a tiny AI model that
      answers "is this speech?"). Speech blocks are collected into a phrase.
-     A phrase ends at a short pause (0.3 s) or after 7 s at the best gap.
+     A phrase ends at a short pause (0.3 s; 0.2 s once it is over 7 s long)
+     or, at most 10 s long, is cut at the quietest moment. During music
+     the pauses are longer (see MUSIC AND LANGUAGES below).
 
   3. PREVIEW  While someone is still talking, the unfinished phrase is sent
      every 0.2 s for a quick "preview" transcription, so text appears almost
@@ -49,6 +56,33 @@ HOW A PIECE OF SPEECH TRAVELS THROUGH THE PROGRAM
   6. DISPLAY  The window replaces the grey preview with the final text and
      translation, can read the translation aloud (Speaker), and logs timing
      and accuracy data for every phrase.
+
+
+MUSIC AND LANGUAGES
+-------------------
+  MUSIC MODE  Once a second a sound classifier (YAMNet, in music.py)
+     decides whether music is playing. If so: phrases may be longer, the
+     speech detector is more sensitive, and a second AI model (UVR) removes
+     the instruments so Whisper hears only the voice.
+
+  AUTO-DETECT  With "Auto-detect" as the source language, Whisper guesses
+     the language of every phrase. A short or unsure guess keeps the
+     current language; a language not heard recently must be very certain
+     (TranscriptionWorker._detect_auto explains the rules).
+
+  WHY  Every phrase's log line ("phrase_trace") records why things
+     happened: which rule ended it (end_rule), why the language was chosen
+     (lang_reason), why text was thrown away (discarded) or retried.
+
+
+TESTING AND IMPROVING
+---------------------
+  simulate.py / simulator_qt.py  play test recordings through this exact
+                    code instead of a sound card and score the results.
+  "Report a mistake" (Fluent window)  saves a phrase the app got wrong,
+                    with its audio, to testdata/feedback; the simulator can
+                    replay these reports to check a fix.
+  log_tools.py trend   headline figures per day, to see if a change helped.
 
 
 THREADS (things that run at the same time)
@@ -238,10 +272,11 @@ import traceback
 import uuid
 import gzip
 import shutil
-from collections import Counter, deque
+from collections import Counter, deque, OrderedDict
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Callable, Iterable
 
 import requests
 import subprocess
@@ -448,7 +483,7 @@ APP_LOG   = _build_logger("interpreter.app",   LOG_PATH,       logging.INFO)
 ERROR_LOG = _build_logger("interpreter.error", ERROR_LOG_PATH, logging.WARNING)
 
 
-def log_event(level: int, event: str, **fields):
+def log_event(level: int, event: str, **fields: Any) -> None:
     """Write one event to the log. This is the function the whole app uses.
 
     `event` is a short name such as "phrase_trace"; any keyword arguments are
@@ -635,7 +670,8 @@ def _where(exc_info):
     return describe(last)
 
 
-def explain_issue(event, fields=None, exc_info=None):
+def explain_issue(event: str, fields: dict[str, Any] | None = None,
+                  exc_info: Any = None) -> dict[str, str]:
     """Plain-language description of a logged problem: dict with title,
     meaning, action, technical (the Python error), where (file:line) and
     details (the facts logged with it). ISSUE_HELP texts may name fields in
@@ -666,7 +702,7 @@ def explain_issue(event, fields=None, exc_info=None):
             "details": _describe_fields(fields)}
 
 
-def log_exception(event: str, exc: Exception, **fields):
+def log_exception(event: str, exc: Exception, **fields: Any) -> None:
     """Log an error together with its full traceback (the list of calls that
     led to it), so problems can be diagnosed later from the log files.
     """
@@ -962,18 +998,18 @@ FIIO_KEYWORDS   = ["fiio", "fio k", "fio q", "fio dac",
 # Bigger models are more accurate but slower. LANGUAGES maps menu names to
 # (Whisper language code, translation-service language code).
 MODELS = {
-    "Tiny  — fastest":        "tiny",
-    "Small — recommended ✓":  "small",
-    "Medium — most accurate": "medium",
+    "Tiny  - fastest":        "tiny",
+    "Small - recommended ✓":  "small",
+    "Medium - most accurate": "medium",
     # Measured on real Russian call audio vs large-v3: 7.5% word errors at
     # ~225 ms, against Medium 9.9% at ~276 ms. It cannot translate (trained
     # for transcription only), so translation comes from Opus-MT/online.
-    "Turbo — best accuracy ★": "large-v3-turbo",
+    "Turbo - best accuracy ★": "large-v3-turbo",
 }
 # Model chosen on first start: Tiny without a GPU (anything bigger is too
 # slow on a CPU), Turbo with one.
-DEFAULT_MODEL_CPU = "Tiny  — fastest"
-DEFAULT_MODEL_GPU = "Turbo — best accuracy ★"
+DEFAULT_MODEL_CPU = "Tiny  - fastest"
+DEFAULT_MODEL_GPU = "Turbo - best accuracy ★"
 
 # Model for live previews (finished phrases always use the main model).
 # Measured preview cost on the RTX 4060 Ti: Tiny ~40 ms, Small ~90 ms,
@@ -1458,7 +1494,7 @@ VB_INPUT_PRIORITY_KEYWORDS = [
 ]
 
 
-def find_best_vb_input(input_devices):
+def find_best_vb_input(input_devices: Iterable[tuple[int, str]]) -> str | None:
     """Return the label of the best VB-Audio input, preferring Cable A."""
     for priority_kw in VB_INPUT_PRIORITY_KEYWORDS:
         for _idx, label in input_devices:
@@ -1467,7 +1503,7 @@ def find_best_vb_input(input_devices):
     return None
 
 
-def get_audio_devices():
+def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Return (input_devices, output_devices) as lists of (index, label).
 
     - Skips WDM-KS devices (need exclusive access, fail under Windows audio engine).
@@ -1481,7 +1517,10 @@ def get_audio_devices():
     # inputs/outputs: the lists we build, as (device number, label).
     # seen_in/seen_out: names already added. Windows lists each device once
     # per host API (WASAPI, DirectSound, MME); we keep only the first, best one.
-    inputs, outputs, seen_in, seen_out = [], [], {}, {}
+    inputs: list[tuple[int, str]] = []
+    outputs: list[tuple[int, str]] = []
+    seen_in: dict[str, bool] = {}
+    seen_out: dict[str, bool] = {}
     portaudio = None
     try:
         portaudio = pyaudio.PyAudio()
@@ -1550,7 +1589,7 @@ FIIO_PRIORITY_KEYWORDS = [
 ]
 
 
-def find_best_friend_input(input_devices):
+def find_best_friend_input(input_devices: Iterable[tuple[int, str]]) -> str | None:
     """Default input for Friend mode: capture what the FiiO is playing (the
     call audio from Teams/Telemost) via WASAPI loopback, else a VB-Audio cable."""
     loopbacks = [(i, l) for i, l in input_devices if "[loopback]" in l.lower()]
@@ -1561,7 +1600,8 @@ def find_best_friend_input(input_devices):
     return find_best_vb_input(input_devices)
 
 
-def find_device_by_keywords(devices, keywords):
+def find_device_by_keywords(devices: Iterable[tuple[int, str]],
+                            keywords: Iterable[str]) -> str | None:
     """Return the first device label whose name (lowercased) contains any keyword.
     Loopback (output-capture) devices are skipped: "nvidia" would otherwise
     match "NVIDIA High Definition Audio [Loopback]" (a monitor's speakers)."""
@@ -1573,7 +1613,7 @@ def find_device_by_keywords(devices, keywords):
     return None
 
 
-def find_best_output_device(output_devices):
+def find_best_output_device(output_devices: Iterable[tuple[int, str]]) -> str | None:
     """Return the label for the best Fiio output, using FIIO_PRIORITY_KEYWORDS
     so that K7 > Q series etc., rather than whichever appears first in the
     PortAudio device list."""
@@ -2229,7 +2269,7 @@ class AudioCaptureThread(threading.Thread):
                     log_event(logging.ERROR, "audio_capture_failed",
                               device_index=self.device_index, failures=read_failures,
                               error=str(e))
-                    self.status_cb("⚠ Audio device stopped responding — reconnecting…")
+                    self.status_cb("⚠ Audio device stopped responding - reconnecting…")
                     break
                 time.sleep(0.05)
                 continue
@@ -2410,7 +2450,7 @@ class AudioCaptureThread(threading.Thread):
 # remembered the next time the app starts.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_settings() -> dict:
+def load_settings() -> dict[str, Any]:
     """Read interpreter.settings.json and return it as a dict ({} if missing or broken)."""
     try:
         return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -2421,7 +2461,7 @@ def load_settings() -> dict:
         return {}
 
 
-def save_settings(**changes):
+def save_settings(**changes: Any) -> None:
     """Update some settings (e.g. save_settings(model="…")) and write the file."""
     settings = load_settings()
     settings.update(changes)
@@ -2433,7 +2473,7 @@ def save_settings(**changes):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Whisper model loader — GPU with automatic CPU fallback
+# Whisper model loader - GPU with automatic CPU fallback
 #
 # Loading a model takes seconds, so it happens on a background thread.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2445,7 +2485,7 @@ class WhisperModelLoader(threading.Thread):
     `ready` is set and `model` (or `error`) is filled in. If loading on the
     GPU fails it falls back to the Tiny model on the CPU.
     """
-    def __init__(self, model_size, status_cb):
+    def __init__(self, model_size: str, status_cb: Callable[[str], None]) -> None:
         """Prepare to load `model_size` ("tiny", "small", "medium", "large-v3-turbo")."""
         super().__init__(daemon=True, name="whisper-loader")
         # model_size: which model to load; status_cb: shows progress messages.
@@ -2537,7 +2577,7 @@ class WhisperModelLoader(threading.Thread):
                     raise first_err
                 # ── CPU fallback ──────────────────────────────────────────
                 fallback_size = MODELS.get(DEFAULT_MODEL_CPU, "tiny")
-                self.status_cb("GPU load failed — falling back to CPU (Tiny model)…")
+                self.status_cb("GPU load failed - falling back to CPU (Tiny model)…")
                 self.model, ms     = self._try_load(fallback_size, "cpu", "int8")
                 self.model_size    = fallback_size
                 self.active_device = "cpu"
@@ -2606,8 +2646,17 @@ FEEDBACK_PROBLEMS = {
 }
 
 
-def save_feedback(seq, audio, trace, recognised, translation, problems,
-                  correct_text="", actual_lang=None, note=""):
+def save_feedback(
+    seq: int,
+    audio: bytes | None,
+    trace: dict[str, Any],
+    recognised: str,
+    translation: str,
+    problems: list[str],
+    correct_text: str = "",
+    actual_lang: str | None = None,
+    note: str = "",
+) -> Path | None:
     """Save a phrase the user reported as wrong: its audio (16 kHz WAV), what
     was shown, what was wrong and the full phrase_trace. It is added to
     testdata/feedback/manifest.jsonl in the simulator's format, so the
@@ -3263,8 +3312,7 @@ class TranscriptionWorker(threading.Thread):
         self._sep_cache    = {}             # vocal separation done ahead for the phrase in progress
         # Audio of the last RECENT_AUDIO_PHRASES phrases (seq -> 16 kHz PCM), so
         # the window's "Report a mistake" can save the phrase the user flags
-        from collections import OrderedDict
-        self.recent_audio  = OrderedDict()
+        self.recent_audio: OrderedDict[int, bytes] = OrderedDict()
         # Automatic language detection (set by the window) and the target
         # language code (a phrase already in it needs no translation)
         self.auto_language = True
@@ -4357,6 +4405,8 @@ class InterpreterApp(ctk.CTk):
         self.loopback_var   = ctk.BooleanVar(
             value=bool(vb_lbl) and "[loopback]" not in (friend_lbl or "").lower())
         saved_model = load_settings().get("model")
+        if isinstance(saved_model, str):
+            saved_model = saved_model.replace(chr(0x2014), "-")
         self.model_var      = ctk.StringVar(
             value=saved_model if saved_model in MODELS else _DEFAULT_MODEL)
         self.sensitivity_var = ctk.DoubleVar(
@@ -4650,7 +4700,7 @@ class InterpreterApp(ctk.CTk):
                      width=95, anchor="w").grid(row=0, column=0, sticky="w")
         self.meter = DbMeter(meter_frame)
         self.meter.grid(row=0, column=1, sticky="ew", padx=(4, 8))
-        self.level_text = ctk.CTkLabel(meter_frame, text="—",
+        self.level_text = ctk.CTkLabel(meter_frame, text="-",
                                        font=ctk.CTkFont(family="Consolas", size=11),
                                        text_color=("gray50", "gray55"),
                                        width=190, anchor="w")
@@ -4662,7 +4712,7 @@ class InterpreterApp(ctk.CTk):
             row=1, column=0, sticky="w", pady=(2, 0))
         self.speech_meter = SpeechMeter(meter_frame)
         self.speech_meter.grid(row=1, column=1, sticky="ew", padx=(4, 8), pady=(2, 0))
-        self.speech_text = ctk.CTkLabel(meter_frame, text="—",
+        self.speech_text = ctk.CTkLabel(meter_frame, text="-",
                                         font=ctk.CTkFont(family="Consolas", size=11),
                                         text_color=("gray50", "gray55"), width=190, anchor="w")
         self.speech_text.grid(row=1, column=2, pady=(2, 0))
@@ -4757,7 +4807,8 @@ class InterpreterApp(ctk.CTk):
 
     # ── Level meter ───────────────────────────────────────────────────────
 
-    def _on_level(self, rms_db, peak_db, speaking, prob=0.0, threshold=0.5):
+    def _on_level(self, rms_db: float, peak_db: float, speaking: bool,
+                  prob: float = 0.0, threshold: float = 0.5) -> None:
         """Called by the capture thread with each block's level; forwards it to the
         main thread through result_queue (threads may not touch widgets).
         """
@@ -4776,7 +4827,7 @@ class InterpreterApp(ctk.CTk):
 
     # ── Mode switching ────────────────────────────────────────────────────
 
-    def _on_mode_btn(self, mode_idx):
+    def _on_mode_btn(self, mode_idx: int) -> None:
         """A mode button was clicked: remember the current mode's settings, switch."""
         if self._active_mode is not None:
             self._mode_state[self._active_mode] = [
@@ -4807,7 +4858,7 @@ class InterpreterApp(ctk.CTk):
         if self._initialised:
             self._restart_session()
 
-    def _on_manual_device_change(self, _=None):
+    def _on_manual_device_change(self, _: object | None = None) -> None:
         """An audio device menu changed: restart listening with the new device."""
         self._restart_session()
 
@@ -4838,7 +4889,7 @@ class InterpreterApp(ctk.CTk):
             self._mode_state[0][0] = nvidia_lbl
         if self._mode_state[1][0] not in self._input_map and friend_lbl:
             self._mode_state[1][0] = friend_lbl
-        self.status_var.set(f"Refreshed — {len(in_labels)} in / {len(out_labels)} out device(s).")
+        self.status_var.set(f"Refreshed - {len(in_labels)} in / {len(out_labels)} out device(s).")
         log_event(logging.INFO, "audio_devices_refreshed",
                   input_count=len(in_labels), output_count=len(out_labels))
         self._refresh_diagnostics_once()
@@ -4863,7 +4914,7 @@ class InterpreterApp(ctk.CTk):
             self.mute_btn.configure(text="🎙  Unmute", fg_color=COL_STOP,
                                     hover_color=COL_STOP_HOV)
             self._set_live_status("MUTED", COL_ERR)
-            self.status_var.set("Muted — not listening.")
+            self.status_var.set("Muted - not listening.")
         else:
             self.mute_btn.configure(text="🔇  Mute", fg_color=["#3B8ED0", "#1F6AA5"],
                                     hover_color=["#3281BC", "#1A5C8F"])
@@ -4881,7 +4932,7 @@ class InterpreterApp(ctk.CTk):
         # ── Step 1: make sure the Whisper model is loaded ────────────────
         # If it is still loading, show a message and try again in 0.6 s.
         if self._model_loader and not self._model_loader.ready.is_set():
-            self.status_var.set("⏳ Loading Whisper model — please wait…")
+            self.status_var.set("⏳ Loading Whisper model - please wait…")
             if self._start_retry_after_id is None:
                 self._start_retry_after_id = self.after(600, self._retry_start_session)
             return
@@ -5102,14 +5153,14 @@ class InterpreterApp(ctk.CTk):
             translation_worker.stop()
         self._translation_workers = []
         self.meter.reset()
-        self.level_text.configure(text="—")
+        self.level_text.configure(text="-")
         self._set_live_status("IDLE", COL_WARN)
         log_event(logging.INFO, "session_stopped",
                   session_id=self.session_id, keep_mode=keep_mode)
         if not keep_mode:
             self.status_var.set("Stopped.")
 
-    # ── TTS — fixed: lock prevents "run loop already started" ────────────
+    # ── TTS - fixed: lock prevents "run loop already started" ────────────
 
     def _toggle_tts(self):
         """On: each new translation is spoken as it arrives, through the
@@ -5208,7 +5259,9 @@ class InterpreterApp(ctk.CTk):
             self._preview_loader.start()
             log_event(logging.INFO, "preview_model_load_started", model_size=size)
 
-    def _translator_for(self, src, tgt):
+    def _translator_for(
+        self, src: str, tgt: str
+    ) -> Callable[[], LocalTranslator | None] | None:
         """Start loading the Opus-MT model for this pair (first use downloads
         ~300 MB) and return a callable the worker polls; until it is ready,
         translation falls back to Whisper/online."""
@@ -5235,7 +5288,7 @@ class InterpreterApp(ctk.CTk):
 
     # ── Queue poll ────────────────────────────────────────────────────────
 
-    def _log_displayed(self, seq, trace, online):
+    def _log_displayed(self, seq: int, trace: dict[str, Any], online: bool) -> None:
         """Log how long a finished phrase took to reach the screen ("phrase_displayed")."""
         now = time.monotonic()
         log_event(logging.INFO, "phrase_displayed", session_id=self.session_id,
@@ -5265,7 +5318,7 @@ class InterpreterApp(ctk.CTk):
                     wait = min(30, 2 ** self._watchdog_failures)
                     log_event(logging.WARNING, "watchdog_restart", problem=problem,
                               attempt=self._watchdog_failures, next_check_sec=wait)
-                    self.status_var.set(f"⚠ {problem} — restarting listening…")
+                    self.status_var.set(f"⚠ {problem} - restarting listening…")
                     self._stop_session(keep_mode=True)
                     self.after(500, self._reconnect)
                     self.after(wait * 1000, self._watchdog)
@@ -5428,7 +5481,7 @@ class InterpreterApp(ctk.CTk):
         # forever without blocking the window (see self.after in the guide).
         self.after(15, self._poll_queue)
 
-    def _update_metric(self, name, value):
+    def _update_metric(self, name: str, value: float) -> None:
         """Keep running statistics for the Diagnostics tab."""
         if name == "transcription_ms":
             self._perf_stats["transcriptions"] += 1
@@ -5458,9 +5511,9 @@ class InterpreterApp(ctk.CTk):
         # Choose a health message and colour: red if work is piling up in a
         # queue (the app can't keep up), green if listening, amber if idle.
         if phrase_backlog >= PHRASE_QUEUE_BACKLOG_WARN or translation_backlog >= TRANSLATION_QUEUE_BACKLOG_WARN:
-            color, health = COL_ERR,  "⚠ Backlog high — translation lagging"
+            color, health = COL_ERR,  "⚠ Backlog high - translation lagging"
         elif self.is_listening:
-            color, health = COL_OK,   "✔ Healthy — listening"
+            color, health = COL_OK,   "✔ Healthy - listening"
         else:
             color, health = COL_WARN, "● Idle"
 
@@ -5541,7 +5594,7 @@ class InterpreterApp(ctk.CTk):
     # ── Helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _avg(values):
+    def _avg(values: Iterable[float]) -> float:
         """Average of a list of numbers (0 for an empty list)."""
         return (sum(values) / len(values)) if values else 0.0
 
@@ -5634,7 +5687,7 @@ class InterpreterApp(ctk.CTk):
             box.configure(font=ctk.CTkFont(size=self._text_size))
         save_settings(text_size=self._text_size)
 
-    def _commit_translation(self, seq, text):
+    def _commit_translation(self, seq: int, text: str) -> None:
         """Show a finished translation, and speak it if Speak is on."""
         self._commit(self.translated_box, seq, text)
         if text and self._tts_on and not text.startswith("[translation failed"):
