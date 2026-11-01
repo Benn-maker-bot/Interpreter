@@ -145,31 +145,80 @@ class VocalSeparator:
         out /= self._norm
         return out[:, self.N_FFT // 2:self.N_FFT // 2 + self.chunk]
 
-    def separate(self, audio_16k: np.ndarray) -> np.ndarray:
-        """Return the voice only, as 16 kHz mono float32 (same length)."""
+    # A chunk is reused from the cache only if its audio ends this far (44.1 kHz
+    # samples) before the end of what has arrived: near the end, resampling
+    # the longer phrase later can still change a few samples.
+    STABLE_MARGIN = 4096
+
+    def _chunk_voice(self, piece):
+        """Separate one chunk (2 x chunk samples, 44.1 kHz) -> mono voice of
+        `step` samples. One chunk per ONNX call: the input shape never
+        changes, so cuDNN picks its convolution method once (a batch of all
+        chunks changed shape with every phrase and made it search again: 2-4x
+        slower)."""
+        spec = self._stft(piece)[:, :self.DIM_F]
+        planes = np.stack([spec[0].real, spec[0].imag, spec[1].real, spec[1].imag])
+        out = self.session.run(None, {"input": planes[None].astype(np.float32)})[0][0]
+        full = np.zeros((2, self.N_FFT // 2 + 1, self.DIM_T), np.complex64)
+        full[0, :self.DIM_F] = out[0] + 1j * out[1]
+        full[1, :self.DIM_F] = out[2] + 1j * out[3]
+        return self._istft(full)[:, self.trim:-self.trim].mean(0)
+
+    def _prepare(self, audio_16k, cache):
+        """Resample to 44.1 kHz and pad. Resets `cache` if it belongs to a
+        different phrase (its first 0.1 s differ)."""
         import soxr
+        if cache is not None:
+            head = audio_16k[:1600]
+            if cache.get("head") is None or len(cache["head"]) != len(head) \
+                    or not np.array_equal(cache["head"], head):
+                cache.clear()
+                cache.update(head=head.copy(), pieces={})
         x = soxr.resample(audio_16k.astype(np.float32), 16000, self.RATE).astype(np.float32)
-        mix = np.stack([x, x])
-        n = mix.shape[1]
+        n = len(x)
         pad = self.step - n % self.step
-        mix = np.concatenate([np.zeros((2, self.trim), np.float32), mix,
-                              np.zeros((2, pad + self.trim), np.float32)], 1)
-        batch = []
+        mix = np.concatenate([np.zeros(self.trim, np.float32), x,
+                              np.zeros(pad + self.trim, np.float32)])
+        return np.stack([mix, mix]), n, pad
+
+    def _stable(self, i, n):
+        """Chunk at offset i only uses audio that won't change any more."""
+        return i + self.chunk - self.trim <= n - self.STABLE_MARGIN
+
+    def prefetch(self, audio_16k, cache, max_chunks=1):
+        """Separate up to max_chunks chunks of a phrase that is still growing,
+        into `cache`, so separate() at the end of the phrase only has the last
+        chunk left (a 12 s sung phrase: ~1 s -> ~0.3 s). Returns how many
+        chunks it did."""
+        mix, n, pad = self._prepare(audio_16k, cache)
+        done = 0
         for i in range(0, n + pad, self.step):
-            spec = self._stft(mix[:, i:i + self.chunk])[:, :self.DIM_F]
-            batch.append(np.stack([spec[0].real, spec[0].imag, spec[1].real, spec[1].imag]))
-        # One chunk per call: the input shape never changes, so cuDNN picks
-        # its convolution method once. (A batch of all chunks changed shape
-        # with every phrase length and made cuDNN search again: 2-4x slower.)
-        outs = [self.session.run(None, {"input": planes[None].astype(np.float32)})[0][0]
-                for planes in batch]
-        pieces = []
-        for out in outs:
-            full = np.zeros((2, self.N_FFT // 2 + 1, self.DIM_T), np.complex64)
-            full[0, :self.DIM_F] = out[0] + 1j * out[1]
-            full[1, :self.DIM_F] = out[2] + 1j * out[3]
-            pieces.append(self._istft(full)[:, self.trim:-self.trim])
-        voice = np.concatenate(pieces, 1)[:, :n].mean(0) * self.COMPENSATE
+            if done >= max_chunks or not self._stable(i, n):
+                break
+            if i not in cache["pieces"]:
+                cache["pieces"][i] = self._chunk_voice(mix[:, i:i + self.chunk])
+                done += 1
+        return done
+
+    def separate(self, audio_16k: np.ndarray, cache=None) -> np.ndarray:
+        """Return the voice only, as 16 kHz mono float32 (same length).
+        cache: a dict kept for one growing phrase; chunks prefetch() already
+        separated are reused."""
+        import soxr
+        mix, n, pad = self._prepare(audio_16k, cache)
+        pieces, reused = [], 0
+        for i in range(0, n + pad, self.step):
+            if cache is not None and i in cache["pieces"]:
+                pieces.append(cache["pieces"][i])
+                reused += 1
+                continue
+            piece = self._chunk_voice(mix[:, i:i + self.chunk])
+            if cache is not None and self._stable(i, n):
+                cache["pieces"][i] = piece
+            pieces.append(piece)
+        if cache is not None:
+            cache["reused"], cache["chunks"] = reused, len(pieces)
+        voice = np.concatenate(pieces)[:n] * self.COMPENSATE
         return soxr.resample(voice, self.RATE, 16000).astype(np.float32)[:len(audio_16k)]
 
 

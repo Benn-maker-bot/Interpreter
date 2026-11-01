@@ -33,6 +33,16 @@
             "justMyCode": false
         },
         {
+            "name": "Simulator (window)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/simulator_qt.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
             "name": "Log summary",
             "type": "debugpy",
             "request": "launch",

@@ -57,6 +57,7 @@ sys.path.insert(0, str(APP_DIR))
 import interpreter as I                         # noqa: E402
 import log_tools as LT                          # noqa: E402
 
+REAL_PYAUDIO = I.pyaudio                      # build() swaps in a fake; live mode needs this
 TESTDATA = APP_DIR / "testdata"
 DATA_SETS = {"synth": TESTDATA / "synth",     # make_testdata.py: TTS voices, made-up music
              "real": TESTDATA}                # fetch_testdata.py: FLEURS + Jamendo
@@ -89,17 +90,48 @@ def reference_words(clip):
     return LT._words(text)
 
 
+LEVEL_TARGET_DBFS = -20     # each clip's voice is brought to this loudness (as the app's AGC)
+LEVEL_PEAK_DBFS   = -1      # without peaks going above this
+LEVEL_RANGE_DB    = (-20, 30)   # at most 20 dB quieter / 30 dB louder
+
+
+def level_clip(audio):
+    """Automatic gain for one clip: measure the loudness of the part that is
+    actually sounding (20 ms blocks within 25 dB of the loudest, so pauses
+    don't count) and scale the clip so that part sits at LEVEL_TARGET_DBFS,
+    limited so peaks stay below LEVEL_PEAK_DBFS. Real recordings differ by
+    20 dB or more; a quiet one could otherwise sit under the speech detector's
+    threshold. Returns (int16 audio, gain in dB)."""
+    x = audio.astype(np.float32) / 32768
+    n = len(x) // 320
+    if n == 0:
+        return audio, 0.0
+    power = (x[:n * 320].reshape(n, 320) ** 2).mean(axis=1)
+    db = 10 * np.log10(power + 1e-12)
+    active = power[(db > db.max() - 25) & (db > -70)]
+    if not len(active):
+        return audio, 0.0
+    gain_db = LEVEL_TARGET_DBFS - 10 * np.log10(active.mean())
+    peak_db = 20 * np.log10(np.abs(x).max() + 1e-9)
+    gain_db = float(np.clip(min(gain_db, LEVEL_PEAK_DBFS - peak_db), *LEVEL_RANGE_DB))
+    out = np.clip(x * 10 ** (gain_db / 20), -1, 1)
+    return (out * 32767).astype(np.int16), round(gain_db, 1)
+
+
 class Playlist:
     """All clips joined into one stream with silence between them. Remembers
-    when (monotonic clock) each clip starts and ends playing."""
+    when (monotonic clock) each clip starts and ends playing. level=True
+    applies level_clip() to each clip (its gain is stored as clip["gain_db"])."""
 
-    def __init__(self, clips, gap_sec):
+    def __init__(self, clips, gap_sec, level=True):
         parts, self.spans, pos = [], [], 0
         silence = np.zeros(int(gap_sec * RATE), np.int16)
         parts.append(silence); pos += len(silence)
         for clip in clips:
             with wave.open(str(DATA_DIR / clip["file"])) as w:
                 audio = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+            if level:
+                audio, clip["gain_db"] = level_clip(audio)
             parts.append(audio)
             # The span ends where the speech ends: FLEURS clips have ~1 s of
             # silence at the end, which made "pause -> text" negative.
@@ -187,14 +219,21 @@ class Loaders:
     _translator_for = I.InterpreterApp._translator_for
 
 
-def build(args, playlist):
-    I.pyaudio = FakePyAudioModule                       # the fake sound card
-    FakePyAudio.playlist = playlist
+def build(args, playlist, say=print, level_cb=None):
+    """level_cb(level_db, peak_db, speaking, speech_prob, threshold) is called
+    for every 20 ms block, from the capture thread.
+    playlist None = live: record the real device args.device (a loopback
+    device captures whatever Windows plays on that output)."""
+    if playlist is None:
+        I.pyaudio = REAL_PYAUDIO                        # a real device
+    else:
+        I.pyaudio = FakePyAudioModule                   # the fake sound card
+        FakePyAudio.playlist = playlist
     src_key, tgt_key = args.src, args.tgt
     src_whisper = I.LANGUAGES[src_key][0]
     tgt_code = I.LANGUAGES[tgt_key][0]
 
-    print(f"Loading Whisper {args.model} …", flush=True)
+    say(f"Loading Whisper {args.model} …")
     main = I.WhisperModelLoader(model_size=args.model, status_cb=lambda m: None)
     main.start()
     preview = None
@@ -203,7 +242,12 @@ def build(args, playlist):
         preview.start()
     main.ready.wait()
     if main.model is None:
-        sys.exit(f"Whisper failed to load: {main.error}")
+        raise RuntimeError(f"Whisper '{args.model}' failed to load: {main.error}")
+    if getattr(main, "used_fallback", False):
+        # The app falls back to Tiny on the CPU; a simulation with a different
+        # model than asked for would give misleading figures, so stop.
+        raise RuntimeError(f"Whisper '{args.model}' failed to load ({main.error or 'see log'}); "
+                           "not simulating with the CPU fallback model")
     if preview:
         preview.ready.wait()
     scene = None
@@ -216,7 +260,9 @@ def build(args, playlist):
     loaders = Loaders()
     # Pre-load the local translators the clips will need, so the first
     # phrases aren't counted as "online" while a model downloads.
-    for code in {c["lang"] for c in playlist.clips}:
+    langs = ({c["lang"] for c in playlist.clips} if playlist is not None
+             else {src_whisper} - {"auto"})              # live: languages not known in advance
+    for code in langs:
         for pair in I.local_route(code, tgt_code):
             loaders._translator_for(*pair)
     for loader in loaders._mt_loaders.values():
@@ -227,11 +273,16 @@ def build(args, playlist):
     phrases = queue.Queue(maxsize=32)
     partial_slot = None if args.preview == "off" else I.LatestSlot()
     early_slot = I.LatestSlot()
-    capture = I.AudioCaptureThread(device_index=0, phrase_queue=phrases,
+    capture = I.AudioCaptureThread(device_index=0 if playlist is not None else args.device,
+                                   phrase_queue=phrases,
                                    status_cb=lambda m: results.put(("status", m)),
-                                   level_cb=lambda *a: None, partial_slot=partial_slot,
+                                   level_cb=level_cb or (lambda *a: None), partial_slot=partial_slot,
                                    early_slot=early_slot)
     capture.set_sensitivity(args.sensitivity)
+    if playlist is not None:
+        # The gaps between clips are digital silence on purpose: don't warn that
+        # "no sound reaches the device" (it would list the real apps playing)
+        capture._report_source = lambda **kw: None
     capture.music_scene = scene
     worker = I.TranscriptionWorker(
         wid=0, model=main.model, src_whisper=src_whisper, src_lang_key=src_key,
@@ -384,50 +435,124 @@ def main():
         maker = "make_testdata.py" if args.data == "synth" else "fetch_testdata.py"
         sys.exit(f"No test data: run  .venv\\Scripts\\python {maker}  first.")
 
-    clips = choose_clips(args)
-    playlist = Playlist(clips, args.gap)
-    playlist.clips = clips
-    print(f"{len(clips)} clips, {playlist.duration / 60:.1f} min of audio", flush=True)
-    capture, worker, results, session_id = build(args, playlist)
+    def show(kind, data):
+        if kind == "status":
+            print(data, flush=True)
+        elif kind == "final" and data["text"]:
+            print(f"  {strip_label(data['text'])[:70]!r} -> {str(data['translated'])[:50]!r}", flush=True)
+
+    rows, path, wall_sec = run(args, show)
+    report(rows, args, wall_sec)
+    print(f"\nDetails: {path}")
+
+
+def run(args, on_event=lambda kind, data: None, stop=None, level_cb=None):
+    """Play the clips through the pipeline, score them and save the results.
+    Returns (rows, results path, wall-clock seconds).
+
+    on_event(kind, data) is called from this thread with
+      ("status", text)          loading progress
+      ("started", playlist)     playback begins (playlist.t0 is set)
+      ("partial", (seq, heard, translated, t_start, t))  a live preview
+      ("final", final)          a finished phrase: dict seq/text/translated/trace/t
+      ("translation", final)    an online translation arrived later for that final
+    stop: a threading.Event that ends the run early (clips not yet played
+    are left out of the results). level_cb: see build().
+
+    args.data == "live": no clips; records the real device args.device until
+    stop is set. Each phrase is a result row (no correct text to compare)."""
+    from concurrent.futures import ThreadPoolExecutor
+    live = args.data == "live"
+    if live:
+        playlist, clips = None, []
+        on_event("status", f"Recording live from {getattr(args, 'device_name', args.device)}")
+    else:
+        clips = choose_clips(args)
+        playlist = Playlist(clips, args.gap, level=getattr(args, "level_clips", True))
+        playlist.clips = clips
+        on_event("status", f"{len(clips)} clips, {playlist.duration / 60:.1f} min of audio")
+    capture, worker, results, session_id = build(args, playlist, lambda m: on_event("status", m),
+                                                 level_cb)
     I.log_event(20, "simulation_started", session_id=session_id, clips=len(clips), **vars(args))
 
     worker.start(); capture.start()
+    if not live:
+        while playlist.t0 is None:                        # the capture thread opens the stream
+            time.sleep(0.01)
+    on_event("started", playlist)
     finals, previews, wall0 = [], [], time.monotonic()
+    # Online translation in the background: waiting for it here held up every
+    # later result by the round trip (~0.2-0.5 s per phrase)
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sim-translate")
+    done_translations = queue.Queue()
+
+    def translate_online(final, lang):
+        try:
+            final["translated"] = I._translate_cached(strip_label(final["text"]),
+                                                      "auto" if lang == "auto" else lang,
+                                                      I.LANGUAGES[args.tgt][1])
+            if final["trace"] is not None:
+                final["trace"]["translation_engine"] = "online"
+        except Exception as e:
+            I.log_exception("sim_online_translation_failed", e, seq=final["seq"], lang=lang)
+            final["translated"] = f"[online translation failed: {e}]"
+        done_translations.put(final)
+
     while True:
         try:
-            kind, data = results.get(timeout=0.2)
+            kind, data = results.get(timeout=0.05)
         except queue.Empty:
             kind = None
         now = time.monotonic()
         if kind == "final":
             seq, text, translated, trace = data
+            final = {"seq": seq, "text": text, "translated": translated, "trace": trace, "t": now}
+            finals.append(final)
+            on_event("final", final)
             if translated is None and text and not args.offline:
-                lang = (trace or {}).get("lang_used") or worker.src_whisper
-                try:
-                    translated = I._translate_cached(strip_label(text),
-                                                     "auto" if lang == "auto" else lang,
-                                                     I.LANGUAGES[args.tgt][1])
-                    if trace is not None:
-                        trace["translation_engine"] = "online"
-                except Exception as e:
-                    translated = f"[online translation failed: {e}]"
-            finals.append({"seq": seq, "text": text, "translated": translated,
-                           "trace": trace, "t": now})
-            if text:
-                print(f"  {strip_label(text)[:70]!r} -> {str(translated)[:50]!r}", flush=True)
+                pool.submit(translate_online, final, (trace or {}).get("lang_used") or worker.src_whisper)
         elif kind == "partial":
             previews.append((now, data[1]))
-        if playlist.t0 and now - playlist.t0 > playlist.duration + 3 and results.empty():
+            on_event("partial", data)
+        elif kind == "status":
+            on_event("status", data)
+        while not done_translations.empty():
+            on_event("translation", done_translations.get())
+        if not live and now - playlist.t0 > playlist.duration + 3 and results.empty():
+            break
+        if stop is not None and stop.is_set():
             break
     capture.stop(); worker.stop()
-    rows = score(playlist, finals, previews)
-    report(rows, args, time.monotonic() - wall0)
+    pool.shutdown(wait=True)
+    while not done_translations.empty():
+        on_event("translation", done_translations.get())
+    if live:
+        rows = live_rows(finals)
+    else:
+        rows = score(playlist, finals, previews)
+        played = sum(playlist.time_of(b) < time.monotonic() - 3 for _, b in playlist.spans)
+        rows = rows[:played] if stop is not None and stop.is_set() else rows
     out_dir = TESTDATA / "sim_results"
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}.json"
+    path = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}{'-live' if live else ''}.json"
     path.write_text(json.dumps({"args": vars(args), "session_id": session_id, "clips": rows},
-                               ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"\nDetails: {path}")
+                               ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    return rows, path, time.monotonic() - wall0
+
+
+def live_row(final):
+    """One result row for a phrase heard live (nothing to compare it with)."""
+    tr = final["trace"] or {}
+    return {"seq": final["seq"], "kind": "live", "lang": None,
+            "detected": tr.get("lang_used") or tr.get("lang"),
+            "hyp": strip_label(final["text"]), "translation": final["translated"] or "",
+            "latency_ms": round((tr["t_result"] - tr["t_end"]) * 1000) if tr.get("t_end") and tr.get("t_result") else None,
+            "audio_sec": tr.get("audio_sec"), "music_mode": bool(tr.get("music_mode")),
+            "engine": tr.get("translation_engine")}
+
+
+def live_rows(finals):
+    return [live_row(f) for f in finals if f["text"]]
 
 
 if __name__ == "__main__":

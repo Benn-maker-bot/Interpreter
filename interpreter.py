@@ -536,6 +536,28 @@ ISSUE_HELP = {
         "A stuck part of the app was restarted",
         "A background task stopped responding and was restarted automatically.",
         "Nothing to do unless it happens often."),
+    "whisper_model_primary_load_failed": (
+        "The speech recognition model '{model_size}' could not be loaded",
+        "Whisper (the speech recogniser) failed to start with model '{model_size}' on "
+        "{device}. Common causes: the model name is wrong, the download was interrupted, "
+        "there is no internet for the first download, or the graphics card ran out of memory.",
+        "Choose another Model and try again. If it says out of memory, close other programs "
+        "that use the graphics card. The app falls back to the small 'tiny' model on the CPU."),
+    "whisper_model_cpu_fallback_ready": (
+        "Using the backup model '{active_model_size}' on the CPU",
+        "The chosen model could not load on the graphics card ({original_device}), so the "
+        "much smaller '{active_model_size}' model runs on the processor instead. Recognition "
+        "works but is less accurate and slower.",
+        "See the error just before this one for why the chosen model failed."),
+    "early_final_failed": (
+        "A phrase could not be pre-transcribed",
+        "To save time the app starts transcribing a phrase as soon as a pause begins. That "
+        "attempt failed for phrase {seq}; the phrase is transcribed normally instead.",
+        "Nothing to do unless it repeats; then copy the details for the developer."),
+    "audio_device_enumeration_failed": (
+        "The list of sound devices could not be read",
+        "Windows' audio system (PortAudio) didn't answer, so device lists may be empty.",
+        "Unplug and re-plug USB audio devices, or restart the app."),
 }
 
 # General explanations by Python error type, for events not listed above
@@ -556,32 +578,80 @@ ERROR_KIND_HELP = {
 }
 
 
+class _Blank(dict):
+    """For str.format_map: a {field} the log line doesn't have shows as '?'."""
+    def __missing__(self, key):
+        return "?"
+
+
+# Log fields that are noise in an explanation (who logged, internal ids)
+_DETAIL_SKIP = {"exception_type", "exception_message", "session_id", "run_id", "process",
+                "thread", "logger", "message", "ts", "event", "level"}
+
+
+def _describe_fields(fields, limit=12):
+    """The facts logged with a problem, one 'name: value' per line, so the
+    explanation shows WHAT was involved (file, device, language …)."""
+    lines = []
+    for key, value in fields.items():
+        if key in _DETAIL_SKIP or value in (None, "", [], {}):
+            continue
+        text = str(value)
+        lines.append(f"{key.replace('_', ' ')}: {text[:200] + '…' if len(text) > 200 else text}")
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines)
+
+
+def _where(exc_info):
+    """Where the error happened: the last line of the app's own code (which
+    is what a developer opens first) and, if different, the library line
+    that actually raised it."""
+    if not exc_info or exc_info[2] is None:
+        return ""
+    tb = traceback.extract_tb(exc_info[2])
+    if not tb:
+        return ""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    ours = [f for f in tb if os.path.dirname(os.path.abspath(f.filename)) == app_dir]
+    last = tb[-1]
+    describe = lambda f: f"{os.path.basename(f.filename)} line {f.lineno} (in {f.name})"
+    if ours and ours[-1] is not last:
+        lib = os.path.relpath(last.filename, app_dir) if "site-packages" not in last.filename \
+              else last.filename.split("site-packages")[-1].strip("\\/")
+        return f"{describe(ours[-1])}, inside the library {lib} line {last.lineno}"
+    return describe(last)
+
+
 def explain_issue(event, fields=None, exc_info=None):
     """Plain-language description of a logged problem: dict with title,
-    meaning, action, technical (the Python error) and where (file:line)."""
+    meaning, action, technical (the Python error), where (file:line) and
+    details (the facts logged with it). ISSUE_HELP texts may name fields in
+    braces, e.g. "{device}", which are filled in from the log line."""
     fields = fields or {}
     kind = fields.get("exception_type") or ""
     message = fields.get("exception_message") or fields.get("error") or ""
     if not message and fields.get("problems"):
         message = "; ".join(map(str, fields["problems"]))
-    where = ""
-    if exc_info and exc_info[2] is not None:
-        tb = traceback.extract_tb(exc_info[2])
-        if tb:
-            frame = tb[-1]
-            where = f"{os.path.basename(frame.filename)}, line {frame.lineno}, in {frame.name}"
+    where = _where(exc_info)
+    general = ERROR_KIND_HELP.get(kind)
     if event in ISSUE_HELP:
-        title, meaning, action = ISSUE_HELP[event]
+        title, meaning, action = (s.format_map(_Blank(fields)) for s in ISSUE_HELP[event])
+        if general and general not in meaning:
+            meaning += f" (Python reported {kind}: {general}.)"
     else:
         title = event.replace("_", " ").capitalize()
-        general = ERROR_KIND_HELP.get(kind)
-        meaning = (f"Something went wrong: {general}." if general
-                   else "Something went wrong in the app.")
-        action = ("If it keeps happening, restart the app. Use Diagnostics → Copy "
-                  "to send the details to the developer.")
+        part = event.split("_")[0]
+        meaning = (f"The '{part}' part of the app reported a problem: {general}." if general
+                   else f"The '{part}' part of the app logged '{event}' as a problem. There is "
+                        "no specific explanation for this message yet; the details below "
+                        "show what was involved.")
+        action = ("If it keeps happening, restart the app. Copy the details (Copy button) "
+                  "to send to the developer; the log file has the full record.")
     technical = f"{kind}: {message}" if kind else message
     return {"title": title, "meaning": meaning, "action": action,
-            "technical": technical.strip(": "), "where": where}
+            "technical": technical.strip(": "), "where": where,
+            "details": _describe_fields(fields)}
 
 
 def log_exception(event: str, exc: Exception, **fields):
@@ -781,6 +851,12 @@ MAIN_MODEL_PREVIEW_INTERVAL_SEC = 0.45   # preview cadence when a large main mod
 # the speech threshold is lower (singing scores lower than speech).
 MUSIC_SILENCE_SEC    = 0.9
 MUSIC_MAX_PHRASE_SEC = 15
+# ...but once a sung phrase is this long, a shorter gap (a breath between
+# lines) ends it. Without this a quarter of sung phrases ran to the 15 s
+# limit and were cut mid-word, and a forced cut can't use the early final:
+# measured ~1.4 s from the end of singing to the text.
+MUSIC_SOFT_PHRASE_SEC  = 6
+MUSIC_SOFT_SILENCE_SEC = 0.4
 MUSIC_VAD_DROP       = 0.15
 VOICE_GAP_DB         = 12     # separated voice this close to the mix = singing
 MIN_PHRASE_SEC   = 0.5     # shorter clips are mostly silence and make Whisper hallucinate
@@ -1967,6 +2043,8 @@ class AudioCaptureThread(threading.Thread):
         speech_limits = (silence_blocks_needed, max_phrase_blocks)
         music_limits  = (max(1, int(MUSIC_SILENCE_SEC * blocks_per_sec)),
                          int(MUSIC_MAX_PHRASE_SEC * blocks_per_sec))
+        music_soft_blocks = int(MUSIC_SOFT_PHRASE_SEC * blocks_per_sec)
+        music_soft_silence_blocks = max(1, int(MUSIC_SOFT_SILENCE_SEC * blocks_per_sec))
         # Every second, the last second of audio goes to the music detector
         # (music.MusicScene.feed), so it can switch within ~2 s, also when
         # nothing is said and no phrase arrives.
@@ -2160,6 +2238,8 @@ class AudioCaptureThread(threading.Thread):
             silence_blocks_needed, max_phrase_blocks = music_limits if in_music else speech_limits
             if in_music:
                 speech_threshold = max(0.15, speech_threshold - MUSIC_VAD_DROP)
+                if len(phrase_blocks) >= music_soft_blocks:
+                    silence_blocks_needed = music_soft_silence_blocks
             # Hysteresis: easier to stay in speech than to enter it, so brief
             # dips inside words don't end the phrase.
             speaking = speech_probability >= (speech_threshold - VAD_HYSTERESIS if in_speech else speech_threshold)
@@ -3005,6 +3085,7 @@ class TranscriptionWorker(threading.Thread):
         self.music_scene  = None            # music.MusicScene (set by the window)
         self._skip_context = False          # True while decoding a phrase in music mode
         self._last_vocals  = None           # separated voice of the last phrase (saved by _record)
+        self._sep_cache    = {}             # vocal separation done ahead for the phrase in progress
         # Automatic language detection (set by the window) and the target
         # language code (a phrase already in it needs no translation)
         self.auto_language = True
@@ -3718,9 +3799,12 @@ class TranscriptionWorker(threading.Thread):
             out = scene.judge(audio_np)
             if out.get("music_mode") and scene.separator is not None:
                 t0 = time.perf_counter()
-                voice = scene.separator.separate(audio_np)
+                voice = scene.separator.separate(audio_np, cache=self._sep_cache)
                 peak = float(np.abs(voice).max()) if len(voice) else 0.0
                 out["separation_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                # chunks separated ahead of time while the phrase was still going
+                out["separation_reused"] = f"{self._sep_cache.get('reused', 0)}/" \
+                                           f"{self._sep_cache.get('chunks', 0)}"
                 # Level kept (voice) vs removed (music), in dBFS
                 rms = lambda x: 10 * np.log10(float(np.mean(x ** 2)) + 1e-12)
                 out["voice_db"], out["music_removed_db"] = (round(rms(voice), 1),
@@ -3806,6 +3890,23 @@ class TranscriptionWorker(threading.Thread):
                                               round((time.perf_counter() - t0) * 1000, 2))))
         except Exception as e:
             log_exception("partial_transcription_failed", e, worker_id=self.wid, seq=seq)
+        self._prefetch_separation(audio_np if "audio_np" in locals() else None)
+
+    def _prefetch_separation(self, audio_np):
+        """Music mode, while a phrase is still going: separate the voice of
+        one more finished 6 s chunk now (~0.3 s), so the phrase's final
+        transcription only has its last chunk left to do."""
+        scene = self.music_scene
+        if audio_np is None or scene is None or not scene.active or scene.separator is None \
+                or self.phrase_queue.qsize():
+            return
+        try:
+            t0 = time.perf_counter()
+            if scene.separator.prefetch(audio_np, self._sep_cache):
+                self._stats.add("separation_prefetch_ms", (time.perf_counter() - t0) * 1000)
+        except Exception as e:
+            self._sep_cache = {}
+            log_exception("separation_prefetch_failed", e, worker_id=self.wid)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

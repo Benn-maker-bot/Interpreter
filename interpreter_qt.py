@@ -140,7 +140,8 @@ class IssueHandler(logging.Handler):
             help_ = core.explain_issue(event, fields, record.exc_info)
         except Exception:
             help_ = {"title": event, "meaning": "", "action": "",
-                     "technical": str(fields.get("exception_message", "")), "where": ""}
+                     "technical": str(fields.get("exception_message", "")), "where": "",
+                     "details": ", ".join(f"{k}={v}" for k, v in fields.items())[:500]}
         # (time, level, event, short detail, plain-language explanation)
         self.sink.append((time.strftime("%H:%M:%S"), record.levelname, event,
                           help_["technical"][:160], help_))
@@ -1289,6 +1290,9 @@ class QtInterpreterApp(FluentWindow):
                      f"  What to do:    {h['action']}"]
             if h.get("technical"):
                 lines.append(f"  Technical:     {h['technical']}")
+            if h.get("details"):
+                pad = "\n" + " " * 17
+                lines.append("  Details:       " + h["details"].replace("\n", pad))
             if h.get("where"):
                 lines.append(f"  Where:         {h['where']}  (log event: {ev})")
             else:
