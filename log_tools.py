@@ -144,7 +144,7 @@ def _row(label, values, unit="ms"):
             f"p95={_pct(vals, .95):>8.1f}  max={max(vals):>8.1f} {unit}")
 
 
-def build_report(since=None):
+def build_report(since: str | None = None) -> str:
     """Latency/efficiency breakdown of the speech -> text -> translation
     pipeline from the phrase_trace, phrase_displayed and *_stats log lines.
     `since` is an ISO prefix such as '2026-10-31T14:00' (UTC offset as logged)."""
@@ -767,6 +767,8 @@ def build_trend(since=None):
     days = {}
 
     def day(entry, sim):
+        """The counters for this entry's day and source (real use or simulation),
+        created empty the first time."""
         d = days.setdefault((entry["ts"][:10], "simulation" if sim else "real use"),
                             {"sessions": set(), "phrases": 0, "empty": 0, "retried": 0,
                              "forced_cut": 0, "lang_changes": 0, "music": 0, "pause_to_text": [],

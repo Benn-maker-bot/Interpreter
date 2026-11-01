@@ -1,5 +1,5 @@
 """
-Simulator window — watch and hear a simulation run (simulate.py) live
+Simulator window - watch and hear a simulation run (simulate.py) live
 =====================================================================
 
 Runs the same simulation as simulate.py through the real pipeline, in a
@@ -141,6 +141,8 @@ class AudioMonitor(threading.Thread):
     AHEAD = int(0.08 * RATE)                      # keep at most 80 ms queued
 
     def __init__(self, playlist, device_index, volume):
+        """playlist: the clips being simulated; device_index: the output to
+        play them on; volume: 0..1 (changed live by the slider)."""
         super().__init__(daemon=True, name="sim-monitor")
         self.playlist, self.device_index = playlist, device_index
         self.volume = volume                      # 0..1, changed live by the slider
@@ -170,6 +172,10 @@ class AudioMonitor(threading.Thread):
         return stream, rate, channels
 
     def run(self):
+        """Thread: open the device and keep writing the playlist's audio,
+        always at the sample the simulation is up to (resampled and copied
+        to stereo if the device needs it). Errors are logged and kept in
+        self.error, which the window shows."""
         import soxr
         pa = real_pyaudio.PyAudio()
         stream = None
@@ -231,6 +237,8 @@ class SimulatorWindow(FluentWindow):
                     "Recognised"]
 
     def __init__(self):
+        """Set up the state, list the audio devices (before the simulator swaps
+        in its fake sound card), build both pages and start the update timers."""
         super().__init__()
         self.setWindowTitle("Interpreter Simulator")
         import uuid
@@ -289,6 +297,7 @@ class SimulatorWindow(FluentWindow):
             set_colour(self.status_label, WARN)
 
     def _reset_run_state(self):
+        """Forget the previous run's phrases, previews and scores."""
         self._finals, self._previews, self._scored = [], [], 0
         self._shown_clip = -1
         self._run_started = None
@@ -307,6 +316,7 @@ class SimulatorWindow(FluentWindow):
 
     @staticmethod
     def _combo(items, current=None, min_width=None):
+        """A drop-down list with `items`, `current` selected, at least min_width wide."""
         c = ComboBox()
         c.addItems(list(items))
         if current in items:
@@ -330,6 +340,9 @@ class SimulatorWindow(FluentWindow):
 
     def _build_page(self):
         # The page scrolls if the screen is too short for it
+        """Build the Simulator page, top to bottom: test settings card, listen
+        row, now-playing card, meters, then text panes and results table
+        (split by a draggable bar) and the status line."""
         scroll = SmoothScrollArea()
         scroll.setObjectName("simulatorPage")
         scroll.setWidgetResizable(True)
@@ -545,6 +558,7 @@ class SimulatorWindow(FluentWindow):
                 pa.terminate()
 
     def _set_columns(self, live):
+        """Empty the results table and give it the clip or live-phrase columns."""
         cols = self.LIVE_COLUMNS if live else self.CLIP_COLUMNS
         self.table.clear()
         self.table.setRowCount(0)
@@ -556,6 +570,8 @@ class SimulatorWindow(FluentWindow):
         header.setSectionResizeMode(len(cols) - 1, QHeaderView.Stretch)
 
     def _build_issues_page(self):
+        """Build the Issues page: grouped warnings/errors with explanations,
+        and a Copy button."""
         page = QWidget()
         page.setObjectName("issuesPage")
         v = QVBoxLayout(page)
@@ -606,6 +622,7 @@ class SimulatorWindow(FluentWindow):
                 layout.itemAt(0).widget().setVisible(visible)
 
     def _layout_of(self, widget):
+        """The small caption+control layout in the settings card holding widget."""
         grid = self.page.widget().layout().itemAt(0).widget().layout()
         for i in range(grid.count()):
             item = grid.itemAt(i)
@@ -632,6 +649,8 @@ class SimulatorWindow(FluentWindow):
     # ── Starting and stopping ────────────────────────────────────────────
 
     def _args(self):
+        """Turn the window's settings into the options simulate.run() expects
+        (the same ones as simulate.py's command line)."""
         data = DATA_CHOICES[self.data_combo.currentText()]
         limit = self.limit_combo.currentText()
         args = argparse.Namespace(
@@ -650,6 +669,8 @@ class SimulatorWindow(FluentWindow):
         return args
 
     def _start(self):
+        """Start button: check the settings, clear the previous results, and run
+        the simulation in a background thread that reports back via events."""
         args = self._args()
         live = args.data == "live"
         if not live:
@@ -682,6 +703,7 @@ class SimulatorWindow(FluentWindow):
             self._level = reading
 
         def work():
+            """Background thread: run the whole simulation and report the result."""
             try:
                 rows, path, wall = S.run(args, lambda k, d: self._events.put((k, d)),
                                          self._stop_evt, level_cb)
@@ -735,6 +757,8 @@ class SimulatorWindow(FluentWindow):
         return None
 
     def _stop(self):
+        """Stop button: ask the simulation to finish; it scores and saves what
+        has played so far."""
         if self._stop_evt is not None:
             log_event(logging.INFO, "sim_gui_stop_pressed", clips_scored=self._scored)
             self._stop_evt.set()
@@ -747,17 +771,21 @@ class SimulatorWindow(FluentWindow):
         return 0.0 if self.mute_btn.isChecked() else self.volume_slider.value() / 100
 
     def _on_volume(self, *_):
+        """Volume slider or Mute changed: apply at once and remember it."""
         if self._monitor is not None:
             self._monitor.volume = self._volume()
         save_settings(sim_volume=self.volume_slider.value())
 
     def _on_output_change(self, label):
+        """A different 'Listen on' device: remember it, and switch the
+        playback to it at once if a simulation is running."""
         save_settings(sim_output=label)
         log_event(logging.INFO, "sim_output_changed", output=label)
         if self.playlist is not None and self._thread is not None and self._thread.is_alive():
             self._start_monitor()
 
     def _start_monitor(self):
+        """(Re)start playing the clips on the chosen output device."""
         if self._monitor is not None:
             self._monitor.stop()
             self._monitor = None
@@ -794,6 +822,9 @@ class SimulatorWindow(FluentWindow):
             log_exception("sim_gui_update_failed", e)
 
     def _tick_once(self):
+        """Handle everything the simulation has sent since the last tick (status,
+        previews, finals, translations, done), update the meters, progress
+        and scores."""
         for _ in range(200):                     # bounded: keep the window responsive
             try:
                 kind, data = self._events.get_nowait()
@@ -844,6 +875,7 @@ class SimulatorWindow(FluentWindow):
                 self._score_finished_clips()
 
     def _started(self, playlist):
+        """The clips have started playing (or live recording has begun)."""
         self._run_started = time.monotonic()
         self._last_level_t = self._run_started
         self.playlist = playlist
@@ -860,11 +892,14 @@ class SimulatorWindow(FluentWindow):
                                   f"({playlist.duration / 60:.1f} min).")
 
     def _show_live_progress(self):
+        """Live mode: elapsed time and number of phrases so far."""
         t = time.monotonic() - self._run_started
         phrases = sum(1 for f in self._finals if f["text"])
         self.time_label.setText(f"{int(t // 60)}:{int(t % 60):02d}  ·  {phrases} phrases")
 
     def _show_progress(self):
+        """Progress bar and time, and which clip is playing now (shown with its
+        correct text, and logged, when it changes)."""
         p = self.playlist
         t = time.monotonic() - p.t0
         self.progress.setValue(int(1000 * min(1.0, t / p.duration)))
@@ -903,6 +938,7 @@ class SimulatorWindow(FluentWindow):
     # ── Results table ────────────────────────────────────────────────────
 
     def _put_row(self, cells, tooltip):
+        """Add one row to the results table: cells are (text, colour or None)."""
         n = self.table.rowCount()
         self.table.insertRow(n)
         for c, (text, colour) in enumerate(cells):
@@ -916,11 +952,14 @@ class SimulatorWindow(FluentWindow):
 
     @staticmethod
     def _latency_cell(ms):
+        """A pause -> text time as a table cell, coloured green/amber/red."""
         if ms is None:
-            return "—", MUTED
+            return "-", MUTED
         return f"{ms} ms", OK if ms < 800 else WARN if ms < 1500 else BAD
 
     def _add_clip_row(self, r):
+        """Add a scored clip to the table (and the log): detected language,
+        gain, word error rate, delay, music mode, recognised text."""
         n = self.table.rowCount()
         wer = min(r["errors"], r["ref_words"]) / r["ref_words"] if r["ref_words"] else 0
         clip = self.playlist.clips[n] if self.playlist and n < len(self.playlist.clips) else {}
@@ -932,29 +971,31 @@ class SimulatorWindow(FluentWindow):
             log_event(logging.WARNING, "sim_wrong_language", clip=n + 1, file=r["file"],
                       lang=r["lang"], detected=r["detected"], heard=r["hyp"][:120])
         cells = [(str(n + 1), None), (r["file"], None), (r["lang"], None),
-                 (r["detected"] or "—", OK if r["detected"] == r["lang"] else BAD),
-                 (f"{gain:+.0f} dB" if gain is not None else "—", None),
+                 (r["detected"] or "-", OK if r["detected"] == r["lang"] else BAD),
+                 (f"{gain:+.0f} dB" if gain is not None else "-", None),
                  (f"{wer:.0%}", OK if wer < 0.1 else WARN if wer < 0.25 else BAD) if r["ref_words"]
-                 else ("—", MUTED),
+                 else ("-", MUTED),
                  self._latency_cell(r["latency_ms"]),
                  ("on" if r["music_mode"] else "off", None), (r["hyp"] or "(nothing)", None)]
         self._put_row(cells, f"Correct: {r['ref']}\nHeard: {r['hyp']}\nTranslation: {r['translation']}")
 
     def _add_live_row(self, r):
+        """Add a live phrase to the table and update the live totals."""
         n = self.table.rowCount()
-        cells = [(str(n + 1), None), (time.strftime("%H:%M:%S"), None), (r["detected"] or "—", None),
+        cells = [(str(n + 1), None), (time.strftime("%H:%M:%S"), None), (r["detected"] or "-", None),
                  self._latency_cell(r["latency_ms"]),
-                 (f"{r['audio_sec']:.1f} s" if r["audio_sec"] else "—", None),
-                 ("on" if r["music_mode"] else "off", None), (r["engine"] or "—", None),
+                 (f"{r['audio_sec']:.1f} s" if r["audio_sec"] else "-", None),
+                 ("on" if r["music_mode"] else "off", None), (r["engine"] or "-", None),
                  (r["hyp"], None)]
         self._put_row(cells, f"Heard: {r['hyp']}\nTranslation: {r['translation']}")
         rows = S.live_rows(self._finals)
         lat = [x["latency_ms"] for x in rows if x["latency_ms"] is not None]
         langs = sorted({x["detected"] for x in rows if x["detected"]})
-        self.totals_label.setText(f"{len(rows)} phrases  ·  languages heard: {', '.join(langs) or '—'}"
-                                  f"  ·  end → text median {int(np.median(lat)) if lat else '—'} ms")
+        self.totals_label.setText(f"{len(rows)} phrases  ·  languages heard: {', '.join(langs) or '-'}"
+                                  f"  ·  end → text median {int(np.median(lat)) if lat else '-'} ms")
 
     def _show_totals(self, rows):
+        """The totals line above the table for the clips scored so far."""
         if not rows:
             return
         # Reported phrases may have no correct text (then no word error rate)
@@ -964,10 +1005,12 @@ class SimulatorWindow(FluentWindow):
         lat = [r["latency_ms"] for r in rows if r["latency_ms"] is not None]
         self.totals_label.setText(
             f"{len(rows)} clips  ·  language right {ok}/{len(rows)}  ·  "
-            f"WER {f'{errs / words:.0%}' if words else '—'}  ·  "
-            f"pause → text median {int(np.median(lat)) if lat else '—'} ms")
+            f"WER {f'{errs / words:.0%}' if words else '-'}  ·  "
+            f"pause → text median {int(np.median(lat)) if lat else '-'} ms")
 
     def _finished(self, rows, path, wall, error=None):
+        """The simulation ended (finished, stopped or failed): stop playback,
+        add any remaining rows, show where the results were saved."""
         if self._monitor is not None:
             self._monitor.stop()
             self._monitor = None
@@ -1000,6 +1043,8 @@ class SimulatorWindow(FluentWindow):
         self._run_started = None
 
     def closeEvent(self, event):
+        """Window closing: stop the simulation and playback, give the run up to
+        5 s to save its results."""
         try:
             running = self._thread is not None and self._thread.is_alive()
             log_event(logging.INFO, "sim_gui_closing", session_id=self.session_id, running=running)
@@ -1015,6 +1060,8 @@ class SimulatorWindow(FluentWindow):
 
 
 def main():
+    """Start the simulator window: catch crashes in the log, dark theme,
+    run until the window closes."""
     core.install_global_exception_hooks()
     log_event(logging.INFO, "app_main_start", gui="simulator")
     app = QApplication(sys.argv)
