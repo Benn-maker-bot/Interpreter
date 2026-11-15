@@ -145,8 +145,8 @@ from interpreter import (LANGUAGES, MODELS, get_audio_devices, find_best_output_
                          load_settings, save_settings, log_event, log_exception)
 # From the interpreter's Fluent window: the issue collector, the two meters,
 # the label-colouring helper and the four status colours.
-from interpreter_qt import (QtInterpreterApp, IssueHandler, LevelMeter, SpeechMeter, set_colour,
-                            OK, WARN, BAD, MUTED)
+from interpreter_qt import (QtInterpreterApp, PaneText, IssueHandler, LevelMeter, SpeechMeter,
+                            set_colour, OK, WARN, BAD, MUTED)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings
@@ -442,15 +442,15 @@ class SimulatorWindow(FluentWindow):
 
     # ── Borrowed from the interpreter window ────────────────────────────
     # PYTHON: a method is just a function stored in a class, so it can be
-    # copied into another class. These come from QtInterpreterApp and work
+    # copied into another class. These come from interpreter_qt.py and work
     # here because this class has the attributes they use.
-    # The live-preview / final-text display (needs self.heard_box, self._live
-    # and self._last_preview_words):
-    _fmt, _set_live, _commit = QtInterpreterApp._fmt, QtInterpreterApp._set_live, QtInterpreterApp._commit
+    # The live-preview / final-text display (PaneText; needs self.heard_box,
+    # self._live and self._last_preview_words):
+    _fmt, _set_live, _commit = PaneText._fmt, PaneText._set_live, PaneText._commit
     # Static methods must stay static when copied, so they are wrapped in staticmethod().
-    _at_bottom = staticmethod(QtInterpreterApp._at_bottom)
-    _follow = staticmethod(QtInterpreterApp._follow)
-    _trim = staticmethod(QtInterpreterApp._trim)
+    _at_bottom = staticmethod(PaneText._at_bottom)
+    _follow = staticmethod(PaneText._follow)
+    _trim = staticmethod(PaneText._trim)
     # Warnings and errors: grouped on the Issues page, first of each kind pops up.
     _refresh_issues = QtInterpreterApp._refresh_issues
     _render_issue_groups = QtInterpreterApp._render_issue_groups

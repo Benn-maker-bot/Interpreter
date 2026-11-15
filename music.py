@@ -834,19 +834,25 @@ class MusicScene:
             voice = scene.separator.separate(phrase)
     """
 
-    def __init__(self, enabled=True, separate=True, log=None):
+    def __init__(self, enabled=True, separate=True, log=None, models_from=None):
         """Create the music scene and start loading the models in the background.
 
         Inputs:
-            enabled   bool (default True). False = never detect music (music
-                      mode switched off in the settings).
-            separate  bool (default True). False = detect music but don't
-                      remove the instruments.
-            log       a function to write log lines with, called as
-                      log("event_name", field=value, …). Default None = a
-                      function that does nothing.
+            enabled      bool (default True). False = never detect music (music
+                         mode switched off in the settings).
+            separate     bool (default True). False = detect music but don't
+                         remove the instruments.
+            log          a function to write log lines with, called as
+                         log("event_name", field=value, …). Default None = a
+                         function that does nothing.
+            models_from  another MusicScene whose models to share (default
+                         None = load our own). The interpreter listens to two
+                         audio sources at once; each needs its own scene (its
+                         own "is music playing?" decision), but both can use
+                         one copy of the models, which saves memory and time.
 
         This returns immediately; the models load in a separate thread (_load).
+        `loaded` is set once loading has finished (or failed).
         """
         # Two attributes set in one line from the two parameters.
         self.enabled, self.want_separation = enabled, separate
@@ -868,13 +874,41 @@ class MusicScene:
         # PYTHON: a LOCK makes threads take turns. "with self._lock:" waits until
         # no other thread is inside a block guarded by the same lock.
         self._lock = threading.Lock()
-        if enabled:
+        # PYTHON: an EVENT is a flag that threads can wait for: loaded.wait()
+        # blocks until another thread calls loaded.set().
+        self.loaded = threading.Event()
+        if enabled and models_from is not None:
+            # Share the other scene's models once it has finished loading them.
+            threading.Thread(target=self._borrow_models, args=(models_from,),
+                             name="music-models-share", daemon=True).start()
+        elif enabled:
             # PYTHON: threading.Thread(target=f) prepares a thread that will run f;
             # .start() starts it. The rest of the program carries on immediately.
             # daemon=True: this thread won't keep the program open when it closes.
             threading.Thread(target=self._load, name="music-models", daemon=True).start()
+        else:
+            self.loaded.set()               # nothing to load
+
+    def _borrow_models(self, source):
+        """Wait until `source` has loaded its models, then use the same ones
+        (runs in a background thread). The models only read their settings
+        while working, and onnxruntime lets several threads run one model,
+        so two scenes can safely share them."""
+        source.loaded.wait()
+        self.classifier, self.separator, self.error = (source.classifier, source.separator,
+                                                       source.error)
+        self.loaded.set()
+        self._log("music_models_shared", classifier=self.classifier is not None,
+                  separator=self.separator is not None)
 
     def _load(self):
+        """Load the models, then set `loaded` (also if loading failed)."""
+        try:
+            self._load_models()
+        finally:
+            self.loaded.set()
+
+    def _load_models(self):
         """Load the models (runs in a background thread).
 
         Steps:

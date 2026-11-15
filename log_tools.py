@@ -425,9 +425,15 @@ def build_report(since: str | None = None) -> str:
         # "A if condition else B" picks the unit.
         out.append(_row(k + " (max)", [w[k]["max"] for w in capture_stats if isinstance(w.get(k), dict)],
                         "frames" if k == "backlog_frames" else "ms"))
-    out.append(_row("level p50", [w["level_dbfs"]["p50"] for w in capture_stats
-                                  if isinstance(w.get("level_dbfs"), dict)], "dBFS"))
-    out.append(_row("speech frames", column(capture_stats, "speech_pct"), "%"))
+    # Level and speech share per channel: a microphone and a call's audio
+    # have very different levels, so mixing them would mean nothing.
+    # (Logs from before channels existed have no "channel": shown as one.)
+    for channel in sorted({w.get("channel") or "" for w in capture_stats}):
+        windows = [w for w in capture_stats if (w.get("channel") or "") == channel]
+        tag = f" [{channel}]" if channel else ""
+        out.append(_row("level p50" + tag, [w["level_dbfs"]["p50"] for w in windows
+                                            if isinstance(w.get("level_dbfs"), dict)], "dBFS"))
+        out.append(_row("speech frames" + tag, column(windows, "speech_pct"), "%"))
 
     # ── Step 6: CPU, memory, GPU and how promptly the window updates.
     resource_stats = by_event.get("resource_stats", [])
@@ -466,12 +472,16 @@ def build_report(since: str | None = None) -> str:
     if sensitivity_changes:
         out.append("\nSensitivity changes vs measured input level (capture level p50, dBFS)")
         for e in sensitivity_changes:
-            before = [w for w in capture_stats if w["ts"] < e["ts"] and isinstance(w.get("level_dbfs"), dict)]
-            after = [w for w in capture_stats if w["ts"] > e["ts"] and isinstance(w.get("level_dbfs"), dict)]
+            # Only the windows of the channel whose slider moved
+            same = [w for w in capture_stats if w.get("channel") == e.get("channel")
+                    and isinstance(w.get("level_dbfs"), dict)]
+            before = [w for w in same if w["ts"] < e["ts"]]
+            after = [w for w in same if w["ts"] > e["ts"]]
             # The last window before, and the first window after the change.
             level_before = before[-1]["level_dbfs"]["p50"] if before else None
             level_after = after[0]["level_dbfs"]["p50"] if after else None
-            out.append(f"  {e['ts'][11:19]}  sensitivity={e.get('value')}  "
+            who = f"[{e['channel']}] " if e.get("channel") else ""
+            out.append(f"  {e['ts'][11:19]}  {who}sensitivity={e.get('value')}  "
                        f"threshold={e.get('vad_threshold')}  level before={level_before}  after={level_after}")
 
     # ── Step 8: automatic findings. Each rule checks for a known problem
@@ -550,14 +560,18 @@ def build_report(since: str | None = None) -> str:
     silences = by_event.get("source_silent", [])
     resumed = by_event.get("source_resumed", [])
     if silences:
-        out.append("\nSource silent (no sound reached the device for 5 s or more)")
+        out.append("\nSource silent (no sound reached the device for 5 s or more;"
+                   " microphones only after 60 s)")
         for e in silences[-8:]:
             # PYTHON: next((x for x in list if condition), None) finds the FIRST
-            # matching item, or None if there is none. Here: when sound came back.
-            back = next((r for r in resumed if r["ts"] > e["ts"]), None)
+            # matching item, or None if there is none. Here: when sound came back
+            # on the SAME channel (two channels can go silent independently).
+            back = next((r for r in resumed if r["ts"] > e["ts"]
+                         and r.get("channel") == e.get("channel")), None)
             until = f"{back['ts'][11:19]} ({back.get('silent_sec')} s)" if back else "end of log"
             apps = ", ".join(a["app"] for a in e.get("playing_apps", []) if "app" in a)
-            out.append(f"  {e['ts'][11:19]}  silent until {until}; "
+            who = f"[{e['channel']}] " if e.get("channel") else ""
+            out.append(f"  {e['ts'][11:19]}  {who}silent until {until}; "
                        f"apps with sound sessions: {apps or 'none'}")
         flags.append(f"The audio source went silent {len(silences)} time(s): see 'Source silent' above.")
     out.append("\nFindings")
@@ -1170,23 +1184,32 @@ def build_sensitivity(since=None):
     # Adding them all up shows how the scores are spread; for any threshold,
     # the share of scores above it is the share of audio that would count as
     # speech at that setting.
-    hist = [0] * 10
+    # One histogram per channel: each channel has its own sensitivity slider,
+    # and a microphone and a call's audio need different settings.
+    hists: dict[str, list[int]] = {}
     for e in entries:
         if e.get("event") == "capture_stats" and isinstance(e.get("speech_score_histogram"), list):
             # zip pairs up the two lists' counters; add them band by band.
-            hist = [a + b for a, b in zip(hist, e["speech_score_histogram"])]
-    total = sum(hist)
+            # setdefault: the channel's list, created as ten zeros the first time.
+            hist = hists.setdefault(e.get("channel") or "", [0] * 10)
+            hists[e.get("channel") or ""] = [a + b for a, b in zip(hist, e["speech_score_histogram"])]
     out += ["", "3) What-if: share of audible audio that would count as speech at each setting"]
-    if total:
+    if any(sum(h) for h in hists.values()):
         out.append("   (from the speech-score histograms; scores fall into 0.1-wide bins, so"
                    " each value is approximate)")
-        for sens in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0):
-            thr = 0.85 - 0.7 * sens
-            # A band counts if its middle ((i + 0.5) / 10, e.g. 0.55 for band 5)
-            # is at or above the threshold.
-            above = sum(hist[i] for i in range(10) if (i + 0.5) / 10 >= thr)
-            out.append(f"   sensitivity {sens * 100:>3.0f}%  threshold {thr:.2f}  ->"
-                       f" {100 * above / total:5.1f}% of audible audio counted as speech")
+        for channel, hist in sorted(hists.items()):
+            total = sum(hist)
+            if not total:
+                continue
+            if channel:
+                out.append(f"   [{channel}]")
+            for sens in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0):
+                thr = 0.85 - 0.7 * sens
+                # A band counts if its middle ((i + 0.5) / 10, e.g. 0.55 for band 5)
+                # is at or above the threshold.
+                above = sum(hist[i] for i in range(10) if (i + 0.5) / 10 >= thr)
+                out.append(f"   sensitivity {sens * 100:>3.0f}%  threshold {thr:.2f}  ->"
+                           f" {100 * above / total:5.1f}% of audible audio counted as speech")
     else:
         out.append("   (no histograms yet: they are logged from this version on)")
 

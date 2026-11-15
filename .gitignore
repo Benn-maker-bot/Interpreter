@@ -25,4 +25,10 @@ testdata/
 learning/
 
 #Ignore vscode AI rules
-.github\instructions\codacy.instructions.md
+.github/instructions/codacy.instructions.md
+
+# Stray PowerShell data folder
+Microsoft/
+
+# Personal Claude Code permissions (skills and agents ARE committed)
+.claude/settings.local.json

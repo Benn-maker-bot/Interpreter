@@ -972,6 +972,7 @@ EARLY_FINAL_SEC  = 0.1     # "early transcription on silence" (idea from Realtim
                            # ~0.2 s transcription time); if speech resumes it is thrown away.
 SILENCE_FLOOR_DBFS = -65   # below this it's digital silence: skip VAD entirely
 SOURCE_SILENT_SEC  = 5     # this long with no sound at all -> "source_silent" warning
+MIC_SILENT_SEC     = 60    # the same for a microphone (its noise gate is silent in pauses)
 ONSET_PROB       = 0.2     # a speech score this high counts as "possibly speech": the time
                            # from then until the detector actually starts a phrase is logged
                            # as onset_delay_ms (how late, at this sensitivity, speech is noticed)
@@ -1447,6 +1448,29 @@ class TranslationWorker(threading.Thread):
 # sensible defaults (FiiO for output, the FiiO's loopback for Friend mode).
 # ─────────────────────────────────────────────────────────────────────────────
 
+# PortAudio counts how many PyAudio objects are open: it really starts on
+# the first and really shuts down (closing every stream) when the last one
+# is terminated. Updating that count is NOT thread-safe. With two channels,
+# one thread may create a PyAudio object (starting a channel, re-scanning
+# devices) while another thread creates or terminates one; the count can go
+# wrong and PortAudio shuts down under a running stream: a crash. So every
+# PyAudio() and terminate() goes through these two helpers, which take turns
+# using PORTAUDIO_LOCK.
+PORTAUDIO_LOCK = threading.Lock()
+
+
+def portaudio_start():
+    """Create a PyAudio object (starts PortAudio), safely across threads."""
+    with PORTAUDIO_LOCK:
+        return pyaudio.PyAudio()
+
+
+def portaudio_stop(portaudio) -> None:
+    """Terminate a PyAudio object created by portaudio_start()."""
+    with PORTAUDIO_LOCK:
+        portaudio.terminate()
+
+
 def get_device_native_rate(portaudio, device_index) -> int:
     """Return the native sample rate reported by PortAudio for a device.
     Falls back to 44100 if the index is invalid or the query fails."""
@@ -1548,6 +1572,9 @@ def find_best_vb_input(input_devices: Iterable[tuple[int, str]]) -> str | None:
     return None
 
 
+MME_NAME_MAX = 31     # Windows' old MME interface cuts device names to 31 characters
+
+
 def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Return (input_devices, output_devices) as lists of (index, label).
 
@@ -1566,9 +1593,18 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     outputs: list[tuple[int, str]] = []
     seen_in: dict[str, bool] = {}
     seen_out: dict[str, bool] = {}
+
+    def known(name: str, seen: dict[str, bool]) -> bool:
+        """True if this device is already listed. MME cuts names to 31
+        characters ("SPDIF Interface (Realtek USB Au"), so a cut name that
+        starts a name already listed (from WASAPI) is the same device; it
+        used to appear twice in the menus, once with a truncated name."""
+        return name in seen or (len(name) == MME_NAME_MAX
+                                and any(s.startswith(name) for s in seen))
+
     portaudio = None
     try:
-        portaudio = pyaudio.PyAudio()
+        portaudio = portaudio_start()
         # Visit the host APIs best-first (WASAPI first), so the first time we
         # meet a device name it is through the best audio system.
         api_map, pref_order, skip_apis = _get_host_api_map(portaudio)
@@ -1585,7 +1621,7 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
                 # A symbol is put in front of the name to help you spot it:
                 #   speaker = loopback (what an output device is playing),
                 #   microphone = NVIDIA Broadcast, star = VB-Audio virtual cable.
-                if info.get("maxInputChannels", 0) >= 1 and name not in seen_in:
+                if info.get("maxInputChannels", 0) >= 1 and not known(name, seen_in):
                     seen_in[name] = True
                     prefix = "\U0001f50a " if info.get("isLoopbackDevice")           else \
                              "\U0001f3a4 " if any(k in name_lower for k in NVIDIA_KEYWORDS) else \
@@ -1593,7 +1629,7 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
                     inputs.append((i, prefix + name))
                 # A device that can play (has output channels) goes in the output list;
                 # headphone symbol = FiiO, star = VB-Audio cable.
-                if info.get("maxOutputChannels", 0) >= 1 and name not in seen_out:
+                if info.get("maxOutputChannels", 0) >= 1 and not known(name, seen_out):
                     seen_out[name] = True
                     is_fiio = any(k in name_lower for k in FIIO_KEYWORDS)
                     is_vb   = any(k in name_lower for k in VB_KEYWORDS)
@@ -1618,7 +1654,7 @@ def get_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
         if portaudio is not None:
             # Always shut PortAudio down again: a leftover instance makes streams
             # opened later by other threads fail ("Unanticipated host error").
-            portaudio.terminate()
+            portaudio_stop(portaudio)
     # If nothing was found, offer the system defaults (-1 = default device).
     return (inputs or [(-1, "Default Microphone")],
             outputs or [(-1, "Default Output")])
@@ -1669,6 +1705,9 @@ def find_best_output_device(output_devices: Iterable[tuple[int, str]]) -> str | 
     return None
 
 
+KEEPALIVE_ERROR_AFTER_TRIES = 15   # 1 s retries before a failing keep-alive is an error
+
+
 def open_loopback_keepalive(portaudio, loopback_info, attempts=6):
     """Retry with growing waits: PortAudio can stay busy for a second or more
     while a previous session's stream shuts down (seen at 14:51:16)."""
@@ -1705,7 +1744,13 @@ def _open_loopback_keepalive(portaudio, loopback_info, log_failure=True):
         log_event(logging.WARNING, "loopback_keepalive_device_not_found", name=name)
     except Exception as e:
         if log_failure:
-            log_exception("loopback_keepalive_failed", e)
+            # A WARNING, not an error: the capture loop keeps retrying, and it
+            # usually works within seconds. (The RODECaster refuses this
+            # silent output stream for ~5 s while its microphone is already
+            # recording.) It becomes an ERROR after KEEPALIVE_ERROR_AFTER_TRIES.
+            log_event(logging.WARNING, "loopback_keepalive_failed",
+                      exception_type=type(e).__name__, exception_message=str(e),
+                      device=loopback_info.get("name"))
     return None
 
 
@@ -1766,7 +1811,7 @@ class LoopbackOutputThread(threading.Thread):
         """Open the output device and keep writing queued audio blocks to it."""
         if not _PYAUDIO_AVAILABLE:
             return
-        pa     = pyaudio.PyAudio()
+        pa     = portaudio_start()
         stream = None
         try:
             # Probe the actual rate and channel count the device accepts.
@@ -1835,7 +1880,7 @@ class LoopbackOutputThread(threading.Thread):
             if stream:
                 stream.close()
         finally:
-            pa.terminate()
+            portaudio_stop(pa)
         log_event(logging.INFO, "loopback_output_stopped")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1924,9 +1969,13 @@ class AudioCaptureThread(threading.Thread):
                  loopback_out: "LoopbackOutputThread | None" = None,
                  partial_slot: "LatestSlot | None" = None,
                  mute_evt: "threading.Event | None" = None,
-                 early_slot: "LatestSlot | None" = None):
+                 early_slot: "LatestSlot | None" = None,
+                 channel: str = ""):
         """Store settings; the device is opened later, in the thread itself (run).
 
+        channel       name of the channel this device belongs to ("Me",
+                      "Friend"), when the window listens to two devices at
+                      once; added to the thread's name and its log lines.
         device_index  which PortAudio device to record from.
         phrase_queue  where finished phrases are sent as (seq, audio, info).
         status_cb     function to show a status message in the window.
@@ -1935,7 +1984,8 @@ class AudioCaptureThread(threading.Thread):
         partial_slot  where preview audio is placed (LatestSlot).
         mute_evt      while set, audio is replaced by silence (our own speech).
         """
-        super().__init__(daemon=True, name="audio-capture")
+        super().__init__(daemon=True, name=f"audio-capture-{channel}" if channel else "audio-capture")
+        self.channel           = channel
         # device_index: which device to record (PortAudio's number for it).
         # _keepalive: the silence stream for loopback devices (see the class doc).
         # is_loopback: True when recording what an OUTPUT device plays.
@@ -1972,18 +2022,31 @@ class AudioCaptureThread(threading.Thread):
         """The captured device went silent (no app playing) or came back.
         Logs it with the apps that have sound sessions, and tells the user.
         The app list is read on a short-lived thread (Windows audio API
-        calls can take tens of ms; the capture loop must not wait)."""
-        device = getattr(self, "device_label", None) or f"device {self.device_index}"
+        calls can take tens of ms; the capture loop must not wait).
+
+        A microphone is different: its noise gate (or mute) sends exact
+        silence whenever nobody speaks, which is normal. It is reported only
+        after MIC_SILENT_SEC, as information. (On 2026-11-15, 24 of 28
+        warnings in 8 minutes were a RODECaster microphone's pauses.)"""
+        if not self.is_loopback:
+            log_event(logging.INFO, "source_silent" if silent else "source_resumed",
+                      channel=self.channel, device_index=self.device_index,
+                      silent_sec=silent_sec, kind="microphone")
+            self.status_cb(f"🔇 Microphone silent for {silent_sec:.0f} s (muted?)" if silent
+                           else "Listening…")
+            return
 
         def report():
             sessions = audio_sessions_snapshot()
             if silent:
-                log_event(logging.WARNING, "source_silent", device_index=self.device_index,
+                log_event(logging.WARNING, "source_silent", channel=self.channel,
+                          device_index=self.device_index,
                           silent_sec=silent_sec, playing_apps=sessions,
                           hint="no sound reaches the device: the playing app stopped or "
                                "plays to a different device")
             else:
-                log_event(logging.INFO, "source_resumed", device_index=self.device_index,
+                log_event(logging.INFO, "source_resumed", channel=self.channel,
+                          device_index=self.device_index,
                           silent_sec=silent_sec, playing_apps=sessions)
         threading.Thread(target=report, name="source-check", daemon=True).start()
         self.status_cb("🔇 No sound is playing on this device" if silent else "Listening…")
@@ -2021,7 +2084,7 @@ class AudioCaptureThread(threading.Thread):
             meta = dict(meta or {}, reason=label, t_end=time.monotonic())
             self.phrase_queue.put((seq, payload, meta), timeout=0.25)
             backlog = self.phrase_queue.qsize()
-            log_event(logging.INFO, "phrase_flushed",
+            log_event(logging.INFO, "phrase_flushed", channel=self.channel,
                       reason=label, seq=seq, bytes=len(payload),
                       chunks=len(blocks), queue_backlog=backlog)
             if backlog >= PHRASE_QUEUE_BACKLOG_WARN:
@@ -2034,7 +2097,7 @@ class AudioCaptureThread(threading.Thread):
     def run(self):
         """Thread entry point: create PortAudio, run the capture, always clean up."""
         log_event(logging.INFO, "audio_thread_priority", applied=boost_audio_thread())
-        pa     = pyaudio.PyAudio()
+        pa     = portaudio_start()
         try:
             self._run(pa)
         finally:
@@ -2043,7 +2106,7 @@ class AudioCaptureThread(threading.Thread):
                     self._keepalive.close()
                 except Exception:
                     pass
-            pa.terminate()
+            portaudio_stop(pa)
 
     def _run(self, pa):
         """The capture itself: open the device, then loop reading audio blocks.
@@ -2128,7 +2191,7 @@ class AudioCaptureThread(threading.Thread):
             if self.device_index is not None and self.device_index >= 0:
                 kwargs["input_device_index"] = self.device_index
             stream = pa.open(**kwargs)
-            log_event(logging.INFO, "audio_stream_opened",
+            log_event(logging.INFO, "audio_stream_opened", channel=self.channel,
                       device_index=self.device_index,
                       open_rate=open_rate, chunk_sz=chunk_sz)
         except Exception as e:
@@ -2180,7 +2243,8 @@ class AudioCaptureThread(threading.Thread):
         phrase_blocks, phrase_speech_probs = [], []  # the current phrase's audio blocks and the
                                                      # VAD speech score of each block
         chunk_sec     = chunk_sz / open_rate  # duration of one block, in seconds
-        source_silent_blocks = int(SOURCE_SILENT_SEC / chunk_sec)
+        silent_report_sec = SOURCE_SILENT_SEC if self.is_loopback else MIC_SILENT_SEC
+        source_silent_blocks = int(silent_report_sec / chunk_sec)
         stats         = PerfWindow()          # timings for the capture_stats log line
         last_read_t   = None                  # when the previous block was read
         speech_frames = frames = 0            # blocks judged speech / all blocks (for stats)
@@ -2285,7 +2349,14 @@ class AudioCaptureThread(threading.Thread):
                     next_keepalive_try = time.monotonic() + 1.0
                     if self._keepalive is not None:
                         log_event(logging.INFO, "loopback_keepalive_restored",
-                                  retries=keepalive_tries)
+                                  channel=self.channel, retries=keepalive_tries)
+                    elif keepalive_tries == KEEPALIVE_ERROR_AFTER_TRIES:
+                        # Not a passing hiccup any more: now it is an error.
+                        log_event(logging.ERROR, "loopback_keepalive_still_failing",
+                                  channel=self.channel, device_index=self.device_index,
+                                  retries=keepalive_tries,
+                                  hint="no sound arrives from this output device while "
+                                       "nothing plays on it; still retrying every second")
                 try:
                     if stream.get_read_available() < chunk_sz:
                         time.sleep(0.005)
@@ -2314,7 +2385,7 @@ class AudioCaptureThread(threading.Thread):
                     log_exception("audio_stream_read_failed", e)
                 if read_failures >= MAX_READ_FAILURES:
                     self.failed = f"audio device stopped responding: {e}"
-                    log_event(logging.ERROR, "audio_capture_failed",
+                    log_event(logging.ERROR, "audio_capture_failed", channel=self.channel,
                               device_index=self.device_index, failures=read_failures,
                               error=str(e))
                     self.status_cb("⚠ Audio device stopped responding - reconnecting…")
@@ -2387,13 +2458,14 @@ class AudioCaptureThread(threading.Thread):
                 silent_frames += 1
                 silent_run += 1
                 if silent_run == source_silent_blocks:
-                    self._report_source(silent=True, silent_sec=SOURCE_SILENT_SEC)
+                    self._report_source(silent=True, silent_sec=silent_report_sec)
             else:
                 if silent_run >= source_silent_blocks:
                     self._report_source(silent=False, silent_sec=round(silent_run * chunk_sec, 1))
                 silent_run = 0
             if stats.due():
-                log_event(logging.INFO, "capture_stats", device_index=self.device_index,
+                log_event(logging.INFO, "capture_stats", channel=self.channel,
+                          device_index=self.device_index,
                           chunk_ms=round(chunk_sec * 1000, 1),
                           speech_pct=round(100 * speech_frames / max(1, frames), 1),
                           silent_pct=round(100 * silent_frames / max(1, frames), 1),
@@ -3353,9 +3425,11 @@ class TranscriptionWorker(threading.Thread):
                  partial_slot: "LatestSlot | None" = None,
                  preview_model=None, run_id=0, record_audio=False, translator=None,
                  early_slot: "LatestSlot | None" = None, session_id: str = "",
-                 config: "dict | None" = None):
+                 config: "dict | None" = None, channel: str = ""):
         """Store everything the worker needs for one listening session.
 
+        channel        name of the channel ("Me", "Friend") when the window
+                       listens to two devices; saved in every phrase_trace.
         model          the main Whisper model (used for finished phrases).
         src_whisper    language code of the speech, e.g. "ru".
         phrase_queue   finished phrases from AudioCaptureThread.
@@ -3365,7 +3439,8 @@ class TranscriptionWorker(threading.Thread):
         translator     Opus-MT translator, or a function returning one (or None).
         record_audio   save each phrase as a WAV for later accuracy checks.
         """
-        super().__init__(daemon=True, name=f"transcription-worker-{wid}")
+        super().__init__(daemon=True, name=f"transcription-worker-{channel or wid}")
+        self.channel      = channel
         # wid: worker number; model: main Whisper model; model_lock: the shared
         # INFERENCE_LOCK; src_whisper: speech language code ("ru"); src/tgt_lang_key:
         # language menu names; phrase_queue / result_queue: input / output;
@@ -3850,7 +3925,7 @@ class TranscriptionWorker(threading.Thread):
         if totals.get("phrases"):
             totals["process_ms_mean"] = round(totals.pop("process_ms_total") / totals["phrases"], 1)
         log_event(logging.INFO, "session_summary", session_id=self.session_id,
-                  run_id=self.run_id, config=self.config,
+                  channel=self.channel, run_id=self.run_id, config=self.config,
                   model=getattr(self.model, "_size_name", None), src_lang=self.src_whisper,
                   **totals)
 
@@ -3881,7 +3956,7 @@ class TranscriptionWorker(threading.Thread):
             if self._stats.due():
                 preview_slot = self.partial_slot
                 log_event(logging.INFO, "preview_stats", session_id=self.session_id,
-                          run_id=self.run_id,
+                          channel=self.channel, run_id=self.run_id,
                           preview_model=getattr(self.preview_model or self.model,
                                                 "_size_name", None),
                           skipped_stale=preview_slot.overwritten if preview_slot else 0,
@@ -3977,7 +4052,7 @@ class TranscriptionWorker(threading.Thread):
                 elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
                 t_result = time.monotonic()
                 trace = {
-                    "session_id": self.session_id,
+                    "session_id": self.session_id, "channel": self.channel,
                     "run_id": self.run_id, "seq": seq, "reason": meta.get("reason"),
                     # early transcription on silence: was the speculative result
                     # used, and how long that transcription took (time saved)

@@ -8,27 +8,32 @@ official Python version of the Qt toolkit) and PyQt-Fluent-Widgets
 
     .venv\\Scripts\\python interpreter_qt.py
 
-The original window (interpreter.py, built with customtkinter) still works.
-Both share all of the real work: recording, speech detection, Whisper,
-translation, logging. Only the interface differs.
+TWO CHANNELS AT ONCE
+--------------------
+This window listens to two audio devices at the same time, e.g. your
+microphone ("Me", English → Russian) and what the call plays in your
+headphones ("Friend", Russian → English). Each is a CHANNEL (class Channel)
+with its own pipeline: capture thread → transcription worker → translation,
+built by its own SessionController. Both channels share one Whisper model on
+the GPU (they take turns). Their results arrive in one queue, each message
+labelled with its channel (session_controller.TaggedQueue), and appear in one
+conversation (ConversationView), in the order the phrases were spoken.
 
-HOW THE TWO WINDOWS SHARE THE PIPELINE
---------------------------------------
-Both windows use `SessionController` to create and stop audio capture,
-transcription, and translation workers. Each window passes a settings snapshot
-and callbacks for status, audio level, model lookup, and translation. The
-controller owns worker queues and thread references. Small compatibility
-adapters remain for shared settings and result handling while those remaining
-UI responsibilities are separated.
+The original window (interpreter.py, built with customtkinter) still works,
+with one device at a time and the My Voice / Friend mode buttons. Both share
+all of the real work: recording, speech detection, Whisper, translation,
+logging.
 
-The adapters are:
+BORROWED LOGIC AND ADAPTERS
+---------------------------
+A few methods that only deal with the (shared) model settings are borrowed
+from the classic window's InterpreterApp class. They expect Tk-style helpers,
+so this window provides:
 
   QVar        acts like a Tk variable (get()/set()) but reads and writes a
-              Qt control, e.g. a combo box or slider
-  ComboShim   lets borrowed code replace a combo box's items
-              (configure(values=[...]))
+              Qt control, e.g. a combo box
   after()     Tk's "run this later" timer, implemented with QTimer
-  TextShim    a label that accepts configure(text=...)
+
 Qt basics used here: a QWidget is anything on screen; layouts (QVBoxLayout =
 stacked vertically, QHBoxLayout = side by side, QGridLayout = rows and
 columns) position widgets; "signals" (e.g. a button's `clicked`) are
@@ -37,17 +42,21 @@ function later or repeatedly on the main thread.
 """
 
 import logging
+import queue
 import sys
 import threading
 import time
-from collections import deque
+import uuid
+from collections import OrderedDict, deque
+from dataclasses import asdict, dataclass, fields, replace
 from functools import partial
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Hashable, Sequence, cast
 
 from PySide6.QtCore import Qt, QTimer, QRectF
-from PySide6.QtGui import (QCloseEvent, QColor, QFont, QPaintEvent, QPainter,
-                           QTextCharFormat, QTextCursor, QGuiApplication)
-from PySide6.QtWidgets import (QApplication, QGridLayout, QHBoxLayout, QLabel,
+from PySide6.QtGui import (QCloseEvent, QColor, QFont, QFontMetricsF, QPaintEvent, QPainter,
+                           QTextBlock, QTextBlockFormat, QTextCharFormat, QTextCursor,
+                           QTextOption, QGuiApplication)
+from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel,
                                QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget,
                                QHeaderView, QAbstractItemView, QComboBox)
 from qfluentwidgets import setThemeColor  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
@@ -63,11 +72,12 @@ import interpreter as core
 from interpreter import (InterpreterApp, LANGUAGES, continuation_join, trailing_marks_length, MODELS, Speaker,
                          PerfWindow, get_audio_devices, find_device_by_keywords,
                          find_best_vb_input, find_best_friend_input, find_best_output_device,
-                         load_settings, log_event, log_exception, vad_threshold_for,
-                         NVIDIA_KEYWORDS, DEFAULT_SENS, TRANSLATION_QUEUE_MAX,
+                         load_settings, log_event, log_exception, vad_threshold_for, plain_device_name,
+                         NVIDIA_KEYWORDS, DEFAULT_SENS,
                          MAX_TEXT_HISTORY_CHARS, WATCHDOG_SEC, STATS_INTERVAL_SEC,
                          WHISPER_DEVICE, COMPUTE_TYPE, NUM_WORKERS,
                          DEFAULT_MODEL_CPU, DEFAULT_MODEL_GPU)
+from session_controller import AnyEvent, SessionConfig, SessionController
 
 PREVIEW_CHOICES: dict[str, str | None] = core.PREVIEW_CHOICES
 
@@ -102,28 +112,6 @@ class QVar:
                 self._widget.blockSignals(False)
 
 
-class ComboShim:
-    """Lets borrowed code call device_menu.configure(values=[...]) to replace a
-    combo box's items, keeping the current choice if it is still there."""
-    def __init__(self, combo: ComboBox) -> None:
-        self.combo = combo
-
-    def configure(self, values: list[str] | None = None, **_: object) -> None:
-        """Replace the combo box's items, keeping the current choice if it is
-        still in the new list. Other Tk-style options are ignored. Signals are
-        blocked during the rebuild so borrowed logic doesn't mistake this
-        refresh for a user changing the selection."""
-        if values is None:
-            return
-        current = self.combo.currentText()
-        self.combo.blockSignals(True)
-        self.combo.clear()
-        self.combo.addItems(list(values))
-        if current in values:
-            _set_combo_text(self.combo, current)
-        self.combo.blockSignals(False)
-
-
 def _set_combo_text(combo: ComboBox, text: str) -> None:
     """Set text through Qt's base combo-box API.
 
@@ -134,32 +122,19 @@ def _set_combo_text(combo: ComboBox, text: str) -> None:
     cast(QComboBox, combo).setCurrentText(text)
 
 
-def _ignore_signal_value(_: object, callback: Callable[[], None]) -> None:
-    """Adapt a Qt signal that sends a value to a no-argument callback.
+def _ignore_signal_value(*_: object, callback: Callable[[], None]) -> None:
+    """Adapt a Qt signal to a no-argument callback, whatever the signal sends.
 
-    Buttons and toggles often emit ``checked``. The reused app handlers don't
-    need that value, so this wrapper deliberately discards it.
+    A combo box sends its new text, a check box its state, but a Fluent
+    button's `clicked` sends NOTHING (Qt only passes what the connected
+    function accepts). `*_` accepts any number of values (also none) and
+    throws them away. It used to require exactly one, so clicking a Fluent
+    button crashed with "missing 1 required positional argument" (logged
+    2026-11-09 for the old mode buttons, and 2026-11-15 for Speak/Mute).
+    `callback` must be given by name, e.g.
+    partial(_ignore_signal_value, callback=self._clear).
     """
     callback()
-
-
-def _select_mode(_: bool, mode: int, callback: Callable[[int], None]) -> None:
-    """Bind a mode number to a Qt button signal.
-
-    Each button emits its own checked state, but the handler needs to know
-    which mode was clicked. Capture that mode here and pass it to the handler.
-    """
-    callback(mode)
-
-
-class TextShim:
-    """A label that accepts configure(text=...) like a customtkinter label."""
-    def __init__(self, label: QLabel) -> None:
-        self.label = label
-
-    def configure(self, text: str | None = None, **_: object) -> None:
-        if text is not None:
-            self.label.setText(text)
 
 
 class IssueHandler:
@@ -383,19 +358,20 @@ class ReportDialog(MessageBoxBase):
 class ReportDialogMistake(MessageBoxBase):
     """"Report a mistake": which phrase (newest first), what was wrong, and
     optionally what was really said and in which language."""
-    def __init__(self, recent: dict[int, dict[str, Any]],
+    def __init__(self, recent: list[tuple[Hashable, dict[str, Any]]],
                  parent: QWidget | None = None) -> None:
-        """Build the dialog: the phrase list (newest first), one tick box per
-        kind of problem, the correct text, the real language and a note."""
+        """Build the dialog: the phrase list (`recent`: (key, details) pairs,
+        newest first), one tick box per kind of problem, the correct text,
+        the real language and a note."""
         super().__init__(parent)  # pyright: ignore[reportUnknownMemberType]
         self.viewLayout.addWidget(SubtitleLabel("Report a mistake"))
         self.viewLayout.addWidget(CaptionLabel("Which phrase?"))
         self.phrase_combo = ComboBox()
-        self._seqs = sorted(recent, reverse=True)
-        for seq in self._seqs:
-            e = recent[seq]
+        self._keys = [key for key, _ in recent]
+        for _, e in recent:
+            who = f"{e['who']}: " if e.get("who") else ""
             cast(QComboBox, self.phrase_combo).addItem(
-                f"{e['time']}  {e['text'][:90] or '(empty)'}"
+                f"{e['time']}  {who}{e['text'][:90] or '(empty)'}"
             )
         self.phrase_combo.setMinimumWidth(640)
         self.viewLayout.addWidget(self.phrase_combo)
@@ -425,492 +401,33 @@ class ReportDialogMistake(MessageBoxBase):
     def validate(self) -> bool:
         return any(c.isChecked() for c in self.checks.values())
 
-    def result_values(self) -> tuple[int, list[str], str, str | None, str]:
-        """What the user entered: (phrase seq, problem keys ticked, correct text,
-        language code or None, note)."""
-        return (self._seqs[self.phrase_combo.currentIndex()],
+    def result_values(self) -> tuple[Hashable, list[str], str, str | None, str]:
+        """What the user entered: (phrase key, problem keys ticked, correct
+        text, language code or None, note)."""
+        return (self._keys[self.phrase_combo.currentIndex()],
                 [k for k, c in self.checks.items() if c.isChecked()],
                 self.correct_edit.text(), self._langs[self.lang_combo.currentIndex()][1],
                 self.note_edit.text())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The main window
+# Two-pane live text (used by the simulator window)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class QtInterpreterApp(FluentWindow):
-    """The Fluent main window: an Interpreter page and a Diagnostics page in a
-    side navigation bar. It uses SessionController for worker lifecycle."""
+class PaneText:
+    """Live preview and final text in a pair of "Heard" / "Translation" boxes.
 
-    # ── Borrowed logic (see the file's opening comment) ──────────────────
-    _preload_model            = InterpreterApp._preload_model  # pyright: ignore[reportPrivateUsage]
-    _reload_model_if_changed  = InterpreterApp._reload_model_if_changed  # pyright: ignore[reportPrivateUsage]
-    _restart_session          = InterpreterApp._restart_session  # pyright: ignore[reportPrivateUsage]
-    _start_session            = InterpreterApp._start_session  # pyright: ignore[reportPrivateUsage]
-    _retry_start_session      = InterpreterApp._retry_start_session  # pyright: ignore[reportPrivateUsage]
-    _stop_session             = InterpreterApp._stop_session  # pyright: ignore[reportPrivateUsage]
-    _configure_speaker        = InterpreterApp._configure_speaker  # pyright: ignore[reportPrivateUsage]
-    _on_preview_choice        = InterpreterApp._on_preview_choice  # pyright: ignore[reportPrivateUsage]
-    _ensure_preview_model     = InterpreterApp._ensure_preview_model  # pyright: ignore[reportPrivateUsage]
-    _ensure_music_scene       = InterpreterApp._ensure_music_scene  # pyright: ignore[reportPrivateUsage]
-    _translator_for           = InterpreterApp._translator_for  # pyright: ignore[reportPrivateUsage]
-    _preview_model            = InterpreterApp._preview_model  # pyright: ignore[reportPrivateUsage]
-    _watchdog                 = InterpreterApp._watchdog  # pyright: ignore[reportPrivateUsage]
-    _reconnect                = InterpreterApp._reconnect  # pyright: ignore[reportPrivateUsage]
-    _log_resources            = InterpreterApp._log_resources  # pyright: ignore[reportPrivateUsage]
-    _poll_queue               = InterpreterApp._poll_queue  # pyright: ignore[reportPrivateUsage]
-    _update_metric            = InterpreterApp._update_metric  # pyright: ignore[reportPrivateUsage]
-    def _commit_translation(self, seq: int, text: str) -> None:
-        """Show a finished translation (borrowed logic), and remember it for
-        'Report a mistake'."""
-        InterpreterApp._commit_translation(cast(InterpreterApp, self), seq, text)  # pyright: ignore[reportPrivateUsage]
-        if seq in self._recent_finals:            # for "Report a mistake"
-            self._recent_finals[seq]["translation"] = text
-    _on_mode_btn              = InterpreterApp._on_mode_btn  # pyright: ignore[reportPrivateUsage]
-    _sync_session_controller  = InterpreterApp._sync_session_controller  # pyright: ignore[reportPrivateUsage]
-    _refresh_devices          = InterpreterApp._refresh_devices  # pyright: ignore[reportPrivateUsage]
-    _on_manual_device_change  = InterpreterApp._on_manual_device_change  # pyright: ignore[reportPrivateUsage]
-    _on_level                 = InterpreterApp._on_level  # pyright: ignore[reportPrivateUsage]
-    _open_path                = InterpreterApp._open_path  # pyright: ignore[reportPrivateUsage]
-    _export_log_summary       = InterpreterApp._export_log_summary  # pyright: ignore[reportPrivateUsage]
-    _avg                      = staticmethod(InterpreterApp._avg)  # pyright: ignore[reportPrivateUsage]
+    The interpreter window used to show its text this way; it now shows one
+    conversation (ConversationView). The simulator window (simulator_qt.py)
+    still uses two boxes and borrows these methods. The class that uses them
+    needs `heard_box`, `_live` and `_last_preview_words`.
 
-    def __init__(self) -> None:
-        """Set up all state the borrowed logic expects, find the audio devices,
-        build both pages, place the window and start listening."""
-        super().__init__()  # pyright: ignore[reportUnknownMemberType]
-        self.setWindowTitle("Voice Interpreter")
-        self._timers: dict[int, QTimer] = {}
-        self._timer_id = 0                       # for after()/after_cancel()
-
-        # ── state (the same attributes InterpreterApp sets up) ───────────
-        import uuid, queue
-        self.session_id = str(uuid.uuid4())
-        self.result_queue: queue.Queue[Any] = queue.Queue()  # background threads -> window
-        from session_controller import SessionController
-        self.session_controller = SessionController(self.result_queue, core)
-        self.phrase_queue: queue.Queue[Any] = self.session_controller.phrase_queue
-        self._perf_stats: dict[str, Any] = {
-            "transcriptions": 0, "translations": 0,
-            "transcription_ms": deque(maxlen=200),
-            "translation_ms": deque(maxlen=200),
-            "lock_wait_ms": deque(maxlen=200),
-        }
-        self._capture_thread: core.AudioCaptureThread | None = None
-        self._loopback_out = None
-        self._workers: list[core.TranscriptionWorker] = []
-        self._translation_workers: list[core.TranslationWorker] = []
-        self._translation_queue: queue.Queue[tuple[int, str, str, str]] = (
-            self.session_controller.translation_queue)
-        self._model_loader: core.WhisperModelLoader | None = None
-        self._whisper_model: Any = None
-        self.is_listening = self._muted = False
-        self._run_id = 0
-        self._traces: dict[int, Any] = {}
-        self._first_preview: dict[int, float] = {}
-        self._ui_stats = PerfWindow()
-        self._last_poll_t: float | None = None
-        self._diag_psutil_process: Any = None
-        self._preview_loader: core.WhisperModelLoader | None = None
-        self._preview_enabled = False
-        self._previews_off = False
-        self._mt_loaders: dict[tuple[str, str], core.TranslatorLoader] = {}
-        self._initialised = False
-        self._active_mode: int | None = None
-        self._start_retry_after_id: int | None = None
-        self._tts_on = False
-        self.speaker = Speaker()
-        self.speaker.start()
-        self._live: dict[TextEdit, tuple[int, int]] = {}
-        self._last_preview_words: dict[TextEdit, tuple[int | None, list[str]]] = {}
-        self._mute_evt = self._partial_slot = None
-        self._sens_log_after: int | None = None
-
-        # ── diagnostics data (new) ───────────────────────────────────────
-        self._started_at = time.monotonic()     # when this window opened
-        self._listening_since: float | None = None
-        self._phrases: deque[dict[str, Any]] = deque(maxlen=50)   # recent finished phrases (timings, text)
-        self._recent_finals: dict[int, dict[str, Any]] = {}       # seq -> text/translation/trace ("Report a mistake")
-        self._levels: deque[float] = deque(maxlen=320)            # recent block levels (~10 s)
-        self._speech_flags: deque[bool] = deque(maxlen=320)       # recent speech yes/no per block
-        self._peak_recent = -100.0
-        # recent warnings/errors: (time, level, event, detail, explanation)
-        self._issues: deque[tuple[str, str, str, str, dict[str, Any]]] = deque(maxlen=40)
-        self._issue_count_seen = 0
-        self._issue_groups: dict[str, dict[str, Any]] = {}  # event -> count, times, explanation
-        self._watchdog_restarts = 0
-        self._nvml: Any = None                  # GPU monitoring handle
-        core.add_issue_sink(IssueHandler(self._issues))
-
-        # ── audio devices and default mode settings ──────────────────────
-        self._input_devices, self._output_devices = get_audio_devices()
-        self._input_map: dict[str, int] = {lbl: idx for idx, lbl in self._input_devices}
-        self._output_map: dict[str, int] = {lbl: idx for idx, lbl in self._output_devices}
-        in_labels = [lbl for _, lbl in self._input_devices]
-        out_labels = [lbl for _, lbl in self._output_devices]
-        nvidia = find_device_by_keywords(self._input_devices, NVIDIA_KEYWORDS)
-        vb = find_best_vb_input(self._input_devices)
-        friend = find_best_friend_input(self._input_devices)
-        fiio = find_best_output_device(self._output_devices)
-        self._mode_state: list[list[str]] = [
-            [nvidia or (in_labels[0] if in_labels else ""), "English", "Russian"],
-            [friend or (in_labels[0] if in_labels else ""), "Russian", "English"],
-        ]
-        for i, lbl in enumerate(load_settings().get("mode_devices", [])[:2]):
-            if lbl in self._input_map:
-                self._mode_state[i][0] = lbl
-
-        # ── pages ────────────────────────────────────────────────────────
-        self.interp_page = self._build_interpreter_page(in_labels, out_labels, fiio, vb, friend)
-        self.diag_page = self._build_diagnostics_page()
-        self.addSubInterface(self.interp_page, FIF.CHAT, "Interpreter")  # pyright: ignore[reportUnknownMemberType]
-        self.addSubInterface(self.diag_page, FIF.DEVELOPER_TOOLS, "Diagnostics")  # pyright: ignore[reportUnknownMemberType]
-        self._place_window()
-
-        log_event(logging.INFO, "app_initialized", session_id=self.session_id, gui="qt",
-                  whisper_device=WHISPER_DEVICE, compute_type=COMPUTE_TYPE,
-                  num_workers=NUM_WORKERS, input_device_count=len(in_labels),
-                  output_device_count=len(out_labels))
-        # Start in the mode used last time (Friend, for most calls)
-        self._apply_mode(int(load_settings().get("mode", 0)) % 2, switch_source=True)
-        self._preload_model()
-        self._ensure_preview_model()
-        self._initialised = True
-        self._start_session()
-        self.after(15, self._poll_queue)
-        self.after(WATCHDOG_SEC * 1000, self._watchdog)
-        self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
-        self.after(1000, self._refresh_diagnostics)
-
-    # ── Tk-style timer (used by the borrowed logic) ──────────────────────
-
-    def after(self, ms: int, fn: Callable[[], None]) -> int:
-        """Run fn once after ms milliseconds, on the main thread. Returns an
-        id that after_cancel() accepts."""
-        self._timer_id += 1
-        tid = self._timer_id
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-
-        def fire():
-            self._timers.pop(tid, None)
-            fn()
-        timer.timeout.connect(fire)
-        self._timers[tid] = timer
-        timer.start(int(ms))
-        return tid
-
-    def after_cancel(self, tid: int) -> None:
-        """Cancel a timer started with after() (if it hasn't fired yet)."""
-        timer = self._timers.pop(tid, None)
-        if timer is not None:
-            timer.stop()
-
-    # ── Window placement ─────────────────────────────────────────────────
-
-    def _place_window(self) -> None:
-        """Size the window to fit the usable screen area (taskbar excluded)
-        and centre it. Qt handles display scaling itself, so sizes here are
-        in scaled ("logical") pixels."""
-        area = QGuiApplication.primaryScreen().availableGeometry()
-        w, h = min(1180, int(area.width() * 0.95)), min(880, int(area.height() * 0.92))
-        self.resize(w, h)
-        self.move(area.x() + (area.width() - w) // 2, area.y() + (area.height() - h) // 2)
-        log_event(logging.INFO, "window_placed", gui="qt", size_logical=[w, h],
-                  screen_area=[area.x(), area.y(), area.width(), area.height()])
-
-    # ── Interpreter page ─────────────────────────────────────────────────
-
-    def _build_interpreter_page(self, in_labels: list[str], out_labels: list[str],
-                                fiio: str | None, vb: str | None,
-                                friend: str | None) -> QWidget:
-        """Build the Interpreter page, top to bottom: mode buttons and status,
-        action buttons, the settings card, the meters, and the two text panes.
-        Then connect the controls to the logic through the adapters."""
-        page = QWidget()
-        page.setObjectName("interpreterPage")   # FluentWindow needs a unique name
-        root = QVBoxLayout(page)
-        root.setContentsMargins(24, 16, 24, 12)
-        root.setSpacing(10)
-
-        # Header: title, GPU/CPU badge, status pill
-        header = QHBoxLayout()
-        header.addWidget(TitleLabel("Voice Interpreter"))
-        self.hw_badge = self._pill(" GPU " if WHISPER_DEVICE == "cuda" else " CPU ",
-                                   OK if WHISPER_DEVICE == "cuda" else "#2980B9")
-        self.status_badge = self._pill(" IDLE ", WARN)
-        header.addWidget(self.hw_badge)
-        header.addWidget(self.status_badge)
-        header.addStretch(1)
-        header.addWidget(CaptionLabel("Whisper AI · local translation"))
-        # Fold the settings away to give the transcript more room (caption
-        # apps devote most of the window to the text); remembered.
-        self.settings_btn = TogglePushButton()
-        self.settings_btn.setText("Settings")
-        self.settings_btn.setIcon(FIF.SETTING)
-        self.settings_btn.setToolTip("Show or hide the settings (more room for the transcript)")
-        self.settings_btn.clicked.connect(self._toggle_settings)
-        header.addWidget(self.settings_btn)
-        root.addLayout(header)
-
-        # Mode buttons and actions
-        actions = QHBoxLayout()
-        self._mode_btns: list[TogglePushButton] = []
-        for i, (icon, text) in enumerate([(FIF.MICROPHONE, "My Voice   English → Russian"),
-                                          (FIF.HEADPHONE, "Friend   Russian → English")]):
-            b = TogglePushButton()
-            b.setText(text)
-            b.setIcon(icon)
-            b.setMinimumHeight(40)
-            b.clicked.connect(partial(_select_mode, mode=i, callback=self._on_mode_btn))
-            actions.addWidget(b, 2)
-            self._mode_btns.append(b)
-        self.mute_btn = TogglePushButton()
-        self.mute_btn.setText("Mute")
-        self.mute_btn.setIcon(FIF.MUTE)
-        self.mute_btn.setMinimumHeight(40)
-        self.mute_btn.clicked.connect(self._toggle_mute)
-        self.tts_btn = TogglePushButton()
-        self.tts_btn.setText("Speak")
-        self.tts_btn.setIcon(FIF.VOLUME)
-        self.tts_btn.setMinimumHeight(40)
-        self.tts_btn.clicked.connect(self._toggle_tts)
-        clear_btn = PushButton()
-        clear_btn.setText("Clear")
-        clear_btn.setIcon(FIF.BROOM)
-        clear_btn.setMinimumHeight(40)
-        clear_btn.clicked.connect(self._clear)
-        report_btn = PushButton()
-        report_btn.setText("Report a mistake")
-        report_btn.setIcon(FIF.FEEDBACK)
-        report_btn.setMinimumHeight(40)
-        report_btn.setToolTip("Mark a recent phrase as wrong. Its audio and what went wrong\n"
-                              "are saved, so the problem can be found and fixed, and the\n"
-                              "simulator can replay it to check the fix.")
-        report_btn.clicked.connect(self._report_mistake)
-        for b in (self.mute_btn, self.tts_btn, clear_btn, report_btn):
-            actions.addWidget(b, 1)
-        root.addLayout(actions)
-
-        # Settings card
-        card = SimpleCardWidget()
-        grid = QGridLayout(card)
-        grid.setContentsMargins(16, 12, 16, 12)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(8)
-
-        def label(text: str, tip: str) -> BodyLabel:
-            """A settings label with a hover explanation."""
-            l = BodyLabel(text)
-            l.setToolTip(tip)
-            return l
-
-        self.device_combo = ComboBox()
-        self.device_combo.addItems(in_labels)
-        self.device_combo.setToolTip("Where to listen. 🔊 = what an output device "
-                                     "(e.g. the FiiO in a call) is playing.")
-        refresh = PushButton()
-        refresh.setIcon(FIF.SYNC)
-        refresh.setToolTip("Re-scan audio devices")
-        refresh.clicked.connect(self._refresh_devices)
-        self.out_combo = ComboBox()
-        self.out_combo.addItems(out_labels)
-        _set_combo_text(self.out_combo, fiio or (out_labels[0] if out_labels else ""))
-        self.replay_check = CheckBox("Hear input through output (VB-Audio cables only)")
-        self.replay_check.setChecked(bool(vb) and "[loopback]" not in (friend or "").lower())
-        # Source list starts with "Auto-detect" (the language of each phrase
-        # is detected); a target must be a real language.
-        targets = sorted(core.TARGET_LANGUAGES)
-        self.src_combo, self.tgt_combo = ComboBox(), ComboBox()
-        self.src_combo.addItems(["Auto-detect"] + targets)
-        self.tgt_combo.addItems(targets)
-        self.model_combo = ComboBox()
-        self.model_combo.addItems(list(MODELS))
-        saved = load_settings()
-        saved_model = saved.get("model")
-        if isinstance(saved_model, str):
-            saved_model = saved_model.replace(chr(0x2014), "-")
-        if not isinstance(saved_model, str) or saved_model not in MODELS:
-            saved_model = DEFAULT_MODEL_GPU if WHISPER_DEVICE == "cuda" else DEFAULT_MODEL_CPU
-        _set_combo_text(self.model_combo, saved_model)
-        self.sens_slider = Slider(Qt.Orientation.Horizontal)
-        self.sens_slider.setRange(0, 100)
-        self.sens_slider.setValue(int(round(float(saved.get("sensitivity", DEFAULT_SENS)) * 100)))
-        self.sens_value = BodyLabel(f"{self.sens_slider.value()}%")
-        self.preview_combo = ComboBox()
-        self.preview_combo.addItems(list(PREVIEW_CHOICES))
-        choice = saved.get("preview_model")
-        if choice not in PREVIEW_CHOICES:
-            choice = "Tiny (instant)" if saved.get("fast_preview", False) else "Small (balanced)"
-        _set_combo_text(self.preview_combo, choice)
-
-        grid.addWidget(label("Audio input", "Device to listen to"), 0, 0)
-        grid.addWidget(self.device_combo, 0, 1, 1, 3)
-        grid.addWidget(refresh, 0, 4)
-        grid.addWidget(label("Audio output", "Device for Speak and replay"), 1, 0)
-        grid.addWidget(self.out_combo, 1, 1, 1, 2)
-        grid.addWidget(self.replay_check, 1, 3, 1, 2)
-        grid.addWidget(label("Translate", "Language spoken → language shown"), 2, 0)
-        lang_row = QHBoxLayout()
-        lang_row.addWidget(self.src_combo)
-        lang_row.addWidget(BodyLabel("→"))
-        lang_row.addWidget(self.tgt_combo)
-        # Automatic language detection (see LANG_SWITCH_PROB in interpreter.py)
-        self.auto_lang_check = CheckBox("Detect other languages")
-        self.auto_lang_check.setToolTip(
-            "If a phrase is clearly in another language (e.g. a German song while\n"
-            "listening for Russian), recognise it in that language, label it\n"
-            "[German] and translate it. Off: label it but don't translate it.")
-        self.auto_lang_check.setChecked(bool(load_settings().get("auto_language", True)))
-        self.auto_lang_check.stateChanged.connect(self._on_auto_language)
-        lang_row.addSpacing(16)
-        lang_row.addWidget(self.auto_lang_check)
-        lang_row.addStretch(1)
-        grid.addLayout(lang_row, 2, 1, 1, 4)
-        grid.addWidget(label("Model", "Whisper model for the final text"), 3, 0)
-        grid.addWidget(self.model_combo, 3, 1)
-        grid.addWidget(label("Previews", "Model for the live grey text"), 3, 2)
-        grid.addWidget(self.preview_combo, 3, 3, 1, 2)
-        grid.addWidget(label("Speech sensitivity",
-                             "Higher = also catch quieter/less clear speech. Changes what "
-                             "counts as speech, not the volume."), 4, 0)
-        sens_row = QHBoxLayout()
-        sens_row.addWidget(self.sens_slider, 1)
-        sens_row.addWidget(self.sens_value)
-        grid.addLayout(sens_row, 4, 1, 1, 4)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
-        root.addWidget(card)
-        self.settings_card = card
-        show = bool(load_settings().get("show_settings", True))
-        card.setVisible(show)
-        self.settings_btn.setChecked(show)
-
-        # Meters
-        meters = QGridLayout()
-        meters.setHorizontalSpacing(10)
-        meters.addWidget(CaptionLabel("Input level"), 0, 0)
-        self.meter = LevelMeter()
-        meters.addWidget(self.meter, 0, 1)
-        self.level_label = CaptionLabel("-")
-        self.level_label.setFont(QFont("Consolas", 10))
-        self.level_label.setMinimumWidth(210)
-        meters.addWidget(self.level_label, 0, 2)
-        meters.addWidget(CaptionLabel("Speech"), 1, 0)
-        self.speech_meter = SpeechMeter()
-        meters.addWidget(self.speech_meter, 1, 1)
-        self.speech_label = CaptionLabel("-")
-        self.speech_label.setFont(QFont("Consolas", 10))
-        meters.addWidget(self.speech_label, 1, 2)
-        meters.setColumnStretch(1, 1)
-        root.addLayout(meters)
-
-        # Text panes
-        panes = QGridLayout()
-        self.heard_label = StrongBodyLabel("Heard")
-        self.translated_label = StrongBodyLabel("Translation")
-        # Text size (caption guidance: readers must control the size)
-        # The label shares the row with the buttons: when both sat in the same
-        # grid cell, the label covered the buttons and swallowed their clicks.
-        size_row = QHBoxLayout()
-        size_row.addWidget(self.translated_label)
-        size_row.addStretch(1)
-        size_row.addWidget(CaptionLabel("Text size"))
-        for text, step in (("A−", -1), ("A+", 1)):
-            b = PushButton()
-            b.setText(text)
-            b.setFixedWidth(52)
-            b.setToolTip("Smaller / larger transcript text")
-            b.clicked.connect(lambda _=False, d=step: self._change_text_size(d))
-            size_row.addWidget(b)
-        panes.addLayout(size_row, 0, 1)
-        self.heard_box, self.translated_box = TextEdit(), TextEdit()
-        self._text_size = int(load_settings().get("text_size", 13))
-        for box in (self.heard_box, self.translated_box):
-            box.setReadOnly(True)
-        self._apply_text_size()
-        panes.addWidget(self.heard_label, 0, 0)
-        panes.addWidget(self.heard_box, 1, 0)
-        panes.addWidget(self.translated_box, 1, 1)
-        root.addLayout(panes, 1)
-
-        self.status_label = CaptionLabel("Loading Whisper model…")
-        root.addWidget(self.status_label)
-
-        # ── adapters for the borrowed logic ──────────────────────────────
-        self.device_var = QVar(self.device_combo.currentText,
-                               partial(_set_combo_text, self.device_combo), self.device_combo)
-        self.out_device_var = QVar(self.out_combo.currentText,
-                                   partial(_set_combo_text, self.out_combo), self.out_combo)
-        self.loopback_var = QVar(self.replay_check.isChecked, self.replay_check.setChecked,
-                                 self.replay_check)
-        self.src_var = QVar(self.src_combo.currentText,
-                            partial(_set_combo_text, self.src_combo), self.src_combo)
-        self.tgt_var = QVar(self.tgt_combo.currentText,
-                            partial(_set_combo_text, self.tgt_combo), self.tgt_combo)
-        self.model_var = QVar(self.model_combo.currentText,
-                              partial(_set_combo_text, self.model_combo), self.model_combo)
-        self.preview_choice_var = QVar(self.preview_combo.currentText,
-                                       partial(_set_combo_text, self.preview_combo),
-                                       self.preview_combo)
-        self.sensitivity_var = QVar(lambda: self.sens_slider.value() / 100,
-                                    lambda v: self.sens_slider.setValue(int(round(float(v) * 100))),
-                                    self.sens_slider)
-        self.status_var = QVar(self.status_label.text, self.status_label.setText)
-        self.device_menu = ComboShim(self.device_combo)
-        self.out_device_menu = ComboShim(self.out_combo)
-        self.level_text = TextShim(self.level_label)
-
-        # ── control events ───────────────────────────────────────────────
-        self.device_combo.currentTextChanged.connect(
-            partial(_ignore_signal_value, callback=self._on_manual_device_change))
-        self.out_combo.currentTextChanged.connect(
-            partial(_ignore_signal_value, callback=self._on_manual_device_change))
-        self.replay_check.stateChanged.connect(
-            partial(_ignore_signal_value, callback=self._on_manual_device_change))
-        self.src_combo.currentTextChanged.connect(
-            partial(_ignore_signal_value, callback=self._on_manual_lang_change))
-        self.tgt_combo.currentTextChanged.connect(
-            partial(_ignore_signal_value, callback=self._on_manual_lang_change))
-        self.model_combo.currentTextChanged.connect(
-            partial(_ignore_signal_value, callback=self._reload_model_if_changed))
-        self.preview_combo.currentTextChanged.connect(
-            partial(_ignore_signal_value, callback=self._on_preview_choice))
-        def on_sensitivity_changed(value: int) -> None:
-            self._on_sensitivity(value / 100)
-
-        self.sens_slider.valueChanged.connect(on_sensitivity_changed)
-        return page
-
-    def _on_auto_language(self, *_: object) -> None:
-        """'Detect other languages' ticked/unticked: save and apply now
-        (the workers read the flag for each phrase; no restart needed)."""
-        on = self.auto_lang_check.isChecked()
-        core.save_settings(auto_language=on)
-        for worker in getattr(self, "_workers", []):
-            worker.auto_language = on
-        log_event(logging.INFO, "auto_language_changed", enabled=on)
-
-    def _toggle_settings(self) -> None:
-        """Settings button: show or hide the settings card (remembered)."""
-        show = not self.settings_card.isVisible()
-        self.settings_card.setVisible(show)
-        self.settings_btn.setChecked(show)
-        core.save_settings(show_settings=show)
-
-    def _apply_text_size(self) -> None:
-        """The Fluent theme's stylesheet fixes the text box font size, which
-        overrides setFont(), so the size goes in the widget's own custom
-        stylesheet (kept when the theme changes)."""
-        qss = f"TextEdit {{ font: {self._text_size}pt 'Segoe UI'; }}"
-        for box in (self.heard_box, self.translated_box):
-            setCustomStyleSheet(box, qss, qss)
-
-    def _change_text_size(self, step: int) -> None:
-        """A−/A+ buttons: change the transcript font size (9-28 pt), saved."""
-        self._text_size = max(9, min(28, self._text_size + step))
-        self._apply_text_size()
-        core.save_settings(text_size=self._text_size)
+    The preview line is replaced each time; the words two previews agree on
+    are shown normally, the rest grey; the final text replaces the preview.
+    """
+    heard_box: TextEdit
+    _live: dict[TextEdit, tuple[int, int]]
+    _last_preview_words: dict[TextEdit, tuple[int | None, list[str]]]
 
     @staticmethod
     def _at_bottom(box: TextEdit) -> bool:
@@ -922,129 +439,6 @@ class QtInterpreterApp(FluentWindow):
     @staticmethod
     def _follow(box: TextEdit) -> None:
         box.verticalScrollBar().setValue(box.verticalScrollBar().maximum())
-
-    @staticmethod
-    def _pill(text: str, colour: str) -> QLabel:
-        """A small rounded coloured label (status badge)."""
-        l = QLabel(text)
-        l.setStyleSheet(f"background:{colour}; color:white; border-radius:6px; "
-                        f"padding:3px 8px; font-weight:600;")
-        return l
-
-    # ── Interface versions of InterpreterApp's widget methods ────────────
-
-    def _set_live_status(self, text: str, color: str) -> None:
-        """Show a status word (LISTENING, MUTED…) in the coloured badge."""
-        self.status_badge.setText(f" {text} ")
-        self.status_badge.setStyleSheet(f"background:{color}; color:white; border-radius:6px; "
-                                        f"padding:3px 8px; font-weight:600;")
-        if text == "LISTENING":
-            self._listening_since = time.monotonic()
-
-    def _apply_mode(self, mode_idx: int, switch_source: bool = False) -> None:
-        """Switch to mode 0 (My Voice) or 1 (Friend): its device, languages,
-        highlighted button, then restart listening."""
-        if self.is_listening:
-            self._stop_session(keep_mode=True)
-        self._active_mode = mode_idx
-        core.save_settings(mode=mode_idx)
-        device_lbl, src, tgt = self._mode_state[mode_idx]
-        if switch_source and device_lbl:
-            self.device_var.set(device_lbl)
-        self.src_var.set(src)
-        self.tgt_var.set(tgt)
-        self._update_pane_titles()
-        for i, b in enumerate(self._mode_btns):
-            b.setChecked(i == mode_idx)
-        if self._initialised:
-            self._restart_session()
-
-    def _on_manual_lang_change(self) -> None:
-        self._update_pane_titles()
-        self._restart_session()
-
-    def _update_pane_titles(self) -> None:
-        self.heard_label.setText(f"Heard in {self.src_var.get()}")
-        self.translated_label.setText(f"Translation → {self.tgt_var.get()}")
-
-    def _toggle_mute(self) -> None:
-        """Mute button: stop listening and release the device, or start again."""
-        self._muted = not self._muted
-        self.mute_btn.setChecked(self._muted)
-        if self._muted:
-            self._stop_session()
-            self.mute_btn.setText("Unmute")
-            self.mute_btn.setIcon(FIF.MICROPHONE)
-            self._set_live_status("MUTED", BAD)
-            self.status_var.set("Muted - not listening.")
-        else:
-            self.mute_btn.setText("Mute")
-            self.mute_btn.setIcon(FIF.MUTE)
-            self._start_session()
-        log_event(logging.INFO, "mute_toggled", muted=self._muted)
-
-    def _toggle_tts(self) -> None:
-        """Speak button: read each new translation aloud, or stop doing so."""
-        if self.speaker.error and not self.speaker.is_alive():
-            self.status_var.set(f"Text-to-speech unavailable: {self.speaker.error}")
-            self.tts_btn.setChecked(False)
-            return
-        self._tts_on = not self._tts_on
-        self.tts_btn.setChecked(self._tts_on)
-        self.tts_btn.setText("Speak: On" if self._tts_on else "Speak")
-        if self._tts_on:
-            self._configure_speaker()
-        else:
-            self.speaker.stop_speech()
-        log_event(logging.INFO, "tts_toggled", enabled=self._tts_on)
-
-    def _on_sensitivity(self, v: float) -> None:
-        """Sensitivity slider moved: apply it to the capture thread at once;
-        save and log it only once the slider has settled for 0.5 s."""
-        v = round(float(v), 2)
-        self.sens_value.setText(f"{round(v * 100)}%")
-        if self._capture_thread:
-            self._capture_thread.set_sensitivity(v)
-        if self._sens_log_after is not None:
-            self.after_cancel(self._sens_log_after)
-
-        def settled():
-            """Runs once the slider has been still for 0.5 s: save and log."""
-            self._sens_log_after = None
-            core.save_settings(sensitivity=v)
-            log_event(logging.INFO, "sensitivity_changed", value=v, run_id=self._run_id,
-                      session_id=self.session_id, vad_threshold=round(vad_threshold_for(v), 2),
-                      speech_score_now=round(self.speech_meter.shown, 2))
-        self._sens_log_after = self.after(500, settled)
-
-    def _update_meter(self, rms_db: float, peak_db: float, speaking: bool,
-                      prob: float = 0.0, threshold: float = 0.5) -> None:
-        """Called for every audio block (via the result queue): update both
-        meters and their labels, and keep the last ~10 s for Diagnostics."""
-        self.meter.update_level(rms_db, peak_db)
-        self.speech_meter.update_score(prob, threshold, speaking)
-        self.level_label.setText("  -∞ dBFS  (silent)" if rms_db <= -99 else f"{rms_db:6.1f} dBFS")
-        self.speech_label.setText(f"{prob * 100:3.0f}% / needs {threshold * 100:.0f}%  "
-                                  f"{'SPEECH' if speaking else 'no speech'}")
-        set_colour(self.speech_label, OK if speaking else None)
-        if rms_db > -99:
-            self._levels.append(rms_db)
-            self._peak_recent = max(peak_db, self._peak_recent - 0.05)
-        self._speech_flags.append(bool(speaking))
-
-    def _clear(self) -> None:
-        """Clear button: empty both text panes and forget any live previews."""
-        self.heard_box.clear()
-        self.translated_box.clear()
-        self._live = {}
-        self._last_preview_words = {}
-        self.status_var.set("Cleared.")
-        log_event(logging.INFO, "ui_cleared")
-
-    # ── Live preview and final text in the panes ─────────────────────────
-    # Same behaviour as interpreter.py: the preview line is replaced each
-    # time; the words two previews agree on are shown normally, the rest
-    # grey; the final text replaces the preview.
 
     def _fmt(self, grey: bool) -> QTextCharFormat:
         """Text format for the panes: grey for still-changing preview words,
@@ -1129,20 +523,1467 @@ class QtInterpreterApp(FluentWindow):
             cur.setPosition(extra, QTextCursor.MoveMode.KeepAnchor)
             cur.removeSelectedText()
 
-    def _log_displayed(self, seq: int, trace: dict[str, Any], online: bool) -> None:
-        """Log the screen timings (borrowed), and keep them for Diagnostics."""
-        first_preview = self._first_preview.get(seq)
-        InterpreterApp._log_displayed(cast(InterpreterApp, self), seq, trace, online)  # pyright: ignore[reportPrivateUsage]
-        self._recent_finals[seq] = {"time": time.strftime("%H:%M:%S"), "trace": trace,
-                                    "text": trace.get("text") or "",
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channels: the audio sources the interpreter listens to at the same time
+# ─────────────────────────────────────────────────────────────────────────────
+
+# One colour per channel, used for its name in the conversation and its strip
+CHANNEL_COLOURS = ("#4FC3F7", "#FFB74D")      # light blue, amber
+
+
+@dataclass
+class ChannelSettings:
+    """One channel's choices, saved in interpreter.settings.json under
+    "channels" (a list with one dict per channel).
+
+    name         shown in the conversation, e.g. "Me" or "Friend"
+    device       input device label, e.g. "Microphone (RODECaster Duo …)" or
+                 "🔊 Speakers (FiiO Q series) [Loopback]" (what an output plays)
+    src, tgt     language names: spoken ("Auto-detect" allowed) -> shown
+    sensitivity  0..1, how readily sound counts as speech
+    muted        True = this channel is switched off
+    speak        True = read this channel's translations aloud
+    output       output device label for Speak and replay
+    replay       True = play the input through `output` (VB-Audio cables)
+    """
+    name: str
+    device: str
+    src: str
+    tgt: str
+    sensitivity: float = DEFAULT_SENS
+    muted: bool = False
+    speak: bool = False
+    output: str = ""
+    replay: bool = False
+
+
+def load_channel_settings(input_devices: list[tuple[int, str]],
+                          output_devices: list[tuple[int, str]]) -> list[ChannelSettings]:
+    """The two channels' settings: the saved ones, or sensible defaults.
+
+    The defaults follow the old two-mode design: channel 1 ("Me") is your
+    microphone, English → Russian; channel 2 ("Friend") is the call audio,
+    Russian → English. Devices saved by the old version ("mode_devices")
+    are reused, so an upgrade keeps your choices.
+    """
+    saved = load_settings()
+    in_labels = [lbl for _, lbl in input_devices]
+    out_labels = [lbl for _, lbl in output_devices]
+    first_in = in_labels[0] if in_labels else ""
+    old_devices = [d for d in saved.get("mode_devices", []) if isinstance(d, str)]
+    me_device = ((old_devices[0] if len(old_devices) > 0 else None)
+                 or find_device_by_keywords(input_devices, NVIDIA_KEYWORDS) or first_in)
+    friend_device = ((old_devices[1] if len(old_devices) > 1 else None)
+                     or find_best_friend_input(input_devices) or first_in)
+    headphones = find_best_output_device(output_devices) or (out_labels[0] if out_labels else "")
+    vb_cable = find_best_vb_input(input_devices)
+    sensitivity = float(saved.get("sensitivity", DEFAULT_SENS))
+    channels = [
+        ChannelSettings("Me", me_device, "English", "Russian", sensitivity, output=headphones),
+        ChannelSettings("Friend", friend_device, "Russian", "English", sensitivity,
+                        output=headphones, replay=bool(vb_cable) and friend_device == vb_cable),
+    ]
+    known = {f.name for f in fields(ChannelSettings)}
+    for i, stored in enumerate(saved.get("channels", [])[:len(channels)]):
+        if not isinstance(stored, dict):
+            continue
+        # PYTHON: dataclasses.replace() makes a copy with some fields changed.
+        # Only known keys are used, so an old or hand-edited file can't crash it.
+        channel = replace(channels[i], **{k: v for k, v in stored.items() if k in known})
+        if channel.src not in LANGUAGES:
+            channel.src = channels[i].src
+        if channel.tgt not in core.TARGET_LANGUAGES:
+            channel.tgt = channels[i].tgt
+        channels[i] = channel
+    return channels
+
+
+class Channel:
+    """One audio source the interpreter listens to, and everything that
+    belongs to it while the app runs.
+
+    Each channel has its own pipeline (a SessionController: capture thread,
+    transcription worker, translation), its own text-to-speech Speaker and
+    its own music detector. The Whisper model is shared: both workers take
+    turns on the GPU (INFERENCE_LOCK in interpreter.py).
+
+    run_id changes every time the channel (re)starts. Messages from the
+    channel's threads arrive labelled (index, run_id), so a late message
+    from a pipeline that has just been stopped can be recognised.
+    Phrases are identified by the key (index, run_id, seq).
+    """
+
+    def __init__(self, index: int, settings: ChannelSettings, result_queue: queue.Queue[Any]) -> None:
+        self.index = index
+        self.settings = settings
+        self.colour = CHANNEL_COLOURS[index % len(CHANNEL_COLOURS)]
+        self.controller = SessionController(result_queue, core)
+        self.speaker = Speaker()
+        self.speaker.start()
+        self.listening = False
+        self.run_id = 0
+        self.music_scene: Any = None
+        self.problem: str | None = None    # why it isn't listening (shown on its strip)
+        self.failures = 0                  # restarts in a row (the watchdog waits longer each time)
+        self.retry_at = 0.0                # time.monotonic() of the next start attempt
+        self.needs_rescan = False          # re-scan devices before the next attempt
+        self.missing_checks = 0            # looks for a missing device (they get rarer)
+        self.first_preview: dict[int, float] = {}          # seq -> ms from speech to first preview
+        self.pending_translation: dict[int, dict[str, Any]] = {}   # seq -> trace (online)
+        self.levels: deque[float] = deque(maxlen=320)      # recent block levels (~10 s)
+        self.speech_flags: deque[bool] = deque(maxlen=320)  # recent speech yes/no per block
+        self.peak_recent = -100.0
+        self.sens_log_after: int | None = None
+        self.strip: ChannelStrip       # set when the page is built
+        self.controls: ChannelControls
+
+    @property
+    def capture(self) -> core.AudioCaptureThread | None:
+        return self.controller.capture_thread
+
+    @property
+    def workers(self) -> list[core.TranscriptionWorker]:
+        return self.controller.workers
+
+
+@dataclass
+class ChannelControls:
+    """One channel's column in the settings card."""
+    name_edit: LineEdit
+    device_combo: ComboBox
+    src_combo: ComboBox
+    tgt_combo: ComboBox
+    sens_slider: Slider
+    sens_value: BodyLabel
+    out_combo: ComboBox
+    replay_check: CheckBox
+
+
+# Added to a device menu entry whose device isn't connected now
+NOT_CONNECTED = "  (not connected)"
+
+
+def _fill_combo(combo: ComboBox, labels: list[str], current: str) -> None:
+    """Replace a combo box's items and select `current`. A device that is
+    unplugged right now stays in the list, marked "(not connected)", so the
+    box still shows the channel's real choice (it reconnects when the device
+    comes back) without looking like a device that works.
+    Signals are blocked: refilling is not the user choosing something."""
+    combo.blockSignals(True)
+    combo.clear()
+    shown = current if current in labels or not current else current + NOT_CONNECTED
+    combo.addItems(labels + ([shown] if shown != current else []))
+    _set_combo_text(combo, shown)
+    combo.blockSignals(False)
+
+
+def _combo_device(combo: ComboBox) -> str:
+    """The device label chosen in a device menu (without "(not connected)")."""
+    return combo.currentText().removesuffix(NOT_CONNECTED)
+
+
+def similar_devices(label: str, labels: Sequence[str]) -> list[str]:
+    """Connected devices that look like the same hardware as `label`: they
+    share a distinctive word from its brackets, e.g. "Realtek" in
+    "Digital Output (Realtek USB2.0 Audio)" and "SPDIF Interface (Realtek
+    USB Audio)". Windows renames devices after driver updates or when they
+    are plugged into another port, so this helps to find the new name."""
+    common = {"audio", "usb", "device", "high", "definition", "stereo", "main"}
+    inside = label[label.find("(") + 1:label.rfind(")")] if "(" in label else label
+    words = {w for w in inside.lower().replace(".", " ").split() if len(w) > 2} - common
+    same_kind = "[loopback]" in label.lower()
+    return [l for l in labels if l != label and ("[loopback]" in l.lower()) == same_kind
+            and any(w in l.lower() for w in words)]
+
+
+class ChannelStrip(SimpleCardWidget):
+    """The always-visible summary of one channel above the conversation:
+    its name in its colour, device and languages, the level and speech
+    meters, what it is doing now, and its Speak and Mute switches."""
+
+    def __init__(self, colour: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)  # pyright: ignore[reportUnknownMemberType]
+        grid = QGridLayout(self)
+        grid.setContentsMargins(12, 8, 12, 8)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+        bar = QFrame()                      # the coloured stripe on the left
+        bar.setFixedWidth(4)
+        bar.setStyleSheet(f"background:{colour}; border-radius:2px;")
+        self.name_label = StrongBodyLabel("")
+        self.name_label.setTextColor(QColor(colour), QColor(colour))
+        self.detail_label = CaptionLabel("")
+        self.speak_btn = TogglePushButton()
+        self.speak_btn.setText("Speak")
+        self.speak_btn.setIcon(FIF.VOLUME)
+        self.speak_btn.setToolTip("Read this channel's translations aloud\n"
+                                  "(output device: Settings → Speak and replay to)")
+        self.mute_btn = TogglePushButton()
+        self.mute_btn.setText("Mute")
+        self.mute_btn.setIcon(FIF.MUTE)
+        self.mute_btn.setToolTip("Stop listening to this channel (releases the device)")
+        top = QHBoxLayout()
+        top.addWidget(self.name_label)
+        top.addSpacing(8)
+        top.addWidget(self.detail_label, 1)
+        top.addWidget(self.speak_btn)
+        top.addWidget(self.mute_btn)
+        self.meter = LevelMeter()
+        self.speech_meter = SpeechMeter()
+        self.level_label = CaptionLabel("-")
+        self.speech_label = CaptionLabel("-")
+        for label in (self.level_label, self.speech_label):
+            label.setFont(QFont("Consolas", 9))
+            label.setMinimumWidth(120)
+        self.status_label = CaptionLabel("Starting…")
+        self.status_label.setWordWrap(True)          # long problem messages wrap
+        grid.addWidget(bar, 0, 0, 4, 1)
+        grid.addLayout(top, 0, 1, 1, 2)
+        grid.addWidget(self.meter, 1, 1)
+        grid.addWidget(self.level_label, 1, 2)
+        grid.addWidget(self.speech_meter, 2, 1)
+        grid.addWidget(self.speech_label, 2, 2)
+        grid.addWidget(self.status_label, 3, 1, 1, 2)
+        grid.setColumnStretch(1, 1)
+
+    def show_settings(self, s: ChannelSettings) -> None:
+        """Show the channel's name, device and languages."""
+        self.name_label.setText(s.name)
+        device = ("🔊 " if "[loopback]" in s.device.lower() else "🎙 ") + plain_device_name(s.device)
+        short = device if len(device) <= 42 else device[:40] + "…"
+        self.detail_label.setText(f"{short}  ·  {s.src} → {s.tgt}")
+        self.detail_label.setToolTip(f"{s.device}\n{s.src} → {s.tgt}")
+        self.mute_btn.setChecked(s.muted)
+        self.mute_btn.setText("Unmute" if s.muted else "Mute")
+        self.mute_btn.setIcon(FIF.MICROPHONE if s.muted else FIF.MUTE)
+        self.speak_btn.setChecked(s.speak)
+        self.speak_btn.setText("Speak: On" if s.speak else "Speak")
+
+    def set_status(self, text: str, colour: str | None = None) -> None:
+        self.status_label.setText(text)
+        set_colour(self.status_label, colour)
+
+    def update_levels(self, rms_db: float, peak_db: float, speaking: bool,
+                      prob: float, threshold: float) -> None:
+        """Show one audio block's level and speech score."""
+        self.meter.update_level(rms_db, peak_db)
+        self.speech_meter.update_score(prob, threshold, speaking)
+        self.level_label.setText("  -∞ dBFS" if rms_db <= -99 else f"{rms_db:6.1f} dBFS")
+        self.speech_label.setText(f"{prob * 100:3.0f}% / {threshold * 100:.0f}% "
+                                  f"{'SPEECH' if speaking else ''}")
+        set_colour(self.speech_label, OK if speaking else None)
+
+    def reset_meters(self) -> None:
+        self.meter.reset()
+        self.speech_meter.update_score(0.0, 0.5, False)
+        self.level_label.setText("-")
+        self.speech_label.setText("-")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The conversation: both channels' phrases in one transcript
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _Entry:
+    """One phrase in the conversation (see ConversationView).
+
+    text_block / translation_block  its two paragraphs in the document
+    heard        what was heard (the preview, then the final text)
+    stable       preview only: how many leading words two previews agreed on
+    final        True once the final text has replaced the preview
+    translation  None while there is none (yet); "" if none was possible
+    show_label   False when the line above is the same speaker (no repeat)
+    """
+    channel: int
+    time: str
+    t: float
+    text_block: QTextBlock
+    translation_block: QTextBlock
+    heard: str = ""
+    stable: int = 0
+    final: bool = False
+    translation: str | None = None
+    translation_final: bool = False
+    show_label: bool = True
+
+
+class ConversationView(TextEdit):
+    """The conversation: every phrase from both channels, in the order the
+    phrases started. Each phrase is an ENTRY of two lines (paragraphs):
+
+        10:02  Friend   Да, слышу хорошо.
+                        → Yes, I hear you well.
+
+    The name is left out when the same person carries on. While someone is
+    still talking their entry shows the live preview in grey; the final text
+    then replaces it IN PLACE. So when both people talk at once, each keeps
+    their own entry and nothing gets mixed up.
+
+    Qt notes: a QTextDocument is made of paragraphs called BLOCKS. A
+    QTextBlock is a handle to one: it stays valid while other blocks are
+    added or removed, and block.position() always gives its current place.
+    That is how an entry can still be found and changed later, e.g. when
+    its translation arrives from the online service a second afterwards.
+    The document always starts and ends with an empty block ("sentinels"):
+    entries are only ever added or removed as whole blocks BETWEEN other
+    blocks, so an entry's block is never merged into a neighbour.
+    The hanging indent (names on the left, wrapped text lined up to the
+    right of them) is a tab stop plus a negative first-line indent.
+    """
+    GREY = "#8a8f94"
+    MAX_ENTRIES = 300          # older phrases are removed from the top
+    SAME_TURN_SEC = 60         # same speaker within this gap: no repeated name
+
+    def __init__(self, names: Sequence[str], colours: Sequence[str],
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.names, self.colours = list(names), list(colours)
+        self._entries: OrderedDict[Hashable, _Entry] = OrderedDict()   # in document order
+        self._newest_preview: dict[int, Hashable] = {}                  # channel -> key
+        self._indent = 120.0
+        self._text_pt = 13
+        self.reset()
+
+    # ── public interface (called by the window) ──────────────────────────
+
+    def reset(self) -> None:
+        """Remove everything (the Clear button)."""
+        self._entries.clear()
+        self._newest_preview.clear()
+        self.document().clear()
+        cursor = QTextCursor(self.document())
+        cursor.insertBlock()                        # [top sentinel][bottom sentinel]
+        self._bottom = self.document().lastBlock()
+
+    def show_preview(self, key: Hashable, channel: int, heard: str,
+                     translated: str | None) -> None:
+        """Show (or update) the live preview of a phrase still being spoken."""
+        newest = self._newest_preview.get(channel)
+        if newest is not None and key < newest:     # type: ignore[operator]
+            return                                  # older than a preview already shown
+        entry = self._entries.get(key)
+        if entry is not None and entry.final:
+            return                                  # its final text is already shown
+        if entry is None and not heard.strip():
+            return
+        follow = self._at_bottom()
+        if entry is None:
+            entry = self._new_entry(key, channel)
+        words, old = heard.split(), entry.heard.split()
+        stable = 0
+        while stable < min(len(words), len(old)) and words[stable] == old[stable]:
+            stable += 1
+        entry.heard, entry.stable = heard, stable
+        if translated:
+            entry.translation = translated
+        self._newest_preview[channel] = key
+        self._render(entry)
+        if follow:
+            self._follow()
+
+    def commit(self, key: Hashable, channel: int, heard: str, translation: str | None) -> None:
+        """Show a phrase's final text. translation None = still to come
+        (online); an empty `heard` (noise, not speech) removes the entry."""
+        entry = self._entries.get(key)
+        if not heard:
+            if entry is not None:
+                self._remove([key])
+            return
+        follow = self._at_bottom()
+        if entry is None:
+            entry = self._new_entry(key, channel)
+        entry.heard, entry.final = heard, True
+        entry.translation, entry.translation_final = translation, translation is not None
+        self._render(entry)
+        self._trim()
+        if follow:
+            self._follow()
+
+    def set_translation(self, key: Hashable, text: str) -> None:
+        """A translation arrived later (online service)."""
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        follow = self._at_bottom()
+        entry.translation, entry.translation_final = text, True
+        self._render(entry)
+        if follow:
+            self._follow()
+
+    def drop_previews(self, channel: int) -> None:
+        """Remove a channel's unfinished previews (the channel stopped, so
+        their final text will never come)."""
+        self._remove([k for k, e in self._entries.items() if e.channel == channel and not e.final])
+        self._newest_preview.pop(channel, None)
+
+    def set_names(self, names: Sequence[str]) -> None:
+        """A channel was renamed: redraw every entry with the new names."""
+        self.names = list(names)
+        self._layout_changed()
+
+    def set_text_size(self, points: int) -> None:
+        """The Fluent theme's stylesheet fixes the font size, which overrides
+        setFont(), so the size goes in the widget's own custom stylesheet."""
+        self._text_pt = points
+        qss = f"TextEdit {{ font: {points}pt 'Segoe UI'; }}"
+        setCustomStyleSheet(self, qss, qss)
+        self._layout_changed()
+
+    def plain_entries(self) -> list[tuple[int, str, str | None, bool]]:
+        """(channel, heard, translation, final) for each entry; for tests."""
+        return [(e.channel, e.heard, e.translation, e.final) for e in self._entries.values()]
+
+    # ── drawing ──────────────────────────────────────────────────────────
+
+    def _layout_changed(self) -> None:
+        """Recalculate the name column's width and redraw every entry."""
+        bold = QFont("Segoe UI", self._text_pt)
+        bold.setBold(True)
+        metrics = QFontMetricsF(bold, self.viewport())   # measured for this screen's DPI
+        widest = max((metrics.horizontalAdvance("00:00  " + n) for n in self.names), default=80.0)
+        self._indent = widest + metrics.horizontalAdvance("  ")
+        for entry in self._entries.values():
+            self._render(entry)
+
+    def _char(self, colour: str | None = None, bold: bool = False) -> QTextCharFormat:
+        f = QTextCharFormat()
+        f.setForeground(QColor(colour) if colour else self.palette().text().color())
+        f.setFontWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+        return f
+
+    def _block_format(self, top_margin: float = 0.0) -> QTextBlockFormat:
+        """Hanging indent: the first line starts at the left edge, a tab
+        jumps to the text column, wrapped lines start in the text column."""
+        f = QTextBlockFormat()
+        f.setLeftMargin(self._indent)
+        f.setTextIndent(-self._indent)
+        f.setTabPositions([QTextOption.Tab(self._indent, QTextOption.TabType.LeftTab)])
+        f.setTopMargin(top_margin)
+        return f
+
+    @staticmethod
+    def _write(block: QTextBlock, pieces: list[tuple[str, QTextCharFormat]],
+               fmt: QTextBlockFormat) -> None:
+        """Replace one block's text with `pieces` (text, format) and set its format."""
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.setBlockFormat(fmt)
+        for text, char_format in pieces:
+            cursor.insertText(text, char_format)
+
+    def _render(self, entry: _Entry) -> None:
+        """Draw an entry's two lines from its fields."""
+        colour = self.colours[entry.channel % len(self.colours)]
+        name = self.names[entry.channel] if entry.channel < len(self.names) else "?"
+        line: list[tuple[str, QTextCharFormat]] = []
+        if entry.show_label:
+            line += [(entry.time + "  ", self._char(self.GREY)), (name, self._char(colour, bold=True))]
+        line.append(("\t", self._char()))
+        if entry.final:
+            line.append((entry.heard, self._char()))
+        else:
+            words = entry.heard.split()
+            stable = " ".join(words[:entry.stable])
+            line += [("… " + stable + (" " if stable else ""), self._char()),
+                     (" ".join(words[entry.stable:]), self._char(self.GREY))]
+        self._write(entry.text_block, line, self._block_format(8.0 if entry.show_label else 0.0))
+        if entry.translation is None:
+            translation = [("\t→ …", self._char(self.GREY))]
+        else:
+            translation = [("\t", self._char()), ("→ ", self._char(colour)),
+                           (entry.translation or "(no translation)",
+                            self._char(None if entry.translation_final else self.GREY))]
+        self._write(entry.translation_block, translation, self._block_format())
+
+    # ── adding and removing entries ──────────────────────────────────────
+
+    def _new_entry(self, key: Hashable, channel: int) -> _Entry:
+        """Add an empty entry at the end (just above the bottom sentinel)."""
+        cursor = QTextCursor(self._bottom.previous())
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        cursor.insertBlock()
+        text_block = cursor.block()
+        cursor.insertBlock()
+        entry = _Entry(channel, time.strftime("%H:%M"), time.monotonic(),
+                       text_block, cursor.block())
+        previous = next(reversed(self._entries.values()), None)
+        entry.show_label = self._needs_label(previous, entry)
+        self._entries[key] = entry
+        return entry
+
+    def _needs_label(self, previous: _Entry | None, entry: _Entry) -> bool:
+        return (previous is None or previous.channel != entry.channel
+                or entry.t - previous.t > self.SAME_TURN_SEC)
+
+    def _remove(self, keys: list[Hashable]) -> None:
+        """Remove entries (both their blocks), then fix the name labels of
+        the entries that now follow a different speaker."""
+        if not keys:
+            return
+        for key in keys:
+            entry = self._entries.pop(key)
+            cursor = QTextCursor(entry.text_block)
+            cursor.setPosition(entry.translation_block.next().position(),
+                               QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+        previous = None
+        for entry in self._entries.values():
+            label = self._needs_label(previous, entry)
+            if label != entry.show_label:
+                entry.show_label = label
+                self._render(entry)
+            previous = entry
+
+    def _trim(self) -> None:
+        """Keep at most MAX_ENTRIES entries; the oldest finished ones go."""
+        extra = len(self._entries) - self.MAX_ENTRIES
+        if extra > 0:
+            self._remove([k for k, e in self._entries.items() if e.final][:extra])
+
+    def _at_bottom(self) -> bool:
+        """True if scrolled to the end. New text only scrolls the view if so:
+        someone re-reading earlier text isn't yanked back down."""
+        bar = self.verticalScrollBar()
+        return bar.value() >= bar.maximum() - 4
+
+    def _follow(self) -> None:
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The main window
+# ─────────────────────────────────────────────────────────────────────────────
+
+class QtInterpreterApp(FluentWindow):
+    """The Fluent main window: an Interpreter page and a Diagnostics page in a
+    side navigation bar.
+
+    It listens to two audio devices at the same time ("channels", see
+    Channel). Each channel has its own SessionController pipeline; both
+    share one Whisper model. Their results arrive in one queue, labelled
+    with the channel, and appear in one conversation.
+    """
+
+    # ── Borrowed logic (see the file's opening comment) ──────────────────
+    # These only use the model settings, which both channels share.
+    _preload_model            = InterpreterApp._preload_model  # pyright: ignore[reportPrivateUsage]
+    _on_preview_choice        = InterpreterApp._on_preview_choice  # pyright: ignore[reportPrivateUsage]
+    _ensure_preview_model     = InterpreterApp._ensure_preview_model  # pyright: ignore[reportPrivateUsage]
+    _translator_for           = InterpreterApp._translator_for  # pyright: ignore[reportPrivateUsage]
+    _preview_model            = InterpreterApp._preview_model  # pyright: ignore[reportPrivateUsage]
+    _update_metric            = InterpreterApp._update_metric  # pyright: ignore[reportPrivateUsage]
+    _open_path                = InterpreterApp._open_path  # pyright: ignore[reportPrivateUsage]
+
+    def __init__(self) -> None:
+        """Set up the state, find the audio devices, build both pages, place
+        the window and start listening on both channels."""
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        self.setWindowTitle("Voice Interpreter")
+        self._timers: dict[int, QTimer] = {}
+        self._timer_id = 0                       # for after()/after_cancel()
+
+        # ── state ────────────────────────────────────────────────────────
+        self.session_id = str(uuid.uuid4())
+        self.result_queue: queue.Queue[Any] = queue.Queue()  # background threads -> window
+        self._perf_stats: dict[str, Any] = {
+            "transcriptions": 0, "translations": 0,
+            "transcription_ms": deque(maxlen=200),
+            "translation_ms": deque(maxlen=200),
+            "lock_wait_ms": deque(maxlen=200),
+        }
+        self._model_loader: core.WhisperModelLoader | None = None
+        self._whisper_model: Any = None
+        self._run_id = 0                         # counts every channel start (unique run ids)
+        self._ui_stats = PerfWindow()
+        self._last_poll_t: float | None = None
+        self._diag_psutil_process: Any = None
+        self._preview_loader: core.WhisperModelLoader | None = None
+        self._preview_enabled = False
+        self._previews_off = False
+        self._mt_loaders: dict[tuple[str, str], core.TranslatorLoader] = {}
+        self._initialised = False
+        self._closing = False                    # set when the window closes
+        self._start_retry_after_id: int | None = None
+
+        # ── diagnostics data ─────────────────────────────────────────────
+        self._started_at = time.monotonic()     # when this window opened
+        self._listening_since: float | None = None
+        self._phrases: deque[dict[str, Any]] = deque(maxlen=50)   # recent finished phrases (timings, text)
+        self._recent_finals: OrderedDict[Hashable, dict[str, Any]] = OrderedDict()  # "Report a mistake"
+        # recent warnings/errors: (time, level, event, detail, explanation)
+        self._issues: deque[tuple[str, str, str, str, dict[str, Any]]] = deque(maxlen=40)
+        self._issue_count_seen = 0
+        self._issue_groups: dict[str, dict[str, Any]] = {}  # event -> count, times, explanation
+        self._watchdog_restarts = 0
+        self._nvml: Any = None                  # GPU monitoring handle
+        core.add_issue_sink(IssueHandler(self._issues))
+
+        # ── audio devices and the two channels ───────────────────────────
+        self._input_devices, self._output_devices = get_audio_devices()
+        self._input_map: dict[str, int] = {lbl: idx for idx, lbl in self._input_devices}
+        self._output_map: dict[str, int] = {lbl: idx for idx, lbl in self._output_devices}
+        self.channels = [Channel(i, s, self.result_queue) for i, s in
+                         enumerate(load_channel_settings(self._input_devices, self._output_devices))]
+
+        # ── pages ────────────────────────────────────────────────────────
+        self.interp_page = self._build_interpreter_page()
+        self.diag_page = self._build_diagnostics_page()
+        self.addSubInterface(self.interp_page, FIF.CHAT, "Interpreter")  # pyright: ignore[reportUnknownMemberType]
+        self.addSubInterface(self.diag_page, FIF.DEVELOPER_TOOLS, "Diagnostics")  # pyright: ignore[reportUnknownMemberType]
+        self._place_window()
+
+        log_event(logging.INFO, "app_initialized", session_id=self.session_id, gui="qt",
+                  whisper_device=WHISPER_DEVICE, compute_type=COMPUTE_TYPE,
+                  num_workers=NUM_WORKERS, input_device_count=len(self._input_devices),
+                  output_device_count=len(self._output_devices),
+                  channels=[asdict(c.settings) for c in self.channels])
+        self._preload_model()
+        self._ensure_preview_model()
+        self._initialised = True
+        self._start_all()
+        self.after(15, self._poll_queue)
+        self.after(WATCHDOG_SEC * 1000, self._watchdog)
+        self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
+        self.after(1000, self._refresh_diagnostics)
+
+    @property
+    def is_listening(self) -> bool:
+        """True while at least one channel is listening."""
+        return any(c.listening for c in self.channels)
+
+    # ── Tk-style timer (used by the borrowed logic) ──────────────────────
+
+    def after(self, ms: int, fn: Callable[[], None]) -> int:
+        """Run fn once after ms milliseconds, on the main thread. Returns an
+        id that after_cancel() accepts."""
+        self._timer_id += 1
+        tid = self._timer_id
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def fire():
+            self._timers.pop(tid, None)
+            fn()
+        timer.timeout.connect(fire)
+        self._timers[tid] = timer
+        timer.start(int(ms))
+        return tid
+
+    def after_cancel(self, tid: int) -> None:
+        """Cancel a timer started with after() (if it hasn't fired yet)."""
+        timer = self._timers.pop(tid, None)
+        if timer is not None:
+            timer.stop()
+
+    # ── Window placement ─────────────────────────────────────────────────
+
+    def _place_window(self) -> None:
+        """Size the window to fit the usable screen area (taskbar excluded)
+        and centre it. Qt handles display scaling itself, so sizes here are
+        in scaled ("logical") pixels."""
+        area = QGuiApplication.primaryScreen().availableGeometry()
+        w, h = min(1180, int(area.width() * 0.95)), min(920, int(area.height() * 0.92))
+        self.resize(w, h)
+        self.move(area.x() + (area.width() - w) // 2, area.y() + (area.height() - h) // 2)
+        log_event(logging.INFO, "window_placed", gui="qt", size_logical=[w, h],
+                  screen_area=[area.x(), area.y(), area.width(), area.height()])
+
+    # ── Interpreter page ─────────────────────────────────────────────────
+
+    def _build_interpreter_page(self) -> QWidget:
+        """Build the Interpreter page, top to bottom: the header with the
+        action buttons, the settings card (can be hidden), one strip per
+        channel, the conversation, and the status line."""
+        page = QWidget()
+        page.setObjectName("interpreterPage")   # FluentWindow needs a unique name
+        root = QVBoxLayout(page)
+        root.setContentsMargins(24, 16, 24, 12)
+        root.setSpacing(10)
+
+        # Header: title, GPU/CPU badge, status pill, actions
+        header = QHBoxLayout()
+        header.addWidget(TitleLabel("Voice Interpreter"))
+        self.hw_badge = self._pill(" GPU " if WHISPER_DEVICE == "cuda" else " CPU ",
+                                   OK if WHISPER_DEVICE == "cuda" else "#2980B9")
+        self.status_badge = self._pill(" IDLE ", WARN)
+        header.addWidget(self.hw_badge)
+        header.addWidget(self.status_badge)
+        header.addStretch(1)
+        clear_btn = PushButton()
+        clear_btn.setText("Clear")
+        clear_btn.setIcon(FIF.BROOM)
+        clear_btn.clicked.connect(self._clear)
+        report_btn = PushButton()
+        report_btn.setText("Report a mistake")
+        report_btn.setIcon(FIF.FEEDBACK)
+        report_btn.setToolTip("Mark a recent phrase as wrong. Its audio and what went wrong\n"
+                              "are saved, so the problem can be found and fixed, and the\n"
+                              "simulator can replay it to check the fix.")
+        report_btn.clicked.connect(self._report_mistake)
+        # Fold the settings away to give the conversation more room; remembered.
+        self.settings_btn = TogglePushButton()
+        self.settings_btn.setText("Settings")
+        self.settings_btn.setIcon(FIF.SETTING)
+        self.settings_btn.setToolTip("Show or hide the settings (more room for the conversation)")
+        self.settings_btn.clicked.connect(self._toggle_settings)
+        for b in (clear_btn, report_btn, self.settings_btn):
+            header.addWidget(b)
+        root.addLayout(header)
+
+        self.settings_card = self._build_settings_card()
+        root.addWidget(self.settings_card)
+        show = bool(load_settings().get("show_settings", True))
+        self.settings_card.setVisible(show)
+        self.settings_btn.setChecked(show)
+
+        # One strip per channel, side by side
+        strips = QHBoxLayout()
+        strips.setSpacing(10)
+        for ch in self.channels:
+            ch.strip = ChannelStrip(ch.colour)
+            ch.strip.show_settings(ch.settings)
+            ch.strip.mute_btn.clicked.connect(partial(_ignore_signal_value,
+                                                      callback=partial(self._toggle_channel_mute, ch)))
+            ch.strip.speak_btn.clicked.connect(partial(_ignore_signal_value,
+                                                       callback=partial(self._toggle_channel_speak, ch)))
+            strips.addWidget(ch.strip, 1)
+        root.addLayout(strips)
+
+        # The conversation, with text size buttons (caption guidance:
+        # readers must control the size)
+        title_row = QHBoxLayout()
+        title_row.addWidget(StrongBodyLabel("Conversation"))
+        title_row.addStretch(1)
+        title_row.addWidget(CaptionLabel("Text size"))
+        for text, step in (("A−", -1), ("A+", 1)):
+            b = PushButton()
+            b.setText(text)
+            b.setFixedWidth(52)
+            b.setToolTip("Smaller / larger conversation text")
+            b.clicked.connect(lambda _=False, d=step: self._change_text_size(d))
+            title_row.addWidget(b)
+        root.addLayout(title_row)
+        self.conversation = ConversationView([c.settings.name for c in self.channels],
+                                             [c.colour for c in self.channels])
+        self._text_size = int(load_settings().get("text_size", 13))
+        self.conversation.set_text_size(self._text_size)
+        root.addWidget(self.conversation, 1)
+
+        self.status_label = CaptionLabel("Loading Whisper model…")
+        root.addWidget(self.status_label)
+        self.status_var = QVar(self.status_label.text, self.status_label.setText)
+        return page
+
+    def _build_settings_card(self) -> SimpleCardWidget:
+        """The settings card: one column per channel (name, device,
+        languages, sensitivity, output, replay), then the settings both
+        channels share (model, previews, other languages)."""
+        card = SimpleCardWidget()
+        grid = QGridLayout(card)
+        grid.setContentsMargins(16, 12, 16, 12)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        def label(text: str, tip: str) -> BodyLabel:
+            """A settings label with a hover explanation."""
+            l = BodyLabel(text)
+            l.setToolTip(tip)
+            return l
+
+        in_labels = [lbl for _, lbl in self._input_devices]
+        out_labels = [lbl for _, lbl in self._output_devices]
+        targets = sorted(core.TARGET_LANGUAGES)
+        refresh = PushButton()
+        refresh.setIcon(FIF.SYNC)
+        refresh.setToolTip("Re-scan audio devices (e.g. after plugging one in)")
+        refresh.clicked.connect(self._refresh_devices)
+        listen_label = QHBoxLayout()
+        listen_label.addWidget(label("Listen to", "Device to listen to. 🔊 = what an output "
+                                                  "device (e.g. the FiiO in a call) is playing."))
+        listen_label.addWidget(refresh)
+        listen_label.addStretch(1)
+        grid.addWidget(label("Name", "Shown in the conversation"), 1, 0)
+        grid.addLayout(listen_label, 2, 0)
+        grid.addWidget(label("Translate", "Language spoken → language shown"), 3, 0)
+        grid.addWidget(label("Speech sensitivity",
+                             "Higher = also catch quieter/less clear speech. Changes what "
+                             "counts as speech, not the volume."), 4, 0)
+        grid.addWidget(label("Speak and replay to", "Output device for Speak (this channel's "
+                                                    "translations read aloud) and for replay"), 5, 0)
+
+        for col, ch in enumerate(self.channels, start=1):
+            s = ch.settings
+            heading = StrongBodyLabel(f"Channel {ch.index + 1}")
+            heading.setTextColor(QColor(ch.colour), QColor(ch.colour))
+            name_edit = LineEdit()
+            name_edit.setText(s.name)
+            name_edit.setMaxLength(16)
+            device_combo = ComboBox()
+            _fill_combo(device_combo, in_labels, s.device)
+            src_combo, tgt_combo = ComboBox(), ComboBox()
+            # The source list starts with "Auto-detect" (the language of each
+            # phrase is detected); a target must be a real language.
+            src_combo.addItems(["Auto-detect"] + targets)
+            tgt_combo.addItems(targets)
+            _set_combo_text(src_combo, s.src)
+            _set_combo_text(tgt_combo, s.tgt)
+            sens_slider = Slider(Qt.Orientation.Horizontal)
+            sens_slider.setRange(0, 100)
+            sens_slider.setValue(int(round(s.sensitivity * 100)))
+            sens_value = BodyLabel(f"{sens_slider.value()}%")
+            out_combo = ComboBox()
+            _fill_combo(out_combo, out_labels, s.output)
+            replay_check = CheckBox("Hear input through output (VB-Audio cables only)")
+            replay_check.setChecked(s.replay)
+            ch.controls = ChannelControls(name_edit, device_combo, src_combo, tgt_combo,
+                                          sens_slider, sens_value, out_combo, replay_check)
+
+            lang_row = QHBoxLayout()
+            lang_row.addWidget(src_combo, 1)
+            lang_row.addWidget(BodyLabel("→"))
+            lang_row.addWidget(tgt_combo, 1)
+            sens_row = QHBoxLayout()
+            sens_row.addWidget(sens_slider, 1)
+            sens_row.addWidget(sens_value)
+            grid.addWidget(heading, 0, col)
+            grid.addWidget(name_edit, 1, col)
+            grid.addWidget(device_combo, 2, col)
+            grid.addLayout(lang_row, 3, col)
+            grid.addLayout(sens_row, 4, col)
+            grid.addWidget(out_combo, 5, col)
+            grid.addWidget(replay_check, 6, col)
+            grid.setColumnStretch(col, 1)
+
+            # ── control events (partial() fixes which channel they are for)
+            name_edit.editingFinished.connect(partial(self._on_channel_name, ch))
+            device_combo.currentTextChanged.connect(
+                partial(_ignore_signal_value, callback=partial(self._on_channel_device, ch)))
+            src_combo.currentTextChanged.connect(
+                partial(_ignore_signal_value, callback=partial(self._on_channel_languages, ch)))
+            tgt_combo.currentTextChanged.connect(
+                partial(_ignore_signal_value, callback=partial(self._on_channel_languages, ch)))
+            sens_slider.valueChanged.connect(partial(self._on_channel_sensitivity, ch))
+            out_combo.currentTextChanged.connect(
+                partial(_ignore_signal_value, callback=partial(self._on_channel_output, ch)))
+            replay_check.stateChanged.connect(
+                partial(_ignore_signal_value, callback=partial(self._on_channel_replay, ch)))
+
+        # Shared by both channels: one Whisper model serves both
+        saved = load_settings()
+        self.model_combo = ComboBox()
+        self.model_combo.addItems(list(MODELS))
+        saved_model = saved.get("model")
+        if isinstance(saved_model, str):
+            saved_model = saved_model.replace(chr(0x2014), "-")
+        if not isinstance(saved_model, str) or saved_model not in MODELS:
+            saved_model = DEFAULT_MODEL_GPU if WHISPER_DEVICE == "cuda" else DEFAULT_MODEL_CPU
+        _set_combo_text(self.model_combo, saved_model)
+        self.preview_combo = ComboBox()
+        self.preview_combo.addItems(list(PREVIEW_CHOICES))
+        choice = saved.get("preview_model")
+        if choice not in PREVIEW_CHOICES:
+            choice = "Tiny (instant)" if saved.get("fast_preview", False) else "Small (balanced)"
+        _set_combo_text(self.preview_combo, choice)
+        # Automatic language detection (see LANG_SWITCH_PROB in interpreter.py)
+        self.auto_lang_check = CheckBox("Detect other languages")
+        self.auto_lang_check.setToolTip(
+            "If a phrase is clearly in another language (e.g. a German song while\n"
+            "listening for Russian), recognise it in that language, label it\n"
+            "[German] and translate it. Off: label it but don't translate it.")
+        self.auto_lang_check.setChecked(bool(saved.get("auto_language", True)))
+        shared = QHBoxLayout()
+        shared.addWidget(self.model_combo, 1)
+        shared.addSpacing(16)
+        shared.addWidget(label("Previews", "Model for the live grey text"))
+        shared.addWidget(self.preview_combo, 1)
+        shared.addSpacing(16)
+        shared.addWidget(self.auto_lang_check)
+        grid.addWidget(label("Model", "Whisper model for the final text (both channels)"), 7, 0)
+        grid.addLayout(shared, 7, 1, 1, len(self.channels))
+
+        # Adapters for the borrowed logic (it calls .get() and .set())
+        self.model_var = QVar(self.model_combo.currentText,
+                              partial(_set_combo_text, self.model_combo), self.model_combo)
+        self.preview_choice_var = QVar(self.preview_combo.currentText,
+                                       partial(_set_combo_text, self.preview_combo),
+                                       self.preview_combo)
+        self.model_combo.currentTextChanged.connect(
+            partial(_ignore_signal_value, callback=self._on_model_change))
+        self.preview_combo.currentTextChanged.connect(
+            partial(_ignore_signal_value, callback=self._on_preview_choice))
+        self.auto_lang_check.stateChanged.connect(self._on_auto_language)
+        return card
+
+    @staticmethod
+    def _pill(text: str, colour: str) -> QLabel:
+        """A small rounded coloured label (status badge)."""
+        l = QLabel(text)
+        l.setStyleSheet(f"background:{colour}; color:white; border-radius:6px; "
+                        f"padding:3px 8px; font-weight:600;")
+        return l
+
+    def _set_live_status(self, text: str, color: str) -> None:
+        """Show a status word (LISTENING, MUTED…) in the coloured badge."""
+        self.status_badge.setText(f" {text} ")
+        self.status_badge.setStyleSheet(f"background:{color}; color:white; border-radius:6px; "
+                                        f"padding:3px 8px; font-weight:600;")
+
+    def _update_live_status(self) -> None:
+        """The badge sums up both channels: LISTENING if either listens."""
+        if self.is_listening:
+            if self._listening_since is None:
+                self._listening_since = time.monotonic()
+            self._set_live_status("LISTENING", OK)
+            return
+        self._listening_since = None
+        if all(c.settings.muted for c in self.channels):
+            self._set_live_status("MUTED", BAD)
+        else:
+            self._set_live_status("IDLE", WARN)
+
+    # ── Settings changes ─────────────────────────────────────────────────
+
+    def _save_channels(self) -> None:
+        core.save_settings(channels=[asdict(c.settings) for c in self.channels])
+
+    def _on_channel_name(self, ch: Channel) -> None:
+        """Name edited: used for new log lines and redrawn everywhere."""
+        name = ch.controls.name_edit.text().strip() or f"Channel {ch.index + 1}"
+        if name == ch.settings.name:
+            return
+        ch.settings.name = name
+        self._save_channels()
+        ch.strip.show_settings(ch.settings)
+        self.conversation.set_names([c.settings.name for c in self.channels])
+        log_event(logging.INFO, "channel_renamed", channel=ch.index, name=name)
+
+    def _on_channel_device(self, ch: Channel) -> None:
+        """A different device chosen: listen to it instead."""
+        ch.settings.device = _combo_device(ch.controls.device_combo)
+        # Refill: a "(not connected)" entry that is no longer chosen disappears
+        _fill_combo(ch.controls.device_combo, [lbl for _, lbl in self._input_devices],
+                    ch.settings.device)
+        self._save_channels()
+        ch.strip.show_settings(ch.settings)
+        ch.failures, ch.retry_at, ch.missing_checks = 0, 0.0, 0
+        self._restart_channel(ch)
+
+    def _on_channel_languages(self, ch: Channel) -> None:
+        """Spoken or shown language changed: restart this channel."""
+        ch.settings.src = ch.controls.src_combo.currentText()
+        ch.settings.tgt = ch.controls.tgt_combo.currentText()
+        self._save_channels()
+        ch.strip.show_settings(ch.settings)
+        if MODELS[self.model_var.get()] == "tiny" and ch.settings.src != "English":
+            self.status_var.set("Note: Tiny makes many mistakes in non-English speech; "
+                                "use Turbo or Medium.")
+        self._restart_channel(ch)
+
+    def _on_channel_sensitivity(self, ch: Channel, value: int) -> None:
+        """Sensitivity slider moved: apply it to the capture thread at once;
+        save and log it only once the slider has settled for 0.5 s."""
+        v = round(value / 100, 2)
+        ch.settings.sensitivity = v
+        ch.controls.sens_value.setText(f"{value}%")
+        if ch.capture is not None:
+            ch.capture.set_sensitivity(v)
+        if ch.sens_log_after is not None:
+            self.after_cancel(ch.sens_log_after)
+
+        def settled() -> None:
+            """Runs once the slider has been still for 0.5 s: save and log."""
+            ch.sens_log_after = None
+            self._save_channels()
+            log_event(logging.INFO, "sensitivity_changed", channel=ch.settings.name, value=v,
+                      run_id=ch.run_id, session_id=self.session_id,
+                      vad_threshold=round(vad_threshold_for(v), 2),
+                      speech_score_now=round(ch.strip.speech_meter.shown, 2))
+        ch.sens_log_after = self.after(500, settled)
+
+    def _on_channel_output(self, ch: Channel) -> None:
+        """Output device changed. It also decides which channel must ignore
+        this speaker's voice, so both channels restart."""
+        ch.settings.output = _combo_device(ch.controls.out_combo)
+        _fill_combo(ch.controls.out_combo, [lbl for _, lbl in self._output_devices],
+                    ch.settings.output)
+        self._save_channels()
+        if ch.settings.speak:
+            self._configure_speaker(ch)
+        self._restart_session()
+
+    def _on_channel_replay(self, ch: Channel) -> None:
+        ch.settings.replay = ch.controls.replay_check.isChecked()
+        self._save_channels()
+        self._restart_channel(ch)
+
+    def _on_model_change(self) -> None:
+        """Model menu changed: save, load the new model, restart both channels."""
+        log_event(logging.INFO, "whisper_model_reload_requested", selected_model=self.model_var.get())
+        core.save_settings(model=self.model_var.get())
+        if (MODELS[self.model_var.get()] == "tiny"
+                and any(c.settings.src != "English" for c in self.channels)):
+            self.after(1500, lambda: self.status_var.set(
+                "Note: Tiny makes many mistakes in non-English speech; use Turbo or Medium."))
+        self._stop_all()
+        self._whisper_model = None
+        self._preload_model()
+        self._ensure_preview_model()
+        self._start_all()
+
+    def _on_auto_language(self, *_: object) -> None:
+        """'Detect other languages' ticked/unticked: save and apply now
+        (the workers read the flag for each phrase; no restart needed)."""
+        on = self.auto_lang_check.isChecked()
+        core.save_settings(auto_language=on)
+        for ch in self.channels:
+            for worker in ch.workers:
+                worker.auto_language = on
+        log_event(logging.INFO, "auto_language_changed", enabled=on)
+
+    def _toggle_settings(self) -> None:
+        """Settings button: show or hide the settings card (remembered)."""
+        show = not self.settings_card.isVisible()
+        self.settings_card.setVisible(show)
+        self.settings_btn.setChecked(show)
+        core.save_settings(show_settings=show)
+
+    def _change_text_size(self, step: int) -> None:
+        """A−/A+ buttons: change the conversation font size (9-28 pt), saved."""
+        self._text_size = max(9, min(28, self._text_size + step))
+        self.conversation.set_text_size(self._text_size)
+        core.save_settings(text_size=self._text_size)
+
+    def _toggle_channel_mute(self, ch: Channel) -> None:
+        """A strip's Mute button: stop listening to that channel (and release
+        its device), or start again."""
+        ch.settings.muted = not ch.settings.muted
+        self._save_channels()
+        ch.strip.show_settings(ch.settings)
+        if ch.settings.muted:
+            self._stop_channel(ch)
+            ch.strip.set_status("Muted - not listening.", BAD)
+        else:
+            ch.failures, ch.retry_at = 0, 0.0
+            self._start_channel(ch)
+        self._update_live_status()
+        log_event(logging.INFO, "mute_toggled", channel=ch.settings.name, muted=ch.settings.muted)
+
+    def _toggle_channel_speak(self, ch: Channel) -> None:
+        """A strip's Speak button: read this channel's translations aloud
+        through its output device, or stop doing so."""
+        if ch.speaker.error and not ch.speaker.is_alive():
+            self.status_var.set(f"Text-to-speech unavailable: {ch.speaker.error}")
+            ch.strip.speak_btn.setChecked(False)
+            return
+        ch.settings.speak = not ch.settings.speak
+        self._save_channels()
+        ch.strip.show_settings(ch.settings)
+        if ch.settings.speak:
+            self._configure_speaker(ch)
+        else:
+            ch.speaker.stop_speech()
+        log_event(logging.INFO, "tts_toggled", channel=ch.settings.name, enabled=ch.settings.speak)
+
+    def _configure_speaker(self, ch: Channel) -> None:
+        """Point the channel's voice at its output device and target language."""
+        ch.speaker.configure(ch.settings.output, ch.settings.tgt)
+
+        def report_error() -> None:
+            """0.3 s later: show the problem if the voice couldn't be set up."""
+            if ch.speaker.error:
+                self.status_var.set(f"{ch.settings.name}: {ch.speaker.error}")
+        self.after(300, report_error)
+
+    def _clear(self) -> None:
+        """Clear button: empty the conversation (listening carries on)."""
+        self.conversation.reset()
+        self.status_var.set("Cleared.")
+        log_event(logging.INFO, "ui_cleared")
+
+    def _refresh_devices(self) -> None:
+        """The ⟳ button: re-scan audio devices, then restart both channels."""
+        self._stop_all()
+        self._rescan_devices()
+        self.status_var.set(f"Refreshed - {len(self._input_devices)} in / "
+                            f"{len(self._output_devices)} out device(s).")
+        log_event(logging.INFO, "audio_devices_refreshed",
+                  input_count=len(self._input_devices), output_count=len(self._output_devices))
+        for ch in self.channels:
+            ch.failures, ch.retry_at = 0, 0.0
+        self._start_all()
+
+    def _rescan_devices(self) -> None:
+        """Find the audio devices again (their numbers change when a USB
+        device is re-plugged) and refill the device menus."""
+        self._input_devices, self._output_devices = get_audio_devices()
+        self._input_map = {lbl: idx for idx, lbl in self._input_devices}
+        self._output_map = {lbl: idx for idx, lbl in self._output_devices}
+        in_labels = [lbl for _, lbl in self._input_devices]
+        out_labels = [lbl for _, lbl in self._output_devices]
+        for ch in self.channels:
+            _fill_combo(ch.controls.device_combo, in_labels, ch.settings.device)
+            _fill_combo(ch.controls.out_combo, out_labels, ch.settings.output)
+            ch.needs_rescan = False
+
+    # ── Starting and stopping the channels ───────────────────────────────
+    # The app listens continuously; a settings change restarts the channel
+    # concerned, and a channel's Mute button is the only way to stop it.
+
+    def _model_ready(self) -> bool:
+        """True when the Whisper model can be used. While it is still
+        loading, says so and tries starting again shortly."""
+        loader = self._model_loader
+        if loader is not None and not loader.ready.is_set():
+            self.status_var.set("⏳ Loading Whisper model - please wait…")
+            if self._start_retry_after_id is None:
+                self._start_retry_after_id = self.after(600, self._retry_start)
+            return False
+        if self._whisper_model is None and loader is not None:
+            if loader.error:
+                self.status_var.set(f"Cannot start: {loader.error}")
+                self._set_live_status("MODEL ERROR", BAD)
+                log_event(logging.ERROR, "session_start_blocked_model_error", error=loader.error)
+                return False
+            self._whisper_model = loader.model
+            if getattr(loader, "used_fallback", False):
+                self._set_live_status("CPU FALLBACK", WARN)
+                self.model_var.set(loader.default_model_key)
+        if self._whisper_model is None:
+            self.status_var.set("Whisper model unavailable.")
+            log_event(logging.ERROR, "session_start_blocked_model_unavailable")
+            return False
+        return True
+
+    def _retry_start(self) -> None:
+        """Timer callback: try starting again (the model was still loading)."""
+        self._start_retry_after_id = None
+        self._start_all()
+
+    def _start_all(self) -> None:
+        for ch in self.channels:
+            self._start_channel(ch)
+
+    def _stop_all(self) -> None:
+        if self._start_retry_after_id is not None:
+            self.after_cancel(self._start_retry_after_id)
+            self._start_retry_after_id = None
+        for ch in self.channels:
+            self._stop_channel(ch)
+
+    def _restart_session(self) -> None:
+        """Restart both channels (e.g. the Previews choice changed). The
+        borrowed _on_preview_choice calls this."""
+        self._stop_all()
+        self._start_all()
+
+    def _restart_channel(self, ch: Channel) -> None:
+        self._stop_channel(ch)
+        self._start_channel(ch)
+
+    def _channel_problem(self, ch: Channel, text: str, colour: str = WARN,
+                         **details: Any) -> None:
+        """Show why a channel isn't listening on its strip (logged once,
+        with any `details` that help to diagnose it from the log)."""
+        if text != ch.problem:
+            log_event(logging.WARNING, "channel_not_listening", channel=ch.settings.name,
+                      device=ch.settings.device, problem=text, **details)
+        ch.problem = text
+        ch.strip.set_status(text, colour)
+        ch.strip.status_label.setToolTip(text)
+
+    def _device_missing(self, ch: Channel) -> None:
+        """The channel's device isn't in Windows' device list: unplugged,
+        switched off, disabled, or renamed (a driver update or another USB
+        port can give it a new name). Say so, suggest a connected device that
+        looks similar, but never switch silently: a wrong guess would
+        translate the wrong person."""
+        name = plain_device_name(ch.settings.device) or "the device"
+        labels = [lbl for _, lbl in self._input_devices]
+        similar = similar_devices(ch.settings.device, labels)
+        hint = (f" Similar device connected: {plain_device_name(similar[0])}."
+                if similar else "")
+        self._channel_problem(
+            ch, f"⚠ {name} is not connected. Plug it in, or choose another device "
+                f"in Settings → Listen to.{hint}",
+            similar=similar, available=labels)
+
+    def _start_channel(self, ch: Channel) -> None:
+        """Start one channel's pipeline with its current settings (unless it
+        is muted, already listening, or its device isn't there)."""
+        if ch.listening or ch.settings.muted or not self._initialised or self._closing:
+            return
+        if not self._model_ready():
+            return
+        s = ch.settings
+        if s.device not in self._input_map:
+            self._device_missing(ch)
+            return
+        twin = next((c for c in self.channels
+                     if c is not ch and c.listening and c.settings.device == s.device), None)
+        if twin is not None:
+            self._channel_problem(ch, f"⚠ Same device as {twin.settings.name}: choose another "
+                                      f"in Settings.")
+            return
+        self._run_id += 1
+        ch.run_id = self._run_id
+        ch.first_preview, ch.pending_translation = {}, {}
+        if s.speak:
+            self._configure_speaker(ch)
+        config = SessionConfig(
+            session_id=self.session_id,
+            run_id=ch.run_id,
+            device_label=s.device,
+            device_index=self._input_map[s.device],
+            output_label=s.output,
+            output_index=self._output_map.get(s.output),
+            loopback=s.replay,
+            src_key=s.src,
+            tgt_key=s.tgt,
+            model_label=self.model_var.get(),
+            sensitivity=s.sensitivity,
+            preview_choice=self.preview_choice_var.get(),
+            preview_enabled=self._preview_enabled,
+            previews_off=self._previews_off,
+            tts_on=s.speak,
+            record_audio=bool(load_settings().get("record_audio", True)),
+            auto_language=self.auto_lang_check.isChecked(),
+            # Every language either channel uses: candidates for a short,
+            # unclear phrase (see TranscriptionWorker._recent_langs)
+            mode_state=tuple(("", c.settings.src, c.settings.tgt) for c in self.channels),
+            channel=s.name,
+            tag=(ch.index, ch.run_id),
+        )
+        log_event(logging.INFO, "audio_device_selected", channel=s.name,
+                  device_label=s.device, device_index=config.device_index)
+        try:
+            ch.controller.start(
+                config,
+                model=self._whisper_model,
+                model_loader=self._model_loader,
+                speaker=None,
+                on_level=None,
+                preview_model=self._preview_model,
+                translator_for=self._translator_for,
+                music_scene=self._music_scene_for(ch),
+                mute_event=self._mute_event_for(ch),
+            )
+        except Exception as exc:
+            ch.controller.stop_workers()
+            ch.failures += 1
+            ch.retry_at = time.monotonic() + min(30, 2 ** ch.failures)
+            self._channel_problem(ch, f"⚠ Could not start: {exc}", BAD)
+            log_exception("session_start_failed", exc, channel=s.name, device_label=s.device,
+                          model=config.model_label, run_id=config.run_id)
+            return
+        ch.listening = True
+        ch.problem = None
+        ch.strip.set_status("Listening…")
+        self.status_var.set("Listening…")
+        self._update_live_status()
+
+    def _stop_channel(self, ch: Channel) -> None:
+        """Stop one channel's pipeline and clear its meters and previews."""
+        was_listening = ch.listening
+        ch.listening = False
+        ch.controller.stop_workers()
+        ch.strip.reset_meters()
+        self.conversation.drop_previews(ch.index)
+        if was_listening:
+            ch.strip.set_status("Stopped.")
+            log_event(logging.INFO, "session_stopped", session_id=self.session_id,
+                      channel=ch.settings.name, run_id=ch.run_id)
+        self._update_live_status()
+
+    def _mute_event_for(self, ch: Channel) -> AnyEvent | None:
+        """When a channel listens to what an output device plays, it must
+        ignore our own text-to-speech on that device (or it would translate
+        it again). Returns a flag that is set while any speaker that uses
+        this device is talking, or None if none does."""
+        if "[loopback]" not in ch.settings.device.lower():
+            return None
+        device = plain_device_name(ch.settings.device)
+        events = [c.speaker.speaking for c in self.channels
+                  if plain_device_name(c.settings.output) == device]
+        return AnyEvent(events) if events else None
+
+    def _music_scene_for(self, ch: Channel) -> Any:
+        """The channel's music detector (music.py), created once and kept
+        across restarts. The second channel's detector shares the first
+        one's models. "music_mode": false in interpreter.settings.json turns
+        it off; "vocal_separation": false keeps the detection but skips
+        removing the instruments."""
+        if ch.music_scene is None:
+            settings = load_settings()
+            shared = next((c.music_scene for c in self.channels if c.music_scene is not None), None)
+            name = ch.settings.name
+
+            def log(event: str, **fields: Any) -> None:
+                log_event(logging.INFO, event, channel=name, **fields)
+            try:
+                from music import MusicScene
+                ch.music_scene = MusicScene(enabled=bool(settings.get("music_mode", True)),
+                                            separate=bool(settings.get("vocal_separation", True)),
+                                            log=log, models_from=shared)
+            except Exception as e:
+                log_exception("music_scene_unavailable", e, channel=name)
+                return None
+        return ch.music_scene if ch.music_scene.enabled else None
+
+    # ── Results from the channels ────────────────────────────────────────
+
+    def _poll_queue(self) -> None:
+        """Runs every 15 ms on the main thread: handle every message the
+        background threads have sent, and update the window. This is the
+        only place results reach the screen."""
+        now = time.monotonic()
+        if self._last_poll_t is not None:
+            # >0 means the window was busy and results waited
+            self._ui_stats.add("poll_lag_ms", (now - self._last_poll_t) * 1000 - 15)
+        self._last_poll_t = now
+        handled = 0
+        try:
+            while True:
+                message = self.result_queue.get_nowait()
+                handled += 1
+                try:
+                    self._handle_message(message)
+                except Exception as e:      # one bad message must not stop the window
+                    log_exception("ui_message_failed", e)
+        except queue.Empty:
+            pass
+        if handled:
+            self._ui_stats.add("msgs_per_poll", handled)
+        self.after(15, self._poll_queue)
+
+    def _handle_message(self, message: tuple[Any, Any]) -> None:
+        """Act on one message from the result queue.
+
+        A channel's messages arrive as ((channel number, run id), (kind,
+        data)) (see TaggedQueue); the window's own as (kind, data), e.g.
+        ("status", "Loading…") from the model loader.
+
+        kinds:  partial     live preview of a phrase still being spoken
+                final       a phrase's final text (+ translation, or None)
+                translated  an online translation arrived
+                status      a message for the status line
+                level       one audio block's level, for the meters
+                metric      a timing figure for Diagnostics
+        """
+        if isinstance(message[0], str):          # the window's own message
+            kind, data = message
+            if kind == "status":
+                self.status_var.set(data)
+                log_event(logging.INFO, "status_updated", status=data)
+            return
+        (index, run_id), (kind, data) = message
+        ch = self.channels[index]
+        if kind == "translated":
+            # Online translations can arrive after a restart: the phrase is
+            # still on screen, so show it anyway.
+            seq, text = data
+            self._show_translation(ch, (index, run_id, seq), text)
+            return
+        if run_id != ch.run_id or not ch.listening:
+            return                               # from a pipeline that was stopped
+        if kind == "partial":
+            seq, heard, translated, t_start, t_ready = data
+            self.conversation.show_preview((index, run_id, seq), index, heard, translated)
+            now = time.monotonic()
+            self._ui_stats.add("preview_ui_ms", (now - t_ready) * 1000)
+            if seq not in ch.first_preview and t_start:
+                ch.first_preview[seq] = round((now - t_start) * 1000, 1)
+        elif kind == "final":
+            self._show_final(ch, (index, run_id, data[0]), *data[1:])
+        elif kind == "status":
+            ch.strip.set_status(data, BAD if data.startswith(("ERROR", "⚠")) else None)
+            self.status_var.set(f"{ch.settings.name}: {data}")
+            log_event(logging.INFO, "status_updated", channel=ch.settings.name, status=data)
+        elif kind == "level":
+            self._update_meter(ch, *data)
+        elif kind == "metric":
+            self._update_metric(*data)
+
+    def _show_final(self, ch: Channel, key: tuple[int, int, int], text: str,
+                    translated: str | None, trace: dict[str, Any] | None) -> None:
+        """A phrase is finished: show it, speak its translation, or send it
+        to the online translator if no local translation was possible."""
+        self.conversation.commit(key, ch.index, text, translated)
+        if not text:
+            return
+        if trace:
+            self._log_displayed(ch, key, trace, online=translated is None)
+        if translated is not None:
+            self._show_translation(ch, key, translated)
+            return
+        seq = key[2]
+        request = (seq, text, ch.settings.src, ch.settings.tgt)
+        try:
+            ch.controller.translation_queue.put(request, timeout=0.1)
+            backlog = ch.controller.translation_queue.qsize()
+            log_event(logging.INFO, "translation_queued", channel=ch.settings.name,
+                      input_chars=len(text), src_lang=ch.settings.src, tgt_lang=ch.settings.tgt,
+                      queue_backlog=backlog)
+            if backlog >= core.TRANSLATION_QUEUE_BACKLOG_WARN:
+                log_event(logging.WARNING, "translation_queue_backlog_high", backlog=backlog)
+        except queue.Full:
+            self.conversation.set_translation(key, "")
+            log_event(logging.WARNING, "translation_dropped_queue_full", channel=ch.settings.name,
+                      input_chars=len(text), src_lang=ch.settings.src, tgt_lang=ch.settings.tgt)
+
+    def _show_translation(self, ch: Channel, key: tuple[int, int, int], text: str) -> None:
+        """Show a translation, remember it for 'Report a mistake', and speak
+        it if the channel's Speak is on."""
+        self.conversation.set_translation(key, text)
+        if key in self._recent_finals:
+            self._recent_finals[key]["translation"] = text
+        if ch.settings.speak and text:
+            ch.speaker.say(text)
+        trace = ch.pending_translation.pop(key[2], None) if key[1] == ch.run_id else None
+        if trace:
+            log_event(logging.INFO, "translation_displayed", channel=ch.settings.name,
+                      run_id=trace["run_id"], seq=key[2],
+                      speech_end_to_translation_ms=round((time.monotonic() - trace["t_end"]) * 1000, 1))
+
+    def _update_meter(self, ch: Channel, rms_db: float, peak_db: float, speaking: bool,
+                      prob: float = 0.0, threshold: float = 0.5) -> None:
+        """Called for every audio block (via the result queue): update the
+        channel's meters, and keep the last ~10 s for Diagnostics."""
+        ch.strip.update_levels(rms_db, peak_db, speaking, prob, threshold)
+        if rms_db > -99:
+            ch.levels.append(rms_db)
+            ch.peak_recent = max(peak_db, ch.peak_recent - 0.05)
+        ch.speech_flags.append(bool(speaking))
+
+    def _log_displayed(self, ch: Channel, key: tuple[int, int, int], trace: dict[str, Any],
+                       online: bool) -> None:
+        """Log how long a finished phrase took to reach the screen
+        ("phrase_displayed"), and keep it for Diagnostics and 'Report a
+        mistake'."""
+        seq = key[2]
+        now = time.monotonic()
+        first_preview = ch.first_preview.pop(seq, None)
+        log_event(logging.INFO, "phrase_displayed", session_id=self.session_id,
+                  channel=ch.settings.name, run_id=trace["run_id"], seq=seq,
+                  ui_ms=round((now - trace["t_result"]) * 1000, 1),
+                  speech_end_to_text_ms=round((now - trace["t_end"]) * 1000, 1),
+                  first_preview_ms=first_preview, online_translation_pending=online)
+        if online:
+            ch.pending_translation[seq] = trace
+        self._recent_finals[key] = {"time": time.strftime("%H:%M:%S"), "who": ch.settings.name,
+                                    "trace": trace, "text": trace.get("text") or "",
                                     "translation": trace.get("translation") or ""}
         while len(self._recent_finals) > 30:
-            self._recent_finals.pop(next(iter(self._recent_finals)))
-        now = time.monotonic()
+            self._recent_finals.popitem(last=False)
         retry = trace.get("retry")
         retry_data = cast(dict[str, Any], retry) if isinstance(retry, dict) else {}
         self._phrases.append({
             "time": time.strftime("%H:%M:%S"),
+            "who": ch.settings.name,
+            "channel": ch.index,
             "pause_to_text": (now - trace["t_end"]) * 1000,
             "first_preview": first_preview,
             # recognition time: for an early-transcribed phrase the work was
@@ -1158,6 +1999,84 @@ class QtInterpreterApp(FluentWindow):
             "text": trace.get("text") or "",
         })
 
+    # ── Keeping both channels alive ──────────────────────────────────────
+
+    def _watchdog(self) -> None:
+        """Every WATCHDOG_SEC: restart a channel whose capture thread died or
+        gave up (device unplugged, driver reset) or whose worker exited,
+        instead of showing it as listening while nothing is heard. Waits
+        longer after each failure (2, 4, 8 … up to 30 s). A channel waiting
+        for its device is retried until the device is back; it never
+        silently switches to another device."""
+        if self._closing:
+            return
+        try:
+            now = time.monotonic()
+            for ch in self.channels:
+                if ch.settings.muted:
+                    continue
+                if ch.listening:
+                    capture = ch.capture
+                    problem = None
+                    if capture is not None and not capture.is_alive():
+                        problem = capture.failed or "capture thread stopped"
+                    elif any(not w.is_alive() for w in ch.workers):
+                        problem = "transcription worker stopped"
+                    if problem is None:
+                        ch.failures = 0
+                        continue
+                    ch.failures += 1
+                    wait = min(30, 2 ** ch.failures)
+                    log_event(logging.WARNING, "watchdog_restart", channel=ch.settings.name,
+                              problem=problem, attempt=ch.failures, next_check_sec=wait)
+                    self._stop_channel(ch)
+                    self._channel_problem(ch, f"⚠ {problem} - restarting…")
+                    ch.retry_at, ch.needs_rescan = now + wait, True
+                elif now >= ch.retry_at and self._whisper_model is not None:
+                    if ch.needs_rescan or ch.settings.device not in self._input_map:
+                        self._rescan_devices()
+                    self._start_channel(ch)
+                    if ch.listening:
+                        ch.missing_checks = 0
+                        log_event(logging.INFO, "watchdog_reconnected", channel=ch.settings.name,
+                                  device=ch.settings.device)
+                    else:
+                        # Still not there: look again, less often each time
+                        # (3, 6, 12, 24, then every 30 s). Every look re-scans
+                        # all devices; every 4 s filled the log and restarted
+                        # PortAudio while the other channel was recording.
+                        ch.missing_checks += 1
+                        ch.retry_at = now + min(30, 3 * 2 ** (ch.missing_checks - 1))
+        except Exception as e:
+            log_exception("watchdog_failed", e)
+        self.after(WATCHDOG_SEC * 1000, self._watchdog)
+
+    def _log_resources(self) -> None:
+        """Every STATS_INTERVAL_SEC: CPU, memory, GPU load and the window's
+        responsiveness, so slowdowns can be tied to resource limits."""
+        base = dict(listening=self.is_listening, run_id=self._run_id,
+                    result_queue=self.result_queue.qsize(),
+                    phrase_queue=sum(c.controller.phrase_queue.qsize() for c in self.channels),
+                    translation_queue=sum(c.controller.translation_queue.qsize()
+                                          for c in self.channels),
+                    **self._ui_stats.summary())
+
+        def measure() -> None:
+            """Background thread: read CPU, memory and GPU figures (slow
+            Windows calls), log them, and warn if anything is running low."""
+            t0 = time.perf_counter()
+            fields = core.collect_resource_stats(self)
+            fields["probe_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            log_event(logging.INFO, "resource_stats", **base, **fields)
+            warnings = core.resource_warnings(fields)
+            if warnings:
+                log_event(logging.WARNING, "resource_warning", problems=warnings,
+                          **{k: fields.get(k) for k in ("system_cpu_pct", "mem_available_mb",
+                                                         "gpu_mem_free_mb", "gpu_util_pct",
+                                                         "top_other_apps")})
+        threading.Thread(target=measure, name="resource-probe", daemon=True).start()
+        self.after(STATS_INTERVAL_SEC * 1000, self._log_resources)
+
     # ── Report a mistake ─────────────────────────────────────────────────
 
     def _report_mistake(self) -> None:
@@ -1168,22 +2087,24 @@ class QtInterpreterApp(FluentWindow):
                          orient=Qt.Orientation.Horizontal, isClosable=True,
                          position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self)
             return
-        dialog = ReportDialogMistake(self._recent_finals, self)
+        dialog = ReportDialogMistake(list(reversed(self._recent_finals.items())), self)
         if not dialog.exec():
             return
-        seq, problems, correct, lang, note = dialog.result_values()
-        entry = self._recent_finals[seq]
+        key, problems, correct, lang, note = dialog.result_values()
+        entry = self._recent_finals[key]
+        index, run_id, seq = cast(tuple[int, int, int], key)
+        ch = self.channels[index]
         audio: bytes | None = None
-        for worker in self._workers:
-            recent_audio = worker.recent_audio
-            if seq in recent_audio:
-                audio = recent_audio[seq]
-                break
+        if run_id == ch.run_id:                  # older runs' audio has gone with their worker
+            for worker in ch.workers:
+                if seq in worker.recent_audio:
+                    audio = worker.recent_audio[seq]
+                    break
         try:
             path = core.save_feedback(seq, audio, entry["trace"], entry["text"], entry["translation"],
                                       problems, correct, lang, note)
         except Exception as e:
-            log_exception("report_mistake_failed", e, seq=seq)
+            log_exception("report_mistake_failed", e, seq=seq, channel=ch.settings.name)
             return
         InfoBar.success(title="Thank you, saved",  # pyright: ignore[reportUnknownMemberType]
                         content=("Saved with its audio" if path else "Saved (audio no longer in memory)")
@@ -1295,12 +2216,12 @@ class QtInterpreterApp(FluentWindow):
         phrases_card = HeaderCardWidget()
         phrases_card.setTitle("Recent phrases")
         self.phrase_table = TableWidget()
-        cols = ["Time", "Model", "Pause→text", "1st preview", "Recognition", "Early", "Text"]
+        cols = ["Time", "Who", "Model", "Pause→text", "1st preview", "Recognition", "Early", "Text"]
         self.phrase_table.setColumnCount(len(cols))
         self.phrase_table.setHorizontalHeaderLabels(cols)
         self.phrase_table.verticalHeader().hide()
         self.phrase_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.phrase_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.phrase_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.phrase_table.setMinimumHeight(260)
         phrases_card.viewLayout.addWidget(self.phrase_table)
         lay.addWidget(phrases_card)
@@ -1338,21 +2259,45 @@ class QtInterpreterApp(FluentWindow):
         s.set("Early transcription used", "-" if early is None else f"{early:.0f} %",
               MUTED if early is None else OK if early >= 50 else WARN)
 
-        a = self.audio_card
-        lv = list(self._levels)
-        now_lv = lv[-1] if lv else None
-        a.set("Level now", "-" if now_lv is None else f"{now_lv:.1f} dBFS")
-        med = pct(lv, .5)
-        a.set("Level (last 10 s)", "-" if med is None else f"{med:.1f} dBFS",
-              MUTED if med is None else OK if -40 <= med <= -10 else WARN)
-        sf = list(self._speech_flags)
-        a.set("Speech share (10 s)", f"{100 * sum(sf) / len(sf):.0f} %" if sf else "-")
-        onset = pct([p["onset"] for p in ph], .5)
-        a.set("Onset delay", "-" if onset is None else f"{onset:.0f} ms", judge(onset, 150, 400))
-        sens = self.sensitivity_var.get()
-        a.set("Sensitivity", f"{sens * 100:.0f} %  (threshold {vad_threshold_for(sens):.2f})")
-        a.set("Loudest peak", f"{self._peak_recent:.1f} dBFS" if self._peak_recent > -99 else "-",
-              BAD if self._peak_recent > -1 else OK)
+        # Audio: one value per channel, e.g. "Me -32.1 dBFS · Friend -40.5 dBFS".
+        # The colour is the worst of the channels.
+        rank = {OK: 0, MUTED: 0, WARN: 1, BAD: 2}
+
+        def per_channel(row: str, values: list[tuple[str, str | None]]) -> None:
+            """Show one (text, colour) per channel in a row of the Audio card."""
+            text = "  ·  ".join(f"{c.settings.name} {v}" for c, (v, _) in zip(self.channels, values))
+            colours = [col for _, col in values if col]
+            self.audio_card.set(row, text, max(colours, key=lambda col: rank.get(col, 0))
+                                if colours else None)
+
+        def level_now(c: Channel) -> tuple[str, str | None]:
+            return ("-", None) if not c.levels else (f"{c.levels[-1]:.1f} dBFS", None)
+
+        def level_median(c: Channel) -> tuple[str, str | None]:
+            med = pct(list(c.levels), .5)
+            return (("-", None) if med is None
+                    else (f"{med:.1f} dBFS", OK if -40 <= med <= -10 else WARN))
+
+        def speech_share(c: Channel) -> tuple[str, str | None]:
+            sf = list(c.speech_flags)
+            return (f"{100 * sum(sf) / len(sf):.0f} %" if sf else "-", None)
+
+        def onset(c: Channel) -> tuple[str, str | None]:
+            value = pct([p["onset"] for p in ph if p["channel"] == c.index], .5)
+            return ("-" if value is None else f"{value:.0f} ms", judge(value, 150, 400))
+
+        def sensitivity(c: Channel) -> tuple[str, str | None]:
+            sens = c.settings.sensitivity
+            return (f"{sens * 100:.0f} % (threshold {vad_threshold_for(sens):.2f})", None)
+
+        def peak(c: Channel) -> tuple[str, str | None]:
+            return ((f"{c.peak_recent:.1f} dBFS", BAD if c.peak_recent > -1 else OK)
+                    if c.peak_recent > -99 else ("-", None))
+
+        for row, measure in (("Level now", level_now), ("Level (last 10 s)", level_median),
+                             ("Speech share (10 s)", speech_share), ("Onset delay", onset),
+                             ("Sensitivity", sensitivity), ("Loudest peak", peak)):
+            per_channel(row, [measure(c) for c in self.channels])
 
         q = self.quality_card
         n = len(ph)
@@ -1368,15 +2313,19 @@ class QtInterpreterApp(FluentWindow):
         self._refresh_resources()
 
         pl = self.pipeline_card
-        pq, tq = self.phrase_queue.qsize(), self._translation_queue.qsize()
+        pq = self._waiting_phrases()
+        tq = sum(c.controller.translation_queue.qsize() for c in self.channels)
         pl.set("Waiting phrases", pq, OK if pq < 2 else WARN if pq < 5 else BAD)
         pl.set("Waiting translations", tq, OK if tq < 3 else WARN)
-        cap = self._capture_thread
         def alive(thread: threading.Thread | None) -> str:
             return "✔" if thread is not None and thread.is_alive() else "✖"
-        threads = (f"capture {alive(cap)}   transcription "
-                   f"{alive(self._workers[0]) if self._workers else '✖'}   speech {alive(self.speaker)}")
-        pl.set("Threads", threads, OK if (not self.is_listening or "✖" not in threads) else BAD)
+        parts, healthy = [], True
+        for c in self.channels:
+            text = (f"{c.settings.name}: capture {alive(c.capture)} transcription "
+                    f"{alive(c.workers[0]) if c.workers else '✖'} speech {alive(c.speaker)}")
+            parts.append(text)
+            healthy = healthy and (not c.listening or "✖" not in text)
+        pl.set("Threads", "   ".join(parts), OK if healthy else BAD)
         pl.set("Watchdog restarts", self._watchdog_restarts,
                OK if self._watchdog_restarts == 0 else WARN)
         pl.set("Phrases this run", self._perf_stats["transcriptions"])
@@ -1390,15 +2339,20 @@ class QtInterpreterApp(FluentWindow):
         it has been listening, and which model and translator are in use."""
         h = self.health_card
         loader = self._model_loader
-        if self._muted:
+        listening = [c for c in self.channels if c.listening]
+        stuck = [c for c in self.channels if not c.settings.muted and not c.listening]
+        if all(c.settings.muted for c in self.channels):
             overall, colour = "Muted", WARN
         elif loader is not None and not loader.ready.is_set():
             overall, colour = "Loading the Whisper model…", WARN
         elif loader is not None and loader.error:
             overall, colour = f"Model error: {loader.error}", BAD
-        elif self.phrase_queue.qsize() >= 5:
+        elif self._waiting_phrases() >= 5:
             overall, colour = "Falling behind: phrases are piling up", BAD
-        elif self.is_listening:
+        elif listening and stuck:
+            overall, colour = (f"Listening to {', '.join(c.settings.name for c in listening)}; "
+                               f"{stuck[0].settings.name} is not: {stuck[0].problem or 'stopped'}"), WARN
+        elif listening:
             overall, colour = "Healthy - listening", OK
         else:
             overall, colour = "Idle", WARN
@@ -1423,17 +2377,34 @@ class QtInterpreterApp(FluentWindow):
             h.set("Preview model", pl.model_size, OK)
         else:
             h.set("Preview model", "loading…", WARN)
-        src = LANGUAGES.get(self.src_var.get(), ("", ""))[0]
-        tgt = LANGUAGES.get(self.tgt_var.get(), ("", ""))[0]
-        mt = self._mt_loaders.get((src, tgt))
-        if mt is None:
-            h.set("Translation", "online services (no local model for this pair)", WARN)
-        elif not mt.ready.is_set():
-            h.set("Translation", "local Opus-MT loading…", WARN)
-        elif mt.translator is None:
-            h.set("Translation", "local Opus-MT failed to load - using fallback", BAD)
-        else:
-            h.set("Translation", f"local Opus-MT {src}→{tgt}", OK)
+        # Translation: one entry per channel, coloured by the worst
+        texts, colours = [], []
+        for c in self.channels:
+            src = LANGUAGES.get(c.settings.src, ("", ""))[0]
+            tgt = LANGUAGES.get(c.settings.tgt, ("", ""))[0]
+            if src == "auto":
+                texts.append(f"{c.settings.name}: Opus-MT per detected language → {tgt}")
+                colours.append(OK)
+                continue
+            mt = self._mt_loaders.get((src, tgt))
+            if mt is None:
+                texts.append(f"{c.settings.name}: online (no local model for {src}→{tgt})")
+                colours.append(WARN)
+            elif not mt.ready.is_set():
+                texts.append(f"{c.settings.name}: Opus-MT {src}→{tgt} loading…")
+                colours.append(WARN)
+            elif mt.translator is None:
+                texts.append(f"{c.settings.name}: Opus-MT {src}→{tgt} failed - using fallback")
+                colours.append(BAD)
+            else:
+                texts.append(f"{c.settings.name}: Opus-MT {src}→{tgt}")
+                colours.append(OK)
+        worst = BAD if BAD in colours else WARN if WARN in colours else OK
+        h.set("Translation", "   ".join(texts), worst)
+
+    def _waiting_phrases(self) -> int:
+        """Finished phrases not yet transcribed, both channels together."""
+        return sum(c.controller.phrase_queue.qsize() for c in self.channels)
 
     def _refresh_resources(self) -> None:
         """The Computer card: this app's CPU and memory, and the graphics card's
@@ -1548,17 +2519,20 @@ class QtInterpreterApp(FluentWindow):
         rows = list(reversed(ph))[:20]
         t.setRowCount(len(rows))
         for r, p in enumerate(rows):
-            cells: list[str] = [p["time"], p["model"] or "", f"{p['pause_to_text']:.0f} ms",
+            cells: list[str] = [p["time"], p["who"], p["model"] or "",
+                     f"{p['pause_to_text']:.0f} ms",
                      f"{p['first_preview']:.0f} ms" if p["first_preview"] else "-",
                      f"{p['process']:.0f} ms" if p["process"] is not None else "-",
                      "yes" if p["early"] else "no", p["text"]]
             for c, val in enumerate(cells):
                 item = QTableWidgetItem(val)
-                if c == 2:
+                if c == 1:
+                    item.setForeground(QColor(CHANNEL_COLOURS[p["channel"] % len(CHANNEL_COLOURS)]))
+                elif c == 3:
                     item.setForeground(QColor(judge(p["pause_to_text"], 400, 800)))
                 t.setItem(r, c, item)
         t.resizeColumnsToContents()
-        t.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        t.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
 
     def _copy_diagnostics(self) -> None:
         """Copy every Diagnostics figure as text (e.g. to paste in a message)."""
@@ -1604,12 +2578,17 @@ class QtInterpreterApp(FluentWindow):
     # ── Closing ──────────────────────────────────────────────────────────
 
     def closeEvent(self, e: QCloseEvent) -> None:
-        """The window is closing: stop listening, log it, stop the speaker."""
+        """The window is closing: stop listening, log it, stop the speakers.
+        _closing stops the watchdog (or a pending timer) restarting a channel."""
         try:
-            if self.is_listening:
-                self._stop_session()
+            self._closing = True
+            for timer in self._timers.values():
+                timer.stop()
+            self._timers.clear()
+            self._stop_all()
             log_event(logging.INFO, "app_closing", session_id=self.session_id)
-            self.speaker.shutdown()
+            for ch in self.channels:
+                ch.speaker.shutdown()
         finally:
             super().closeEvent(e)  # pyright: ignore[reportUnknownMemberType]
 

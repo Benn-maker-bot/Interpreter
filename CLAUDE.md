@@ -51,7 +51,14 @@ If it's unclear which mode I want, ask.
 7. Data analysis: `log_tools.py` (percentiles, aligning words to measure accuracy)
 8. Git and GitHub: branches instead of the zip files in `archive/`, remotes, `.gitignore`
 
+## Skills and agents in `.claude/`
+- `/session-start`, `/session-end`: run the session routine above.
+- `/log-triage`: rank log errors and propose one fix (uses the `log-analyst` agent).
+- `/accuracy-check`: measure a change with `simulate.py` and `log_tools.py`.
+- `code-reviewer` agent: review a change or an exercise attempt before a commit.
+- Ignore `.github/instructions/codacy.instructions.md`; it is for the VS Code Codacy extension, not for Claude.
+
 ## Current position
 - Up to 2026-11-08: covered PowerShell Verb-Noun naming, `Get-Command` and aliases.
 - Weak spot: `ls` = `Get-ChildItem`, not `Get-Location` (`Get-Location` = `pwd`).
-- In progress: the `LatestSlot` exercise (`learning/slot_test.py`). Next: the PowerShell pipeline (`|`).
+- In progress: the `LatestSlot` exercise (`learning/slot_test.py`; the `put` calls still need `slot.` in front). Next: the PowerShell pipeline (`|`).

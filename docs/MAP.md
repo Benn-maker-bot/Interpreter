@@ -23,6 +23,32 @@ flowchart LR
 - **Left to right** is the path of the sound.
 - The capture and transcription boxes are background threads; the window runs
   on the main thread. Sound and logs are data sources and storage, not threads.
+- The Fluent window runs this path **twice at once**, one per channel (see
+  [Two channels](#1a-two-channels-fluent-window)). The classic window runs it
+  once, for the device of the selected mode.
+
+## 1a. Two channels (Fluent window)
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
+flowchart LR
+    M[Channel 1 'Me'<br/>microphone<br/>English → Russian] --> C1[SessionController 1<br/>capture → worker<br/>→ translation]
+    F[Channel 2 'Friend'<br/>call audio 🔊 loopback<br/>Russian → English] --> C2[SessionController 2<br/>capture → worker<br/>→ translation]
+    W[(One Whisper model<br/>on the GPU<br/>INFERENCE_LOCK)] -.- C1
+    W -.- C2
+    C1 -- "TaggedQueue<br/>(1, run)" --> Q[result_queue]
+    C2 -- "TaggedQueue<br/>(2, run)" --> Q
+    Q --> UI[Window: one conversation,<br/>a strip per channel]
+```
+
+- Each channel has its own device, languages, sensitivity, Mute, Speak and
+  output device. The model and preview model are shared.
+- Every message from a channel arrives labelled `(channel, run id)`. The run id
+  changes when a channel restarts, so late messages from a stopped pipeline are
+  recognised and ignored.
+- PortAudio may only be started or stopped by one thread at a time
+  (`portaudio_start()` / `portaudio_stop()`, `PORTAUDIO_LOCK`): with two
+  channels, overlapping starts crashed the app.
 - Work passes between threads through **queues** (like mailboxes). The detailed
   [message flow](FLOWCHARTS.md#2-message-flow-threads-and-hand-offs) shows which
   messages use a replaceable preview slot and which use queues.
@@ -123,13 +149,13 @@ flowchart TB
     subgraph Main thread
         UI[Window: draws everything,<br/>checks the result queue every 15 ms]
     end
-    subgraph Background threads
-        CAP[audio-capture]
-        TW[transcription-worker]
+    subgraph Background threads, one set per channel
+        CAP[audio-capture-Me / -Friend]
+        TW[transcription-worker-Me / -Friend]
         TR[translation-worker<br/>online fallback]
-        WL[whisper-loader / mt-loader<br/>load AI models]
         TTS[tts: speaks text]
     end
+    WL[whisper-loader / mt-loader<br/>load AI models, shared]
     CAP -- phrase_queue --> TW
     TW -- result_queue --> UI
     UI -- translation queue --> TR
