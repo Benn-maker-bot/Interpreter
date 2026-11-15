@@ -28,10 +28,13 @@ QUICK START
   4. The first start downloads the AI models once (Turbo ~1.6 GB, Small
      ~480 MB, Opus-MT ~300 MB per direction). Later starts take seconds.
 
-  The app starts listening by itself, in the mode you used last. In VS Code,
-  press F5 and choose "Interpreter" or "Interpreter (classic window)".
-  The Settings button (top right) hides the settings to give the
-  transcript more room; A-/A+ change the text size. Both are remembered.
+  The app starts listening by itself. In VS Code, press F5 and choose
+  "Interpreter" or "Interpreter (classic window)".
+  The Fluent window listens to two devices at once (channels "Me" and
+  "Friend") and shows both in one conversation. Each channel's device,
+  languages and sensitivity are on the Settings page: the gear icon at the
+  bottom of the left bar, or the gear on a channel's strip. A-/A+ change the
+  text size. Everything is remembered.
 
 
 DIAGNOSTICS PAGE (Fluent window)

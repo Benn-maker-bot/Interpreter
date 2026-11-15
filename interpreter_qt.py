@@ -63,9 +63,10 @@ from qfluentwidgets import setThemeColor  # pyright: ignore[reportMissingTypeStu
 from qfluentwidgets import (  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
                             BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF,
                             FluentWindow, HeaderCardWidget, InfoBar, InfoBarPosition, LineEdit,
-                            MessageBoxBase, PrimaryPushButton, PushButton, SimpleCardWidget,
-                            Slider, SmoothScrollArea, StrongBodyLabel, SubtitleLabel,
-                            TableWidget, TextEdit, Theme, TitleLabel, TogglePushButton,
+                            MessageBoxBase, NavigationItemPosition, PrimaryPushButton,
+                            PushButton, SimpleCardWidget, Slider, SmoothScrollArea,
+                            StrongBodyLabel, SubtitleLabel, TableWidget, TextEdit, Theme,
+                            TitleLabel, TogglePushButton, TransparentToolButton,
                             setCustomStyleSheet, setTheme)
 
 import interpreter as core
@@ -649,7 +650,8 @@ class Channel:
 
 @dataclass
 class ChannelControls:
-    """One channel's column in the settings card."""
+    """One channel's card on the Settings page and its controls."""
+    card: HeaderCardWidget
     name_edit: LineEdit
     device_combo: ComboBox
     src_combo: ComboBox
@@ -723,12 +725,16 @@ class ChannelStrip(SimpleCardWidget):
         self.mute_btn.setText("Mute")
         self.mute_btn.setIcon(FIF.MUTE)
         self.mute_btn.setToolTip("Stop listening to this channel (releases the device)")
+        self.settings_btn = TransparentToolButton(FIF.SETTING)
+        self.settings_btn.setToolTip("Device, languages and sensitivity (the Settings page)")
+        # Top row: name and buttons; the device and languages get a line of
+        # their own below (in one row they ran into the Speak button)
         top = QHBoxLayout()
         top.addWidget(self.name_label)
-        top.addSpacing(8)
-        top.addWidget(self.detail_label, 1)
+        top.addStretch(1)
         top.addWidget(self.speak_btn)
         top.addWidget(self.mute_btn)
+        top.addWidget(self.settings_btn)
         self.meter = LevelMeter()
         self.speech_meter = SpeechMeter()
         self.level_label = CaptionLabel("-")
@@ -738,20 +744,21 @@ class ChannelStrip(SimpleCardWidget):
             label.setMinimumWidth(120)
         self.status_label = CaptionLabel("Starting…")
         self.status_label.setWordWrap(True)          # long problem messages wrap
-        grid.addWidget(bar, 0, 0, 4, 1)
+        grid.addWidget(bar, 0, 0, 5, 1)
         grid.addLayout(top, 0, 1, 1, 2)
-        grid.addWidget(self.meter, 1, 1)
-        grid.addWidget(self.level_label, 1, 2)
-        grid.addWidget(self.speech_meter, 2, 1)
-        grid.addWidget(self.speech_label, 2, 2)
-        grid.addWidget(self.status_label, 3, 1, 1, 2)
+        grid.addWidget(self.detail_label, 1, 1, 1, 2)
+        grid.addWidget(self.meter, 2, 1)
+        grid.addWidget(self.level_label, 2, 2)
+        grid.addWidget(self.speech_meter, 3, 1)
+        grid.addWidget(self.speech_label, 3, 2)
+        grid.addWidget(self.status_label, 4, 1, 1, 2)
         grid.setColumnStretch(1, 1)
 
     def show_settings(self, s: ChannelSettings) -> None:
         """Show the channel's name, device and languages."""
         self.name_label.setText(s.name)
         device = ("🔊 " if "[loopback]" in s.device.lower() else "🎙 ") + plain_device_name(s.device)
-        short = device if len(device) <= 42 else device[:40] + "…"
+        short = device if len(device) <= 60 else device[:58] + "…"   # its own line now
         self.detail_label.setText(f"{short}  ·  {s.src} → {s.tgt}")
         self.detail_label.setToolTip(f"{s.device}\n{s.src} → {s.tgt}")
         self.mute_btn.setChecked(s.muted)
@@ -1131,9 +1138,13 @@ class QtInterpreterApp(FluentWindow):
 
         # ── pages ────────────────────────────────────────────────────────
         self.interp_page = self._build_interpreter_page()
+        self.settings_page = self._build_settings_page()
         self.diag_page = self._build_diagnostics_page()
         self.addSubInterface(self.interp_page, FIF.CHAT, "Interpreter")  # pyright: ignore[reportUnknownMemberType]
         self.addSubInterface(self.diag_page, FIF.DEVELOPER_TOOLS, "Diagnostics")  # pyright: ignore[reportUnknownMemberType]
+        # Settings at the bottom of the side bar, as in Windows 11's own apps
+        self.addSubInterface(self.settings_page, FIF.SETTING, "Settings",  # pyright: ignore[reportUnknownMemberType]
+                             NavigationItemPosition.BOTTOM)
         self._place_window()
 
         log_event(logging.INFO, "app_initialized", session_id=self.session_id, gui="qt",
@@ -1196,8 +1207,8 @@ class QtInterpreterApp(FluentWindow):
 
     def _build_interpreter_page(self) -> QWidget:
         """Build the Interpreter page, top to bottom: the header with the
-        action buttons, the settings card (can be hidden), one strip per
-        channel, the conversation, and the status line."""
+        action buttons, one strip per channel, the conversation, and the
+        status line. The settings are on their own page (_build_settings_page)."""
         page = QWidget()
         page.setObjectName("interpreterPage")   # FluentWindow needs a unique name
         root = QVBoxLayout(page)
@@ -1224,23 +1235,13 @@ class QtInterpreterApp(FluentWindow):
                               "are saved, so the problem can be found and fixed, and the\n"
                               "simulator can replay it to check the fix.")
         report_btn.clicked.connect(self._report_mistake)
-        # Fold the settings away to give the conversation more room; remembered.
-        self.settings_btn = TogglePushButton()
-        self.settings_btn.setText("Settings")
-        self.settings_btn.setIcon(FIF.SETTING)
-        self.settings_btn.setToolTip("Show or hide the settings (more room for the conversation)")
-        self.settings_btn.clicked.connect(self._toggle_settings)
-        for b in (clear_btn, report_btn, self.settings_btn):
+        for b in (clear_btn, report_btn):
             header.addWidget(b)
         root.addLayout(header)
 
-        self.settings_card = self._build_settings_card()
-        root.addWidget(self.settings_card)
-        show = bool(load_settings().get("show_settings", True))
-        self.settings_card.setVisible(show)
-        self.settings_btn.setChecked(show)
-
-        # One strip per channel, side by side
+        # One strip per channel, side by side. (The settings have their own
+        # page, the gear at the bottom of the side bar, so the conversation
+        # and the meters get the room.)
         strips = QHBoxLayout()
         strips.setSpacing(10)
         for ch in self.channels:
@@ -1250,6 +1251,8 @@ class QtInterpreterApp(FluentWindow):
                                                       callback=partial(self._toggle_channel_mute, ch)))
             ch.strip.speak_btn.clicked.connect(partial(_ignore_signal_value,
                                                        callback=partial(self._toggle_channel_speak, ch)))
+            ch.strip.settings_btn.clicked.connect(partial(_ignore_signal_value,
+                                                          callback=self._open_settings))
             strips.addWidget(ch.strip, 1)
         root.addLayout(strips)
 
@@ -1278,15 +1281,35 @@ class QtInterpreterApp(FluentWindow):
         self.status_var = QVar(self.status_label.text, self.status_label.setText)
         return page
 
-    def _build_settings_card(self) -> SimpleCardWidget:
-        """The settings card: one column per channel (name, device,
-        languages, sensitivity, output, replay), then the settings both
-        channels share (model, previews, other languages)."""
-        card = SimpleCardWidget()
-        grid = QGridLayout(card)
-        grid.setContentsMargins(16, 12, 16, 12)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(8)
+    def _build_settings_page(self) -> SmoothScrollArea:
+        """The Settings page (gear icon at the bottom of the side bar): one
+        card per channel, side by side (name, device, languages, sensitivity,
+        output, replay), and a card for what both channels share (model,
+        previews, other languages). Changes apply at once; there is no Save
+        button. The page scrolls when the window is small."""
+        page = SmoothScrollArea()
+        page.setObjectName("settingsPage")      # FluentWindow needs a unique name
+        page.setWidgetResizable(True)
+        page.setStyleSheet("QScrollArea{border:none; background:transparent}")
+        body = QWidget()
+        body.setStyleSheet("background:transparent")
+        page.setWidget(body)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(24, 16, 24, 16)
+        lay.setSpacing(12)
+
+        top = QHBoxLayout()
+        top.addWidget(TitleLabel("Settings"))
+        top.addStretch(1)
+        refresh = PushButton()
+        refresh.setText("Re-scan devices")
+        refresh.setIcon(FIF.SYNC)
+        refresh.setToolTip("Find audio devices again (e.g. after plugging one in)")
+        refresh.clicked.connect(partial(_ignore_signal_value, callback=self._refresh_devices))
+        top.addWidget(refresh)
+        lay.addLayout(top)
+        lay.addWidget(CaptionLabel("Changes apply at once. A channel restarts when its device, "
+                                   "languages or output change."))
 
         def label(text: str, tip: str) -> BodyLabel:
             """A settings label with a hover explanation."""
@@ -1297,28 +1320,12 @@ class QtInterpreterApp(FluentWindow):
         in_labels = [lbl for _, lbl in self._input_devices]
         out_labels = [lbl for _, lbl in self._output_devices]
         targets = sorted(core.TARGET_LANGUAGES)
-        refresh = PushButton()
-        refresh.setIcon(FIF.SYNC)
-        refresh.setToolTip("Re-scan audio devices (e.g. after plugging one in)")
-        refresh.clicked.connect(self._refresh_devices)
-        listen_label = QHBoxLayout()
-        listen_label.addWidget(label("Listen to", "Device to listen to. 🔊 = what an output "
-                                                  "device (e.g. the FiiO in a call) is playing."))
-        listen_label.addWidget(refresh)
-        listen_label.addStretch(1)
-        grid.addWidget(label("Name", "Shown in the conversation"), 1, 0)
-        grid.addLayout(listen_label, 2, 0)
-        grid.addWidget(label("Translate", "Language spoken → language shown"), 3, 0)
-        grid.addWidget(label("Speech sensitivity",
-                             "Higher = also catch quieter/less clear speech. Changes what "
-                             "counts as speech, not the volume."), 4, 0)
-        grid.addWidget(label("Speak and replay to", "Output device for Speak (this channel's "
-                                                    "translations read aloud) and for replay"), 5, 0)
-
-        for col, ch in enumerate(self.channels, start=1):
+        cards = QHBoxLayout()
+        cards.setSpacing(12)
+        for ch in self.channels:
             s = ch.settings
-            heading = StrongBodyLabel(f"Channel {ch.index + 1}")
-            heading.setTextColor(QColor(ch.colour), QColor(ch.colour))
+            card = HeaderCardWidget()
+            card.headerLabel.setStyleSheet(f"color: {ch.colour};")   # the channel's colour
             name_edit = LineEdit()
             name_edit.setText(s.name)
             name_edit.setMaxLength(16)
@@ -1339,8 +1346,9 @@ class QtInterpreterApp(FluentWindow):
             _fill_combo(out_combo, out_labels, s.output)
             replay_check = CheckBox("Hear input through output (VB-Audio cables only)")
             replay_check.setChecked(s.replay)
-            ch.controls = ChannelControls(name_edit, device_combo, src_combo, tgt_combo,
+            ch.controls = ChannelControls(card, name_edit, device_combo, src_combo, tgt_combo,
                                           sens_slider, sens_value, out_combo, replay_check)
+            self._set_card_title(ch)
 
             lang_row = QHBoxLayout()
             lang_row.addWidget(src_combo, 1)
@@ -1349,14 +1357,31 @@ class QtInterpreterApp(FluentWindow):
             sens_row = QHBoxLayout()
             sens_row.addWidget(sens_slider, 1)
             sens_row.addWidget(sens_value)
-            grid.addWidget(heading, 0, col)
-            grid.addWidget(name_edit, 1, col)
-            grid.addWidget(device_combo, 2, col)
-            grid.addLayout(lang_row, 3, col)
-            grid.addLayout(sens_row, 4, col)
-            grid.addWidget(out_combo, 5, col)
-            grid.addWidget(replay_check, 6, col)
-            grid.setColumnStretch(col, 1)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(10)
+            # One row per setting: (label, hover explanation, control)
+            rows: list[tuple[str, str, QWidget | QHBoxLayout]] = [
+                ("Name", "Shown in the conversation", name_edit),
+                ("Listen to", "Device to listen to. 🔊 = what an output device (e.g. the "
+                              "headphones in a call) is playing.", device_combo),
+                ("Translate", "Language spoken → language shown", lang_row),
+                ("Speech sensitivity", "Higher = also catch quieter/less clear speech. Changes "
+                                       "what counts as speech, not the volume.", sens_row),
+                ("Speak and replay to", "Output device for Speak (this channel's translations "
+                                        "read aloud) and for replay", out_combo),
+                ("", "", replay_check),
+            ]
+            for r, (text, tip, control) in enumerate(rows):
+                if text:
+                    grid.addWidget(label(text, tip), r, 0)
+                if isinstance(control, QHBoxLayout):
+                    grid.addLayout(control, r, 1)
+                else:
+                    grid.addWidget(control, r, 1)
+            grid.setColumnStretch(1, 1)
+            card.viewLayout.addLayout(grid)
+            cards.addWidget(card, 1)
 
             # ── control events (partial() fixes which channel they are for)
             name_edit.editingFinished.connect(partial(self._on_channel_name, ch))
@@ -1371,6 +1396,7 @@ class QtInterpreterApp(FluentWindow):
                 partial(_ignore_signal_value, callback=partial(self._on_channel_output, ch)))
             replay_check.stateChanged.connect(
                 partial(_ignore_signal_value, callback=partial(self._on_channel_replay, ch)))
+        lay.addLayout(cards)
 
         # Shared by both channels: one Whisper model serves both
         saved = load_settings()
@@ -1395,15 +1421,22 @@ class QtInterpreterApp(FluentWindow):
             "listening for Russian), recognise it in that language, label it\n"
             "[German] and translate it. Off: label it but don't translate it.")
         self.auto_lang_check.setChecked(bool(saved.get("auto_language", True)))
-        shared = QHBoxLayout()
-        shared.addWidget(self.model_combo, 1)
-        shared.addSpacing(16)
-        shared.addWidget(label("Previews", "Model for the live grey text"))
-        shared.addWidget(self.preview_combo, 1)
-        shared.addSpacing(16)
-        shared.addWidget(self.auto_lang_check)
-        grid.addWidget(label("Model", "Whisper model for the final text (both channels)"), 7, 0)
-        grid.addLayout(shared, 7, 1, 1, len(self.channels))
+        shared_card = HeaderCardWidget()
+        shared_card.setTitle("Both channels")
+        shared = QGridLayout()
+        shared.setHorizontalSpacing(12)
+        shared.setVerticalSpacing(10)
+        shared.addWidget(label("Model", "Whisper model for the final text"), 0, 0)
+        shared.addWidget(self.model_combo, 0, 1)
+        shared.addWidget(label("Previews", "Model for the live grey text"), 1, 0)
+        shared.addWidget(self.preview_combo, 1, 1)
+        shared.addWidget(self.auto_lang_check, 2, 1)
+        shared.setColumnStretch(2, 1)            # keep the menus a sensible width
+        self.model_combo.setMinimumWidth(320)
+        self.preview_combo.setMinimumWidth(320)
+        shared_card.viewLayout.addLayout(shared)
+        lay.addWidget(shared_card)
+        lay.addStretch(1)
 
         # Adapters for the borrowed logic (it calls .get() and .set())
         self.model_var = QVar(self.model_combo.currentText,
@@ -1416,7 +1449,7 @@ class QtInterpreterApp(FluentWindow):
         self.preview_combo.currentTextChanged.connect(
             partial(_ignore_signal_value, callback=self._on_preview_choice))
         self.auto_lang_check.stateChanged.connect(self._on_auto_language)
-        return card
+        return page
 
     @staticmethod
     def _pill(text: str, colour: str) -> QLabel:
@@ -1458,6 +1491,7 @@ class QtInterpreterApp(FluentWindow):
         ch.settings.name = name
         self._save_channels()
         ch.strip.show_settings(ch.settings)
+        self._set_card_title(ch)
         self.conversation.set_names([c.settings.name for c in self.channels])
         log_event(logging.INFO, "channel_renamed", channel=ch.index, name=name)
 
@@ -1544,12 +1578,14 @@ class QtInterpreterApp(FluentWindow):
                 worker.auto_language = on
         log_event(logging.INFO, "auto_language_changed", enabled=on)
 
-    def _toggle_settings(self) -> None:
-        """Settings button: show or hide the settings card (remembered)."""
-        show = not self.settings_card.isVisible()
-        self.settings_card.setVisible(show)
-        self.settings_btn.setChecked(show)
-        core.save_settings(show_settings=show)
+    def _open_settings(self) -> None:
+        """A strip's gear button: show the Settings page."""
+        self.switchTo(self.settings_page)
+
+    @staticmethod
+    def _set_card_title(ch: Channel) -> None:
+        """Title of a channel's settings card, e.g. "Channel 2 · Friend"."""
+        ch.controls.card.setTitle(f"Channel {ch.index + 1}  ·  {ch.settings.name}")
 
     def _change_text_size(self, step: int) -> None:
         """A−/A+ buttons: change the conversation font size (9-28 pt), saved."""
