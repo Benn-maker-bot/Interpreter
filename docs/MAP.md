@@ -1,14 +1,16 @@
 # Map of the program
 
-Pictures of how the parts fit together.
-To see the diagrams: open this file and press **Ctrl+Shift+V**
-(needs the "Markdown Preview Mermaid Support" extension, see [VSCODE.md](VSCODE.md)).
+Quick overview diagrams. For more detailed pictures of module responsibilities,
+thread hand-offs, phrase lifecycle, interface reuse, and testing, see
+[FLOWCHARTS.md](FLOWCHARTS.md). To view Mermaid diagrams, open a Markdown file
+and press **Ctrl+Shift+V** (see [VSCODE.md](VSCODE.md)).
 
 ---
 
 ## 1. The big picture
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart LR
     A[Sound<br/>FiiO headphones<br/>or microphone] --> B[AudioCaptureThread<br/>records, finds speech,<br/>cuts it into phrases]
     B -- phrase audio --> C[TranscriptionWorker<br/>Whisper: audio → text<br/>Opus-MT: translation]
@@ -19,8 +21,11 @@ flowchart LR
 ```
 
 - **Left to right** is the path of the sound.
-- Each box is a **thread**: it runs at the same time as the others.
-- They pass work along through **queues** (like mailboxes).
+- The capture and transcription boxes are background threads; the window runs
+  on the main thread. Sound and logs are data sources and storage, not threads.
+- Work passes between threads through **queues** (like mailboxes). The detailed
+  [message flow](FLOWCHARTS.md#2-message-flow-threads-and-hand-offs) shows which
+  messages use a replaceable preview slot and which use queues.
 
 ---
 
@@ -29,20 +34,21 @@ flowchart LR
 What happens to one sentence, step by step.
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "sequence": {"actorFontSize": 18, "messageFontSize": 18, "noteFontSize": 16, "actorMargin": 48, "messageMargin": 32}}}%%
 sequenceDiagram
     participant S as Sound
     participant C as AudioCaptureThread
     participant W as TranscriptionWorker
     participant UI as Window
-    S->>C: sound, every 20-30 ms
+    S->>C: audio blocks; VAD scores 32 ms frames at 16 kHz
     C->>C: Silero VAD: is this speech?
     loop while the person talks (every 0.2 s)
         C->>W: unfinished phrase (preview)
         W->>UI: grey preview text
     end
-    C->>W: pause starts (0.1 s): early transcription
-    C->>W: pause lasts (0.3 s): phrase finished
-    W->>W: Whisper (uses the early result if ready)
+    C->>W: pause starts (0.1 s): offer early audio in a replaceable slot
+    C->>W: pause lasts (0.3 s): finished phrase enters phrase_queue
+    W->>W: Whisper (reuse early result if still valid, otherwise transcribe)
     W->>W: translate (Opus-MT)
     W->>UI: final text + translation
     UI->>UI: replace grey preview, log timings
@@ -53,6 +59,7 @@ sequenceDiagram
 ## 3. Where a phrase ends
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart TD
     A[New 20-30 ms block] --> B{Speech?}
     B -- yes --> A
@@ -74,6 +81,7 @@ The log line of every phrase says which rule ended it (`end_rule`).
 ## 4. Choosing the language (Auto-detect)
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart TD
     A[Whisper guesses the language<br/>with a certainty 0-1] --> B{Certain enough?<br/>≥ 0.5, or ≥ 3 s of speech}
     B -- no --> C{A recently heard language<br/>is possible?}
@@ -93,6 +101,7 @@ The log line says why (`lang_reason`).
 ## 5. Music mode
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart LR
     A[Every second:<br/>YAMNet sound classifier] --> B{Music?}
     B -- yes --> C[Music mode on]
@@ -109,6 +118,7 @@ The voice is separated in 6-second chunks **while the singing is still going**, 
 ## 6. The threads
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart TB
     subgraph Main thread
         UI[Window: draws everything,<br/>checks the result queue every 15 ms]
@@ -134,6 +144,7 @@ flowchart TB
 ## 7. The simulator
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart LR
     A[Test data<br/>synthetic, recorded,<br/>your reported phrases,<br/>or live Windows audio] --> B[Fake sound card<br/>FakePyAudio]
     B --> C[The REAL pipeline<br/>capture + worker]
@@ -149,8 +160,11 @@ The simulator uses the **same code** as the app; only the sound card is replaced
 ## 8. Which file uses which
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart TB
-    IQ[interpreter_qt.py<br/>Fluent window] --> I[interpreter.py<br/>all the logic]
+    IQ[interpreter_qt.py<br/>Fluent window] --> SC[session_controller.py<br/>shared worker lifecycle]
+    CI[interpreter.py<br/>classic window] --> SC
+    SC --> I[interpreter.py<br/>audio and model services]
     I --> M[music.py<br/>music detection,<br/>vocal separation]
     SQ[simulator_qt.py<br/>simulator window] --> S[simulate.py<br/>simulator engine]
     SQ --> IQ

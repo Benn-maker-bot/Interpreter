@@ -12,20 +12,16 @@ The original window (interpreter.py, built with customtkinter) still works.
 Both share all of the real work: recording, speech detection, Whisper,
 translation, logging. Only the interface differs.
 
-HOW THIS FILE REUSES interpreter.py
------------------------------------
-interpreter.py's InterpreterApp mixes two kinds of methods:
+HOW THE TWO WINDOWS SHARE THE PIPELINE
+--------------------------------------
+Both windows use `SessionController` to create and stop audio capture,
+transcription, and translation workers. Each window passes a settings snapshot
+and callbacks for status, audio level, model lookup, and translation. The
+controller owns worker queues and thread references. Small compatibility
+adapters remain for shared settings and result handling while those remaining
+UI responsibilities are separated.
 
-  * logic (start/stop a listening session, handle results, the watchdog,
-    load models, log timings) - about twenty methods. These are BORROWED
-    unchanged: e.g. `_start_session = InterpreterApp._start_session` below.
-    In Python a method is just a function whose first argument is `self`,
-    so it works on any object that has the attributes it uses.
-  * interface (build widgets, draw meters, show text) - these are written
-    again here with Qt widgets.
-
-The borrowed logic expects a few customtkinter things, so this file gives
-it small stand-ins ("adapters"):
+The adapters are:
 
   QVar        acts like a Tk variable (get()/set()) but reads and writes a
               Qt control, e.g. a combo box or slider
@@ -33,7 +29,6 @@ it small stand-ins ("adapters"):
               (configure(values=[...]))
   after()     Tk's "run this later" timer, implemented with QTimer
   TextShim    a label that accepts configure(text=...)
-
 Qt basics used here: a QWidget is anything on screen; layouts (QVBoxLayout =
 stacked vertically, QHBoxLayout = side by side, QGridLayout = rows and
 columns) position widgets; "signals" (e.g. a button's `clicked`) are
@@ -115,7 +110,9 @@ class ComboShim:
 
     def configure(self, values: list[str] | None = None, **_: object) -> None:
         """Replace the combo box's items, keeping the current choice if it is
-        still in the new list. Other Tk-style options are ignored."""
+        still in the new list. Other Tk-style options are ignored. Signals are
+        blocked during the rebuild so borrowed logic doesn't mistake this
+        refresh for a user changing the selection."""
         if values is None:
             return
         current = self.combo.currentText()
@@ -128,14 +125,30 @@ class ComboShim:
 
 
 def _set_combo_text(combo: ComboBox, text: str) -> None:
+    """Set text through Qt's base combo-box API.
+
+    Fluent's ComboBox has a narrower type signature, but at runtime it is a
+    QComboBox. This adapter keeps the borrowed Tk-style logic independent of
+    Qt's widget classes.
+    """
     cast(QComboBox, combo).setCurrentText(text)
 
 
 def _ignore_signal_value(_: object, callback: Callable[[], None]) -> None:
+    """Adapt a Qt signal that sends a value to a no-argument callback.
+
+    Buttons and toggles often emit ``checked``. The reused app handlers don't
+    need that value, so this wrapper deliberately discards it.
+    """
     callback()
 
 
 def _select_mode(_: bool, mode: int, callback: Callable[[int], None]) -> None:
+    """Bind a mode number to a Qt button signal.
+
+    Each button emits its own checked state, but the handler needs to know
+    which mode was clicked. Capture that mode here and pass it to the handler.
+    """
     callback(mode)
 
 
@@ -149,27 +162,29 @@ class TextShim:
             self.label.setText(text)
 
 
-class IssueHandler(logging.Handler):
-    """Copies every warning/error written to the error log into a list the
-    Diagnostics page shows ("Recent issues"). Handlers run on whichever thread
-    logged, so it only appends to a thread-safe deque."""
+class IssueHandler:
+    """Copies every warning/error written to the log into a list the
+    Diagnostics page shows ("Recent issues"). It is a loguru sink (added with
+    core.add_issue_sink) and runs on whichever thread logged, so it only
+    appends to a thread-safe deque."""
     def __init__(self, sink: deque[tuple[str, str, str, str, dict[str, str]]]) -> None:
-        super().__init__(level=logging.WARNING)
         self.sink = sink
 
-    def emit(self, record: logging.LogRecord) -> None:
-        """Called by Python's logging for every warning/error: turn it into a
+    def __call__(self, message: Any) -> None:
+        """Called by loguru for every warning/error: turn it into a
         plain-language explanation and add it to the Diagnostics list."""
-        fields: dict[str, Any] = getattr(record, "fields", {}) or {}
-        event: str = getattr(record, "event", record.getMessage())
+        record = message.record
+        fields: dict[str, Any] = record["extra"].get("fields") or {}
+        event: str = record["extra"].get("event") or record["message"]
+        exc_info = tuple(record["exception"]) if record["exception"] else None
         try:
-            help_: dict[str, Any] = core.explain_issue(event, fields, record.exc_info)
+            help_: dict[str, Any] = core.explain_issue(event, fields, exc_info)
         except Exception:
             help_ = {"title": event, "meaning": "", "action": "",
                      "technical": str(fields.get("exception_message", "")), "where": "",
                      "details": ", ".join(f"{k}={v}" for k, v in fields.items())[:500]}
         # (time, level, event, short detail, plain-language explanation)
-        self.sink.append((time.strftime("%H:%M:%S"), record.levelname, event,
+        self.sink.append((time.strftime("%H:%M:%S"), record["level"].name, event,
                           help_["technical"][:160], help_))
 
 
@@ -425,7 +440,7 @@ class ReportDialogMistake(MessageBoxBase):
 
 class QtInterpreterApp(FluentWindow):
     """The Fluent main window: an Interpreter page and a Diagnostics page in a
-    side navigation bar. The session logic is borrowed from InterpreterApp."""
+    side navigation bar. It uses SessionController for worker lifecycle."""
 
     # ── Borrowed logic (see the file's opening comment) ──────────────────
     _preload_model            = InterpreterApp._preload_model  # pyright: ignore[reportPrivateUsage]
@@ -452,6 +467,7 @@ class QtInterpreterApp(FluentWindow):
         if seq in self._recent_finals:            # for "Report a mistake"
             self._recent_finals[seq]["translation"] = text
     _on_mode_btn              = InterpreterApp._on_mode_btn  # pyright: ignore[reportPrivateUsage]
+    _sync_session_controller  = InterpreterApp._sync_session_controller  # pyright: ignore[reportPrivateUsage]
     _refresh_devices          = InterpreterApp._refresh_devices  # pyright: ignore[reportPrivateUsage]
     _on_manual_device_change  = InterpreterApp._on_manual_device_change  # pyright: ignore[reportPrivateUsage]
     _on_level                 = InterpreterApp._on_level  # pyright: ignore[reportPrivateUsage]
@@ -471,7 +487,9 @@ class QtInterpreterApp(FluentWindow):
         import uuid, queue
         self.session_id = str(uuid.uuid4())
         self.result_queue: queue.Queue[Any] = queue.Queue()  # background threads -> window
-        self.phrase_queue: queue.Queue[Any] = queue.Queue()
+        from session_controller import SessionController
+        self.session_controller = SessionController(self.result_queue, core)
+        self.phrase_queue: queue.Queue[Any] = self.session_controller.phrase_queue
         self._perf_stats: dict[str, Any] = {
             "transcriptions": 0, "translations": 0,
             "transcription_ms": deque(maxlen=200),
@@ -482,8 +500,8 @@ class QtInterpreterApp(FluentWindow):
         self._loopback_out = None
         self._workers: list[core.TranscriptionWorker] = []
         self._translation_workers: list[core.TranslationWorker] = []
-        self._translation_queue: queue.Queue[tuple[int, str, str, str]] = queue.Queue(
-            maxsize=TRANSLATION_QUEUE_MAX)
+        self._translation_queue: queue.Queue[tuple[int, str, str, str]] = (
+            self.session_controller.translation_queue)
         self._model_loader: core.WhisperModelLoader | None = None
         self._whisper_model: Any = None
         self.is_listening = self._muted = False
@@ -522,7 +540,7 @@ class QtInterpreterApp(FluentWindow):
         self._issue_groups: dict[str, dict[str, Any]] = {}  # event -> count, times, explanation
         self._watchdog_restarts = 0
         self._nvml: Any = None                  # GPU monitoring handle
-        core.ERROR_LOG.addHandler(IssueHandler(self._issues))
+        core.add_issue_sink(IssueHandler(self._issues))
 
         # ── audio devices and default mode settings ──────────────────────
         self._input_devices, self._output_devices = get_audio_devices()

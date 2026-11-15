@@ -47,6 +47,26 @@ HOW TO RUN IT (from the project folder, needs internet)
 -------------------------------------------------------
     .venv\\Scripts\\python make_testdata.py         4 clips per language and kind
     .venv\\Scripts\\python make_testdata.py 8       8 per language and kind
+    .venv\\Scripts\\python make_testdata.py --piper  the same, read by Piper voices
+
+SECOND VOICE ENGINE: PIPER (--piper)
+------------------------------------
+With --piper the voices come from Piper (the "piper-tts" package), a
+neural text-to-speech engine that runs on this PC. Its clips go to a
+SEPARATE data set, testdata/synth_piper/, so the edge-tts set and its
+baseline results never change. Run the simulator on it with:
+    .venv\\Scripts\\python simulate.py --data synth_piper
+(The sentences only match the edge-tts set's when both were made with the
+same clip count and neither engine skipped a sentence.)
+Why a second engine: a test made with one engine's voices can flatter or
+punish the app in ways real speech wouldn't; two engines show that.
+Piper's output is also reproducible (edge-tts voices can change on
+Microsoft's servers). The voice files (~20-110 MB each) download once
+from Hugging Face into testdata/piper_voices/; after that, only the
+FLEURS sentences need the internet.
+Install it WITHOUT its dependencies, or pip replaces onnxruntime-gpu with
+the CPU-only onnxruntime (see requirements.txt):
+    .venv\\Scripts\\python -m pip install --no-deps piper-tts pathvalidate
 
 WHAT IS IN THIS FILE
 --------------------
@@ -101,7 +121,10 @@ from fetch_testdata import FLEURS, HF, save_wav
 # Settings
 # ─────────────────────────────────────────────────────────────────────────────
 APP_DIR = Path(__file__).resolve().parent      # Path: the project folder
-OUT = APP_DIR / "testdata" / "synth"           # Path: where the clips are saved
+# OUT_DIRS: dict, voice engine -> the data set's folder (see PIPER above).
+OUT_DIRS = {"edge": APP_DIR / "testdata" / "synth",
+            "piper": APP_DIR / "testdata" / "synth_piper"}
+OUT = OUT_DIRS["edge"]                         # Path: where the clips are saved (set by build())
 RATE = 16000                                   # int: samples per second
 SEED = 7                                       # int: starting number for all random choices
 
@@ -259,6 +282,69 @@ async def voices_by_lang():
         # "or" falls back to the first two voices of any kind if both were empty.
         out[lang] = (fem[:1] + male[:1]) or [v["ShortName"] for v in vs[:2]]
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Piper: the second voice engine (used with --piper)
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPER_VOICES: dict, language -> Piper voice names, female first, then male
+# where both exist. A name reads "<locale>-<speaker>-<quality>"; quality is
+# x_low / low / medium / high (bigger file, more natural). Spanish uses Latin
+# American voices to match FLEURS's es_419 sentences. Bulgarian and Turkish
+# have only one voice each.
+PIPER_VOICES = {
+    "ru": ["ru_RU-irina-medium", "ru_RU-denis-medium"],
+    "en": ["en_US-hfc_female-medium", "en_US-hfc_male-medium"],
+    "de": ["de_DE-kerstin-low", "de_DE-thorsten-medium"],
+    "fr": ["fr_FR-siwis-medium", "fr_FR-tom-medium"],
+    "es": ["es_AR-daniela-high", "es_MX-ald-medium"],
+    "it": ["it_IT-paola-medium", "it_IT-riccardo-x_low"],
+    "uk": ["uk_UA-tetiana-high", "uk_UA-mykyta-high"],
+    "pl": ["pl_PL-gosia-medium", "pl_PL-darkman-medium"],
+    "bg": ["bg_BG-dimitar-medium"],
+    "tr": ["tr_TR-dfki-medium"],
+}
+PIPER_DIR = APP_DIR / "testdata" / "piper_voices"   # Path: downloaded voice files
+# edge-tts speeds -> Piper's length_scale (how long each sound lasts:
+# 1.1 = 10 % slower, 0.92 = about 8 % faster).
+PIPER_SPEED = {"-10%": 1.1, "+0%": 1.0, "+8%": 0.92}
+_piper_loaded = {}                                  # dict: voice name -> loaded PiperVoice
+
+
+def _piper_voice(name):
+    """Load a Piper voice, downloading its two files the first time.
+
+    The voices live on Hugging Face in rhasspy/piper-voices, in folders made
+    from the name: "ru_RU-irina-medium" ->
+        ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx       (the model)
+        ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx.json  (its settings)
+    """
+    if name not in _piper_loaded:
+        from huggingface_hub import hf_hub_download
+        from piper import PiperVoice
+        locale, speaker, quality = name.split("-")
+        folder = f"{locale.split('_')[0]}/{locale}/{speaker}/{quality}"
+        for ext in (".onnx.json", ".onnx"):
+            hf_hub_download("rhasspy/piper-voices", f"{folder}/{name}{ext}", local_dir=PIPER_DIR)
+        _piper_loaded[name] = PiperVoice.load(PIPER_DIR / folder / f"{name}.onnx")
+    return _piper_loaded[name]
+
+
+def piper_tts(text, voice, rate):
+    """Piper's version of tts(): same inputs, same kind of result.
+
+    Piper returns the speech in chunks of float samples at the voice's own
+    rate (usually 22050 Hz); soxr converts them to 16 kHz. The silence is
+    trimmed exactly as in tts().
+    """
+    import soxr
+    from piper import SynthesisConfig
+    v = _piper_voice(voice)
+    chunks = list(v.synthesize(text, SynthesisConfig(length_scale=PIPER_SPEED[rate])))
+    audio = np.concatenate([c.audio_float_array for c in chunks]).astype(np.float32)
+    audio = soxr.resample(audio, chunks[0].sample_rate, RATE).astype(np.float32)
+    loud = np.nonzero(np.abs(audio) > 0.02 * np.abs(audio).max())[0]
+    return audio[max(0, loud[0] - 160):loud[-1] + 160] if len(loud) else audio
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -440,12 +526,14 @@ def rms(x):
 # Building the clips
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def build(count):
+async def build(count, engine="edge"):
     """Make all the clips and the manifest.
 
     Inputs:
-        count  int: how many speech clips AND how many songs to make per
-               language (default 4, so 10 languages x 8 = 80 clips).
+        count   int: how many speech clips AND how many songs to make per
+                language (default 4, so 10 languages x 8 = 80 clips).
+        engine  str: "edge" (edge-tts, into testdata/synth) or "piper"
+                (Piper, into testdata/synth_piper).
 
     For each language:
       1. Get its sentences and shuffle them (in the same "random" order
@@ -477,7 +565,16 @@ async def build(count):
     # rng: the random-number generator. Starting it from SEED makes every run
     # produce the same sequence of "random" numbers, so the same clips.
     rng = np.random.default_rng(SEED)
-    voices = await voices_by_lang()                   # dict: language -> 2 voice names
+    global OUT                                        # PYTHON: lets this function change OUT
+    OUT = OUT_DIRS[engine]
+    if engine == "piper":
+        voices = PIPER_VOICES                         # dict: language -> 1-2 voice names
+
+        async def say(text, voice, rate):             # async wrapper, same shape as tts()
+            return piper_tts(text, voice, rate)
+    else:
+        voices = await voices_by_lang()               # dict: language -> 2 voice names
+        say = tts
     rates = ["-10%", "+0%", "+8%"]                    # the three speaking speeds, used in turn
     for kind in ("speech", "songs"):
         (OUT / kind).mkdir(parents=True, exist_ok=True)
@@ -504,7 +601,7 @@ async def build(count):
             for text in pool:                         # takes the next sentence from pool
                 for _ in range(2):                    # two attempts
                     try:
-                        return text, await tts(text, voice, rate)
+                        return text, await say(text, voice, rate)
                     except Exception as e:
                         err = e                       # remember the error for the message
                 # {text[:40]!r}: the first 40 characters, in quotes.
@@ -526,7 +623,7 @@ async def build(count):
             path = OUT / "speech" / f"{lang}_{i:02d}.wav"         # e.g. speech\de_03.wav
             save_wav(path, audio, RATE)                           # step 4
             manifest.append({"file": str(path.relative_to(OUT)), "kind": "speech", "lang": lang,
-                             "text": text, "voice": voice,
+                             "text": text, "voice": voice, "engine": engine,
                              "vocal_start": 0.3, "vocal_end": round(0.3 + len(vocal) / RATE, 2)})
         # Step 3: songs.
         for i in range(count):
@@ -560,7 +657,7 @@ async def build(count):
             path = OUT / "songs" / f"{lang}_{i:02d}.wav"
             save_wav(path, mix, RATE)                 # step 4
             manifest.append({"file": str(path.relative_to(OUT)), "kind": "song", "lang": lang,
-                             "text": " ".join(pair), "voice": voice, "snr_db": round(snr_db, 1),
+                             "text": " ".join(pair), "voice": voice, "engine": engine, "snr_db": round(snr_db, 1),
                              "vocal_start": intro, "vocal_end": round(intro + len(vocal) / RATE, 2)})
         print(f"  {lang}: {made['speech']} speech, {made['song']} songs", flush=True)
     # Write the clip list, one JSON object per line.
@@ -572,6 +669,9 @@ async def build(count):
 
 # Start here when run directly. asyncio.run(...) starts the async build()
 # and waits until it has finished. The number of clips per language is the
-# number typed after the script's name (sys.argv[1]), or 4.
+# number typed after the script's name, or 4; "--piper" picks the Piper voices.
 if __name__ == "__main__":
-    asyncio.run(build(int(sys.argv[1]) if len(sys.argv) > 1 else 4))
+    args = sys.argv[1:]
+    numbers = [a for a in args if a.isdigit()]
+    asyncio.run(build(int(numbers[0]) if numbers else 4,
+                      "piper" if "--piper" in args else "edge"))

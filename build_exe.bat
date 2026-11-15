@@ -33,7 +33,7 @@ pause
 REM -- Step 1: make sure every package (including PyInstaller) is installed
 echo.
 echo [1/3] Installing dependencies...
-pip install -r requirements.txt --quiet
+pip install -r requirements.txt -c constraints-win-py313.txt --quiet
 
 REM -- Step 2: build (see the option list at the top of this file)
 echo.

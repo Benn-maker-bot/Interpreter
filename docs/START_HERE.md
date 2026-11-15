@@ -21,10 +21,12 @@ Open them in VS Code and press **Ctrl+Shift+V** to see them nicely formatted.
 | Guide | Read it when you want to… |
 | --- | --- |
 | [MAP.md](MAP.md) | see **pictures** of how everything fits together |
+| [FLOWCHARTS.md](FLOWCHARTS.md) | study architecture, thread messages, phrase flow, interfaces, and tests visually |
 | [FILES.md](FILES.md) | know **what each file is for** |
 | [HOW_TO.md](HOW_TO.md) | **do** something: run, test, check the logs, change a setting |
 | [TUNING.md](TUNING.md) | understand the **numbers** that control the behaviour |
 | [GLOSSARY.md](GLOSSARY.md) | look up a **word** you don't know |
+| [LEARNING.md](LEARNING.md) | follow a phrase through the code and learn by experimenting |
 | [VSCODE.md](VSCODE.md) | make VS Code **calmer and easier** to work in |
 | [../notes.md](../notes.md) | jot down an idea quickly and get back to your task |
 
@@ -47,11 +49,13 @@ Stop after any block. Nothing breaks if you only read part of it.
 
 1. This page.
 2. [MAP.md](MAP.md) – the first picture only ("The big picture").
-3. [FILES.md](FILES.md) – just the table at the top.
-4. The opening comment of `interpreter.py` (lines 1–250). It explains the
-   whole app in plain words.
-5. [GLOSSARY.md](GLOSSARY.md) – skim; come back when a word is unclear.
-6. One class at a time, in the order in [MAP.md](MAP.md) ("A phrase's journey").
+3. [FLOWCHARTS.md](FLOWCHARTS.md) – choose the picture that answers your question.
+4. [FILES.md](FILES.md) – just the table at the top.
+5. The opening guide in `interpreter.py`. It explains the main stages and
+   links them to the implementation.
+6. [LEARNING.md](LEARNING.md) – trace one phrase through those stages.
+7. [GLOSSARY.md](GLOSSARY.md) – skim; come back when a word is unclear.
+8. One class at a time, in the order in [MAP.md](MAP.md) ("A phrase's journey").
 
 ---
 

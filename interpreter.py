@@ -9,8 +9,10 @@ app "listens" to the FiiO, shows the Russian words as they are spoken, and
 shows the English translation next to them. It can also do the reverse
 ("My Voice": your microphone, English -> Russian).
 
-This file is the whole application. It is long, so this guide explains the
-big picture first. Every class and function below also has its own comment.
+This file contains the shared application logic and the classic window. It is
+long, so this guide explains the big picture first. Section comments and
+docstrings explain the main components; use the names below to jump to the
+implementation and follow the data flow.
 
 NEW TO THE PROJECT? Start with docs/START_HERE.md: short guides with
 diagrams (docs/MAP.md), a file guide, how-to recipes, the tuning numbers
@@ -265,7 +267,6 @@ import struct
 import math
 import json
 import logging
-import logging.handlers
 import os
 import sys
 import traceback
@@ -281,6 +282,7 @@ from typing import Any, Callable, Iterable
 import requests
 import subprocess
 import customtkinter as ctk
+from loguru import logger   # the logging library behind log_event()
 
 # PyAudioWPatch is a drop-in PyAudio fork that adds WASAPI loopback devices,
 # letting us capture what an output device (e.g. FiiO K7) is playing.
@@ -385,113 +387,161 @@ def _json_safe(value):
         return list(value)
     return str(value)
 
-class JsonLineFormatter(logging.Formatter):
-    """Turns each log message into one line of JSON.
 
-    JSON lines are easy for programs (like log_tools.py) to read back: every
-    line is a dictionary with the time, level, event name and any extra fields
-    passed to log_event().
-    """
-    def format(self, record):
-        """Build the JSON text for one log record (called by Python's logging)."""
-        payload = {
-            "ts":      datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
-            "level":   record.levelname,
-            "logger":  record.name,
-            "event":   getattr(record, "event", record.getMessage()),
-            "message": record.getMessage(),
-            "thread":  record.threadName,
-            "process": record.process,
-        }
-        extra_fields = getattr(record, "fields", None)
-        if isinstance(extra_fields, dict):
-            payload.update(extra_fields)
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-        # default=_json_safe: numpy numbers (np.int64, np.bool_ …) are not
-        # JSON types; without it the whole line was silently lost.
-        return json.dumps(payload, ensure_ascii=False, default=_json_safe)
+# loguru does the writing: it is thread-safe, rotates and compresses the
+# files itself, records where each line was logged from (module, function,
+# line) and prints tracebacks with the values of the variables involved.
+# log_event() keeps its old signature, so the rest of the app is unchanged.
+#
+# Set the environment variable INTERPRETER_LOG_LEVEL=DEBUG to also record
+# DEBUG events (default INFO).
+LOG_LEVEL = os.environ.get("INTERPRETER_LOG_LEVEL", "INFO").upper()
+
+# Fields every JSON line has; the extra fields passed to log_event() follow.
+_LOG_BASE_KEYS = ("ts", "level", "logger", "event", "message", "thread",
+                  "process", "module", "function", "line")
 
 
-class GZipRotatingFileHandler(logging.handlers.RotatingFileHandler):
-    """A log file handler that starts a new file when the log gets big.
-
-    When interpreter.log.jsonl passes MAX_LOG_BYTES it is renamed to .1, .2 …
-    and the old copies are compressed with gzip so they take little space.
-    """
-    def doRollover(self):
-        """Rotate the log files, then gzip the rotated copies."""
-        super().doRollover()
-        for i in range(self.backupCount, 0, -1):
-            rotated = Path(f"{self.baseFilename}.{i}")
-            gz_path = rotated.with_name(rotated.name + ".gz")
-            if rotated.exists() and not gz_path.exists():
-                try:
-                    with open(rotated, "rb") as src, gzip.open(gz_path, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    rotated.unlink(missing_ok=True)
-                except Exception as e:
-                    print(f"Log compression failed: {e}", file=sys.stderr)
-
-
-class PlaintextFormatter(logging.Formatter):
-    """Formats log messages as short readable lines for the console window."""
-    def format(self, record):
-        """Build one readable console line: time, level, thread, event, fields."""
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        event = getattr(record, "event", record.getMessage())
-        msg = f"[{ts}] {record.levelname:^7} | {record.threadName[:15]:<15} | {event}"
-        extra_fields = getattr(record, "fields", None)
-        if isinstance(extra_fields, dict):
-            # Format kwargs nicely
-            args = ", ".join(f"{k}={v}" for k, v in extra_fields.items() if k not in ["exception", "event"])
-            if args:
-                msg += f" | {args}"
-        if record.exc_info:
-            msg += f"\n{self.formatException(record.exc_info)}"
-        return msg
+def _to_json_line(record) -> None:
+    """loguru patcher: build the JSON text for one record and keep it in
+    record["extra"]["_json"]. Patchers run on the thread that logged, while
+    the traceback still exists, so the "exception" field is always complete."""
+    extra = record["extra"]
+    payload = {
+        "ts":       record["time"].isoformat(timespec="milliseconds"),
+        "level":    record["level"].name,
+        "logger":   extra.get("logger", "interpreter.app"),
+        "event":    extra.get("event", record["message"]),
+        "message":  record["message"],
+        "thread":   record["thread"].name,
+        "process":  record["process"].id,
+        "module":   record["name"],
+        "function": record["function"],
+        "line":     record["line"],
+    }
+    payload.update(extra.get("fields") or {})
+    if record["exception"] is not None:
+        payload["exception"] = "".join(traceback.format_exception(*record["exception"]))
+    # default=_json_safe: numpy numbers (np.int64, np.bool_ …) are not
+    # JSON types; without it the whole line was lost.
+    extra["_json"] = json.dumps(payload, ensure_ascii=False, default=_json_safe)
+    # Short "key=value, …" text for the console line.
+    extra["_kv"] = ", ".join(f"{k}={v}" for k, v in (extra.get("fields") or {}).items())
 
 
-def _build_logger(name: str, path: Path, level=logging.INFO) -> logging.Logger:
-    """Create a logger that writes JSON to `path` and readable text to the console.
-
-    `level` is the minimum importance that gets written (INFO, WARNING …).
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    logger.handlers.clear()
-    logger.propagate = False
-    
-    # JSONL file handler
-    f_handler = GZipRotatingFileHandler(
-        path, maxBytes=MAX_LOG_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
-    )
-    f_handler.setFormatter(JsonLineFormatter())
-    logger.addHandler(f_handler)
-    
-    # Plaintext console handler
-    s_handler = logging.StreamHandler(sys.stdout)
-    s_handler.setFormatter(PlaintextFormatter())
-    logger.addHandler(s_handler)
-    
-    return logger
+def _json_format(record) -> str:
+    """loguru format function for the JSONL files: the ready-made JSON line."""
+    return "{extra[_json]}\n"
 
 
-# The two loggers used by log_event(): APP_LOG gets everything (INFO and
-# up), ERROR_LOG only WARNING and up.
-APP_LOG   = _build_logger("interpreter.app",   LOG_PATH,       logging.INFO)
-ERROR_LOG = _build_logger("interpreter.error", ERROR_LOG_PATH, logging.WARNING)
+def _console_format(record) -> str:
+    """loguru format function for the console: time, level, thread, event,
+    fields, and (added by loguru) a coloured traceback when there is one."""
+    kv = " | {extra[_kv]}" if record["extra"].get("_kv") else ""
+    return ("<green>{time:HH:mm:ss.SSS}</green> <level>{level: ^8}</level> | "
+            "<cyan>{thread.name: <15.15}</cyan> | <level>{extra[event]}</level>" + kv
+            + " <dim>({name}:{function}:{line})</dim>\n{exception}")
+
+
+def _gzip_rotated(path: str, base: Path = None) -> None:
+    """loguru compression hook, run after a log file passes MAX_LOG_BYTES.
+
+    loguru renames interpreter.log.jsonl to interpreter.log.<time>.jsonl;
+    this gzips it as interpreter.log.jsonl.<time>.gz (the name log_tools.py
+    and iter_log_files() look for) and keeps the newest LOG_BACKUP_COUNT."""
+    src = Path(path)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    gz_path = base.with_name(f"{base.name}.{stamp}.gz")
+    try:
+        with open(src, "rb") as fin, gzip.open(gz_path, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        src.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"Log compression failed: {e}", file=sys.stderr)
+    old = sorted(base.parent.glob(base.name + ".*.gz"), key=lambda p: p.stat().st_mtime)
+    for stale in old[:-LOG_BACKUP_COUNT]:
+        stale.unlink(missing_ok=True)
+
+
+class _InterceptHandler(logging.Handler):
+    """Sends warnings from libraries that use Python's standard logging
+    (faster_whisper, huggingface_hub, urllib3, ctranslate2 …) into loguru,
+    so they reach the log files instead of only the console."""
+    def emit(self, record: logging.LogRecord) -> None:
+        """Called by Python's logging: forward the record as a log_event."""
+        if record.name.startswith("interpreter"):
+            return
+        text = record.getMessage()
+        # Public Hub repositories can be downloaded without authentication.
+        # This notice only says unauthenticated requests have lower rate limits;
+        # treating it as an app warning makes it appear as a program problem.
+        hub_auth_notice = (record.name.startswith("huggingface_hub.") and
+                           "unauthenticated requests to the hf hub" in text.lower())
+        event = ("huggingface_auth_optional" if hub_auth_notice else
+                 "library_" + record.name.split(".")[0].replace("-", "_"))
+        fields = {"source": record.name, "text": text,
+                  "where": f"{record.pathname}:{record.lineno} (in {record.funcName})"}
+        logger.opt(exception=record.exc_info or None).bind(event=event, fields=fields) \
+              .log("INFO" if hub_auth_notice else
+                   (record.levelname if record.levelname in _LOGURU_LEVELS else record.levelno),
+                   text)
+
+
+_LOGURU_LEVELS = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
+
+
+def _setup_logging() -> None:
+    """Replace loguru's default console output with the app's sinks:
+    console (readable, coloured), the main JSONL log and the error JSONL log."""
+    logger.remove()
+    logger.configure(patcher=_to_json_line, extra={"event": "", "fields": {}})
+    if sys.stdout is not None:   # None in a windowed .exe (no console)
+        logger.add(sys.stdout, level=LOG_LEVEL, format=_console_format,
+                   colorize=None, backtrace=True, diagnose=True)
+    for path, level in ((LOG_PATH, LOG_LEVEL), (ERROR_LOG_PATH, "WARNING")):
+        logger.add(path, level=level, format=_json_format, encoding="utf-8",
+                   rotation=MAX_LOG_BYTES,
+                   compression=lambda p, base=path: _gzip_rotated(p, base),
+                   backtrace=True, diagnose=False)
+    # Library warnings (and errors) from standard logging go to loguru too.
+    logging.basicConfig(handlers=[_InterceptHandler()], level=logging.WARNING, force=True)
+
+
+_setup_logging()
+
+
+def add_issue_sink(sink: Callable[[Any], None]) -> int:
+    """Also send every warning/error to `sink` (a function that gets loguru's
+    message; message.record has "level", "extra" and "exception"). Used by
+    the Diagnostics page's "Recent issues". Returns an id for remove_log_sink()."""
+    return logger.add(sink, level="WARNING", format="{message}", catch=True)
+
+
+def remove_log_sink(sink_id: int) -> None:
+    """Stop a sink added by add_issue_sink() (ignored if already removed)."""
+    try:
+        logger.remove(sink_id)
+    except ValueError:
+        pass
+
+
+def _level_name(level: int | str) -> str | int:
+    """logging.INFO (20) -> "INFO", which loguru knows; other numbers as is."""
+    if isinstance(level, str):
+        return level.upper()
+    name = logging.getLevelName(level)
+    return name if name in _LOGURU_LEVELS else level
 
 
 def log_event(level: int, event: str, **fields: Any) -> None:
     """Write one event to the log. This is the function the whole app uses.
 
+    `level` is logging.INFO, logging.WARNING … (or a name like "DEBUG");
     `event` is a short name such as "phrase_trace"; any keyword arguments are
     stored as extra JSON fields. Warnings and errors also go to the error log.
+    The line records the caller's module, function and line number.
     """
-    APP_LOG.log(level, event, extra={"event": event, "fields": fields})
-    if level >= logging.WARNING:
-        ERROR_LOG.log(level, event, extra={"event": event, "fields": fields})
+    logger.opt(depth=1).bind(event=event, fields=fields).log(_level_name(level), event)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,7 +683,8 @@ class _Blank(dict):
 
 # Log fields that are noise in an explanation (who logged, internal ids)
 _DETAIL_SKIP = {"exception_type", "exception_message", "session_id", "run_id", "process",
-                "thread", "logger", "message", "ts", "event", "level"}
+                "thread", "logger", "message", "ts", "event", "level",
+                "module", "function", "line"}
 
 
 def _describe_fields(fields, limit=12):
@@ -709,8 +760,7 @@ def log_exception(event: str, exc: Exception, **fields: Any) -> None:
     merged = dict(fields)
     merged.setdefault("exception_type",    type(exc).__name__)
     merged.setdefault("exception_message", str(exc))
-    APP_LOG.error(   event, exc_info=(type(exc), exc, exc.__traceback__), extra={"event": event, "fields": merged})
-    ERROR_LOG.error( event, exc_info=(type(exc), exc, exc.__traceback__), extra={"event": event, "fields": merged})
+    logger.opt(depth=1, exception=exc).bind(event=event, fields=merged).error(event)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -785,16 +835,11 @@ def install_global_exception_hooks():
     installs them (see the bottom of the file), not scripts that import it.
     """
     def _excepthook(exc_type, exc_value, exc_tb):
-        for log in (APP_LOG, ERROR_LOG):
-            log.critical("unhandled_exception", exc_info=(exc_type, exc_value, exc_tb),
-                         extra={"event": "unhandled_exception", "fields": {}})
+        logger.opt(exception=(exc_type, exc_value, exc_tb))               .bind(event="unhandled_exception", fields={}).critical("unhandled_exception")
 
     def _threading_excepthook(args):
-        for log in (APP_LOG, ERROR_LOG):
-            log.critical("unhandled_thread_exception",
-                         exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-                         extra={"event": "unhandled_thread_exception",
-                                "fields": {"thread": args.thread.name if args.thread else None}})
+        logger.opt(exception=(args.exc_type, args.exc_value, args.exc_traceback))               .bind(event="unhandled_thread_exception",
+                    fields={"thread": args.thread.name if args.thread else None})               .critical("unhandled_thread_exception")
 
     sys.excepthook      = _excepthook
     threading.excepthook = _threading_excepthook
@@ -2634,7 +2679,7 @@ MIN_CHARS_PER_SEC = 5.0   # good phrases ran 9-17 chars/s in the logs; at 5 the 
 MAX_COMPRESSION   = 2.4   # Whisper's own repetition-loop check
 
 
-RETRY_USELESS = {"repetitive", "stock_phrase"}   # see _retry_if_suspicious
+RETRY_USELESS = {"stock_phrase"}                 # see _retry_if_suspicious
 RECENT_AUDIO_PHRASES = 40                         # kept in memory for "Report a mistake"
 FEEDBACK_DIR = APP_DIR / "testdata" / "feedback"  # reported phrases (simulator test set)
 
@@ -2696,6 +2741,12 @@ def save_feedback(
               audio_saved=bool(path), note=note[:200], music_mode=trace.get("music_mode"),
               end_rule=trace.get("end_rule"), lang_reason=trace.get("lang_reason"))
     return path
+
+
+def _words(text: str) -> list[str]:
+    """The words of a text, lower-case, without punctuation (to compare two
+    transcriptions by content)."""
+    return "".join(c for c in text.lower() if c.isalnum() or c.isspace()).split()
 
 
 def suspicious_reasons(text: str, speech_sec: float, avg_logprob: float) -> list:
@@ -2825,18 +2876,55 @@ def app_version() -> str:
     return _APP_VERSION
 
 
+_NVML_LOCK = threading.Lock()
+_NVML_MODULE = None
+_NVML_HANDLE = None
+_NVML_ERROR = None
+
+
+def _nvml_device():
+    """Return the cached NVML module and first device handle, initializing once."""
+    global _NVML_MODULE, _NVML_HANDLE, _NVML_ERROR
+    if _NVML_HANDLE is not None:
+        return _NVML_MODULE, _NVML_HANDLE
+    if _NVML_ERROR is not None:
+        raise RuntimeError(_NVML_ERROR)
+    with _NVML_LOCK:
+        if _NVML_HANDLE is not None:
+            return _NVML_MODULE, _NVML_HANDLE
+        if _NVML_ERROR is not None:
+            raise RuntimeError(_NVML_ERROR)
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            _NVML_MODULE = pynvml
+            _NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception as exc:
+            _NVML_ERROR = type(exc).__name__
+            raise
+    return _NVML_MODULE, _NVML_HANDLE
+
+
 def gpu_snapshot() -> dict:
     """Graphics card load, memory, and which OTHER programs use it right now.
     Another program on the GPU slows Whisper (31 Oct: encoder 140 -> 450 ms)."""
     out = {}
     try:
-        import pynvml
+        pynvml, h = _nvml_device()
         import psutil
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
         util, mem = pynvml.nvmlDeviceGetUtilizationRates(h), pynvml.nvmlDeviceGetMemoryInfo(h)
         out.update(gpu_load_pct=util.gpu, gpu_mem_used_mb=mem.used // 2**20,
-                   gpu_mem_total_mb=mem.total // 2**20)
+                   gpu_mem_total_mb=mem.total // 2**20,
+                   gpu_mem_free_mb=mem.free // 2**20,
+                   gpu_temp_c=pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU),
+                   gpu_sm_clock_mhz=pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+        try:
+            own = [p.usedGpuMemory for p in pynvml.nvmlDeviceGetComputeRunningProcesses(h)
+                   if p.pid == os.getpid() and p.usedGpuMemory]
+            if own:
+                out["gpu_mem_app_mb"] = own[0] // 2**20
+        except Exception:
+            pass
         # Programs actually computing on the GPU (% of its time, recent
         # samples). The plain process lists name every app with a window.
         busy = {}
@@ -3548,11 +3636,21 @@ class TranscriptionWorker(threading.Thread):
         if not reasons or info.get("no_speech"):
             return texts, token_ids, info
         info["suspicious"] = reasons
-        # Log analysis (real calls + simulator): retrying a "repetitive" or
-        # "stock_phrase" result never gave a better text (0 of 26), each costing
-        # ~180 ms; "low_confidence" (80/179) and "too_short" (7/26) did help.
+        # Log analysis (real calls + simulator): retrying a "stock_phrase"
+        # result never gave a better text. A "repetitive" loop can be fixed
+        # (simulator, tr_04: 32 -> 4 word errors) once the result is checked
+        # with the rule below; earlier retries of loops only looked useless
+        # because that rule rejected every result shorter than the loop.
         if not set(reasons) - RETRY_USELESS:
             info["retry_skipped"] = "reasons that never improved on retry"
+            return texts, token_ids, info
+        # A 1-2 word fragment of doubtful speech (speech detector < 0.5) that
+        # is only "low confidence": the audio is unclear, and a second decode
+        # just guesses differently ("Oh" -> "Huh?"). Simulator replay with the
+        # correct text: 16 such retries, net 2 word errors fewer, ~160 ms each.
+        if (reasons == ["low_confidence"] and (info.get("vad_mean") or 0) < 0.5
+                and len(texts[0].split()) <= 2):
+            info["retry_skipped"] = "short unclear fragment"
             return texts, token_ids, info
         saved = self._history
         self._history = {k: [] for k in self._history}
@@ -3564,18 +3662,28 @@ class TranscriptionWorker(threading.Thread):
         retry_token_ids = retry_info.pop("_token_ids", [])
         retry_logprob = (retry_info.get("avg_logprob") or [-9.0])[0]
         retry_reasons = suspicious_reasons(retry_texts[0], speech_sec, retry_logprob)
-        # Accept the retry only if it is real text, no shorter than the
-        # original, and less suspect (or equally suspect but more confident).
-        # A looser rule let a retry swap the correct "с друзьями" for
-        # "Субтитры делал DimaTorzok" because that scored as more confident.
-        better = (bool(retry_texts[0]) and not is_hallucination(retry_texts[0])
-                  and len(retry_texts[0]) >= len(texts[0])
-                  and (len(retry_reasons) < len(reasons)
-                       or (len(retry_reasons) == len(reasons) and retry_logprob > logprob)))
+        # Accept the retry only if it is real text (not a caption hallucination
+        # such as "Субтитры делал DimaTorzok", not a stock phrase such as
+        # "Продолжение следует...") and either
+        #   - not suspect at all and more confident: its length doesn't matter
+        #     (simulator: clean retries rejected only for being shorter would
+        #     have cut word errors 11->1, 9->5, 13->11 and 32->4), or
+        #   - no shorter than the original and less suspect (or equally
+        #     suspect but more confident).
+        retry_text = retry_texts[0]
+        real = (bool(retry_text) and not is_hallucination(retry_text)
+                and " ".join(_words(retry_text)) not in SUSPECT_PHRASES)
+        better = real and ((not retry_reasons and retry_logprob > logprob)
+                           or (len(retry_text) >= len(texts[0])
+                               and (len(retry_reasons) < len(reasons)
+                                    or (len(retry_reasons) == len(reasons)
+                                        and retry_logprob > logprob))))
         info["retry"] = {"text": retry_texts[0], "avg_logprob": round(retry_logprob, 3),
                          "reasons": retry_reasons, "used": better,
                          "ms": round((time.perf_counter() - t0) * 1000, 1),
-                         "original_text": texts[0]}
+                         "original_text": texts[0],
+                         # False when only punctuation/capitals differ ("today" -> "Today.")
+                         "words_changed": _words(retry_texts[0]) != _words(texts[0])}
         if better:
             texts, token_ids, reasons = retry_texts, retry_token_ids, retry_reasons
             info["avg_logprob"] = retry_info.get("avg_logprob")
@@ -3852,6 +3960,8 @@ class TranscriptionWorker(threading.Thread):
                     rec = self._recognise(audio_np)
                     self._session["early_missed"] += bool(meta.get("early_blocks"))
                 tasks, token_ids, info = rec["tasks"], rec["token_ids"], rec["info"]
+                if rec.get("switch_log"):
+                    log_event(logging.INFO, "language_switched", seq=seq, **rec["switch_log"])
                 whisper_translates = rec["whisper_translates"]
                 text, translated = rec["text"], rec["translated"]
                 engine, mt_ms = rec["engine"], rec["mt_ms"]
@@ -4031,8 +4141,8 @@ class TranscriptionWorker(threading.Thread):
             translated = f"({name} - not translated: 'Detect other languages' is off)"
         elif text and lang == self.tgt_whisper:
             translated, engine = text, "none (already target language)"
-        elif text and self._mt(text, src=lang)[0] is not None:
-            translated, mt_ms = self._mt(text, src=lang)
+        elif text and (local := self._mt(text, src=lang))[0] is not None:
+            translated, mt_ms = local      # translated once, used as it is
             engine = f"opus-mt-{lang}"
         elif text:
             t0 = time.perf_counter()
@@ -4043,11 +4153,13 @@ class TranscriptionWorker(threading.Thread):
                 info["translation_error"] = f"{type(e).__name__}: {e}"
                 translated = f"(no offline translation for {name})"
             mt_ms = round((time.perf_counter() - t0) * 1000, 1)
-        log_event(logging.INFO, "language_switched", worker_id=self.wid, lang=lang,
-                  lang_prob=info.get("lang_prob"), expected=self.src_whisper,
-                  src_lang_prob=info.get("src_lang_prob"), text=text[:120],
-                  auto=self.auto_language, engine=engine)
+        # Logged by the caller once the result is kept: early finals that are
+        # thrown away would otherwise log the same phrase several times.
+        switch_log = dict(worker_id=self.wid, lang=lang, lang_prob=info.get("lang_prob"),
+                          expected=self.src_whisper, src_lang_prob=info.get("src_lang_prob"),
+                          text=text[:120], auto=self.auto_language, engine=engine)
         return {"tasks": tasks, "token_ids": token_ids, "info": info,
+                "switch_log": switch_log,
                 "whisper_translates": whisper_translates,
                 "text": f"[{name}] {text}" if text else "",
                 "translated": translated if text else ("" if whisper_translates else None),
@@ -4249,6 +4361,7 @@ def collect_resource_stats(app) -> dict:
                                     sorted(per_thread.items(), key=lambda kv: -kv[1])[:6]}
         # The busiest other apps: shows whether Teams/Telemost were short of CPU.
         others, now_other = [], {}
+        process_probe_started = time.perf_counter()
         for p in psutil.process_iter(["pid", "name", "cpu_times"]):
             ct = p.info.get("cpu_times")
             if ct is None or p.info["pid"] in (0, proc.pid):
@@ -4261,32 +4374,20 @@ def collect_resource_stats(app) -> dict:
         app._other_times = now_other
         others.sort(reverse=True)
         fields["top_other_apps"] = {n: round(u / interval * 100, 1) for u, n in others[:5]}
+        fields["process_inventory_ms"] = round(
+            (time.perf_counter() - process_probe_started) * 1000, 1)
     except Exception:
         pass
     if WHISPER_DEVICE == "cuda":
+        gpu_probe_started = time.perf_counter()
         try:
-            import pynvml
-            pynvml.nvmlInit()
-            gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-            gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-            fields.update(gpu_util_pct=gpu_util.gpu, gpu_mem_used_mb=gpu_mem.used // 2**20,
-                          gpu_mem_free_mb=gpu_mem.free // 2**20,
-                          gpu_temp_c=pynvml.nvmlDeviceGetTemperature(gpu_handle, 0),
-                          gpu_sm_clock_mhz=pynvml.nvmlDeviceGetClockInfo(gpu_handle, 1))
-            try:   # our own share of GPU memory (Windows often doesn't report it)
-                own = [p.usedGpuMemory for p in pynvml.nvmlDeviceGetComputeRunningProcesses(gpu_handle)
-                       if p.pid == os.getpid() and p.usedGpuMemory]
-                if own:
-                    fields["gpu_mem_app_mb"] = own[0] // 2**20
-            except Exception:
-                pass
+            fields.update(gpu_snapshot())
+            fields["gpu_util_pct"] = fields.pop("gpu_load_pct")
         except Exception:
             pass
-    # Other programs computing on the GPU (they slow recognition down)
-    others = gpu_snapshot().get("gpu_other_programs_pct")
-    if others:
-        fields["gpu_other_programs_pct"] = others
+        finally:
+            fields["gpu_snapshot_ms"] = round(
+                (time.perf_counter() - gpu_probe_started) * 1000, 1)
     return fields
 
 
@@ -4304,13 +4405,12 @@ def resource_warnings(fields) -> list:
 
 class InterpreterApp(ctk.CTk):
 
-    """The main window, and the "conductor" that starts and stops everything.
+    """Classic desktop view and UI adapter for the shared session controller.
 
-    It builds the controls, starts a listening "session" (one capture thread,
-    one transcription worker, one translation worker) and restarts it whenever
-    a setting changes. Background threads never touch the window directly:
-    they put messages on `result_queue`, and _poll_queue() (on the main
-    thread) reads them every 15 ms and updates the screen.
+    It builds the controls, validates model state, turns current widget values
+    into a SessionConfig, and hands worker lifecycle to SessionController.
+    Background threads never touch the window directly: they put messages on
+    `result_queue`, and _poll_queue() reads them on the UI thread.
     """
     def __init__(self):
         """Create the window: load settings, find audio devices, build all the
@@ -4328,7 +4428,9 @@ class InterpreterApp(ctk.CTk):
         # for every listening session). _perf_stats: figures for Diagnostics.
         self.session_id = str(uuid.uuid4())
         self.result_queue = queue.Queue()
-        self.phrase_queue = queue.Queue()
+        from session_controller import SessionController
+        self.session_controller = SessionController(self.result_queue, sys.modules[__name__])
+        self.phrase_queue = self.session_controller.phrase_queue
         self._perf_stats  = {
             "transcriptions":  0,
             "translations":    0,
@@ -4341,7 +4443,7 @@ class InterpreterApp(ctk.CTk):
         self._loopback_out        = None
         self._workers             = []
         self._translation_workers = []
-        self._translation_queue   = queue.Queue(maxsize=TRANSLATION_QUEUE_MAX)
+        self._translation_queue   = self.session_controller.translation_queue
         # _model_loader: thread loading the main model; _whisper_model: the model
         # once loaded; is_listening: a session is running; _muted: user pressed
         # Mute; _run_id: session counter; _last_poll_t / _psutil_process: for the
@@ -4928,16 +5030,23 @@ class InterpreterApp(ctk.CTk):
             self._start_session()
         log_event(logging.INFO, "mute_toggled", muted=self._muted)
 
-    def _start_session(self):
-        """Start listening: create the capture thread, transcription worker and
-        translation worker for the current device, languages and models.
+    def _sync_session_controller(self):
+        """Expose controller-owned runtime references to existing UI diagnostics."""
+        controller = self.session_controller
+        self.phrase_queue = controller.phrase_queue
+        self._translation_queue = controller.translation_queue
+        self._capture_thread = controller.capture_thread
+        self._loopback_out = controller.loopback_out
+        self._workers = controller.workers
+        self._translation_workers = controller.translation_workers
+        self._partial_slot = controller.partial_slot
+        self._early_slot = controller.early_slot
+        self._stopping_capture = controller.stopping_capture
 
-        If the Whisper model is still loading, it tries again every 0.6 s.
-        """
+    def _start_session(self):
+        """Validate the selected model and ask the shared controller to start it."""
         if self.is_listening or self._muted:
             return
-        # ── Step 1: make sure the Whisper model is loaded ────────────────
-        # If it is still loading, show a message and try again in 0.6 s.
         if self._model_loader and not self._model_loader.ready.is_set():
             self.status_var.set("⏳ Loading Whisper model - please wait…")
             if self._start_retry_after_id is None:
@@ -4962,176 +5071,67 @@ class InterpreterApp(ctk.CTk):
             log_event(logging.ERROR, "session_start_blocked_model_unavailable")
             return
 
+        device_label = self.device_var.get()
+        input_index = self._input_map.get(device_label, -1)
+        input_index = None if input_index == -1 else input_index
+        log_event(logging.INFO, "audio_device_selected",
+                  device_label=device_label, device_index=input_index)
+        if self._active_mode is not None:
+            self._mode_state[self._active_mode][0] = device_label
+        save_settings(mode_devices=[mode[0] for mode in self._mode_state])
+
+        output_label = self.out_device_var.get()
+        output_index = self._output_map.get(output_label, -1)
+        output_index = None if output_index == -1 else output_index
+        if self._tts_on:
+            self._configure_speaker()
+        self._live = {}
         self.is_listening = True
         self._set_live_status("LISTENING", COL_OK)
         self.status_var.set("Listening…")
 
-        # ── Step 2: work out the device, languages and queues ────────────
-        # in_idx is PortAudio's number for the selected input device.
-        in_idx = self._input_map.get(self.device_var.get(), -1)
-        if in_idx == -1:
-            in_idx = None
-        log_event(logging.INFO, "audio_device_selected",
-                  device_label=self.device_var.get(), device_index=in_idx)
-        if self._active_mode is not None:
-            self._mode_state[self._active_mode][0] = self.device_var.get()
-        save_settings(mode_devices=[m[0] for m in self._mode_state])
-        capturing_output = "[loopback]" in self.device_var.get().lower()
-
-        src_key     = self.src_var.get()
-        tgt_key     = self.tgt_var.get()
-        src_whisper, _ = LANGUAGES.get(src_key, ("en", "en"))
-
-        # phrase_queue carries finished phrases (capture -> worker);
-        # partial_slot carries only the newest preview audio.
-        worker_count = getattr(self._model_loader, "worker_count", NUM_WORKERS)
-        # Room for ~30 phrases (each ≤15 s, ≤0.5 MB): a GPU stall of a minute or
-        # so is caught up later instead of losing speech (8 slots overflowed
-        # when the GPU was shared, 31 Oct). The backlog warning still fires at 6.
-        self.phrase_queue  = queue.Queue(maxsize=max(worker_count * 16, 32))
-        # No preview slot when previews are Off: capture then never offers one.
-        self._partial_slot = None if self._previews_off else LatestSlot()
-        self._early_slot   = LatestSlot()   # early finals (EARLY_FINAL_SEC)
-        # Everything that can change speed or accuracy, recorded once per
-        # session (session_config) and copied into every phrase_trace, so
-        # results can be compared by setting (log_tools.py compare).
-        loader = self._model_loader
-        session_config = {
-            "model": MODELS.get(self.model_var.get()),
-            "compute_type": getattr(loader, "active_compute_type", COMPUTE_TYPE),
-            "device": getattr(loader, "active_device", WHISPER_DEVICE),
-            "preview_choice": self.preview_choice_var.get(),
-            "sensitivity": round(self.sensitivity_var.get(), 2),
-            "src_lang": self.src_var.get(), "tgt_lang": self.tgt_var.get(),
-            "speak": self._tts_on,
-        }
-        self._live         = {}
-        # Spoken translations played on the device we're capturing would be
-        # heard as the friend; mute capture while the speaker is talking.
-        same_device = (capturing_output and plain_device_name(self.device_var.get())
-                       == plain_device_name(self.out_device_var.get()))
-        self._mute_evt = self.speaker.speaking if same_device else None
-        if self._tts_on:
-            self._configure_speaker()
-
-        # ── Optional loopback output (VB-Audio → Fiio headphones) ────────
-        # Look up the native sample rate of the input device so the loopback
-        # output thread opens at the same rate and PortAudio accepts it.
-        _pa_tmp = pyaudio.PyAudio() if _PYAUDIO_AVAILABLE else None
-        in_native_rate = get_device_native_rate(_pa_tmp, in_idx) if _pa_tmp else SAMPLE_RATE
-        if _pa_tmp:
-            _pa_tmp.terminate()
-        self._loopback_out = None
-        if self.loopback_var.get() and capturing_output:
-            # The audio is already playing on that device; replaying it would
-            # double it up (or feed back if it's the same device).
-            log_event(logging.INFO, "loopback_skipped_output_capture",
-                      device_label=self.device_var.get())
-        elif self.loopback_var.get():
-            out_lbl = self.out_device_var.get()
-            out_idx = self._output_map.get(out_lbl, -1)
-            if out_idx == -1:
-                out_idx = None
-            self._loopback_out = LoopbackOutputThread(
-                output_device_index=out_idx,
-                input_sample_rate=in_native_rate,
-                status_cb=lambda m: self.result_queue.put(("status", m)))
-            self._loopback_out.start()
-            log_event(logging.INFO, "loopback_started",
-                      output_label=out_lbl, output_index=out_idx,
-                      input_native_rate=in_native_rate)
-
-        # Opening a new PortAudio instance while the previous capture thread is
-        # still terminating its own fails with "Unanticipated host error".
-        prev_capture = getattr(self, "_stopping_capture", None)
-        if prev_capture is not None and prev_capture.is_alive():
-            prev_capture.join(timeout=1.0)
-        self._stopping_capture = None
-        self._capture_thread = AudioCaptureThread(
-            device_index=in_idx,
-            phrase_queue=self.phrase_queue,
-            status_cb=lambda m: self.result_queue.put(("status", m)),
-            level_cb=self._on_level,
-            loopback_out=self._loopback_out,
-            partial_slot=self._partial_slot,
-            mute_evt=self._mute_evt,
-            early_slot=self._early_slot,
+        from session_controller import SessionConfig
+        settings = load_settings()
+        config = SessionConfig(
+            session_id=self.session_id,
+            run_id=self._run_id,
+            device_label=device_label,
+            device_index=input_index,
+            output_label=output_label,
+            output_index=output_index,
+            loopback=bool(self.loopback_var.get()),
+            src_key=self.src_var.get(),
+            tgt_key=self.tgt_var.get(),
+            model_label=self.model_var.get(),
+            sensitivity=round(self.sensitivity_var.get(), 2),
+            preview_choice=self.preview_choice_var.get(),
+            preview_enabled=self._preview_enabled,
+            previews_off=self._previews_off,
+            tts_on=self._tts_on,
+            record_audio=bool(settings.get("record_audio", True)),
+            auto_language=bool(settings.get("auto_language", True)),
+            mode_state=tuple(tuple(mode) for mode in self._mode_state),
         )
-        self._capture_thread.set_sensitivity(round(self.sensitivity_var.get(), 2))
-        # Previews from a large main model (Turbo/Medium) take ~190 ms each;
-        # every 0.2 s kept the GPU at 100 % and made finished phrases wait
-        # (logs: 120 ms median, 331 ms p95; 561 previews thrown away). Make
-        # them every 0.45 s instead; small preview models keep 0.2 s.
-        if (not self._preview_enabled and not self._previews_off
-                and MODELS.get(self.model_var.get()) in (
-                "large-v3-turbo", "medium")):
-            self._capture_thread.preview_interval_sec = MAIN_MODEL_PREVIEW_INTERVAL_SEC
-        self._capture_thread.music_scene = self._ensure_music_scene()
-        self._capture_thread.start()
-
-        # ── Translation workers (TRANSLATION_WORKERS parallel) ────────────
-        self._translation_workers = []
-        for wid in range(TRANSLATION_WORKERS):
-            translation_worker = TranslationWorker(wid, self._translation_queue, self.result_queue)
-            translation_worker.start()
-            self._translation_workers.append(translation_worker)
-
-        # ── Transcription workers ─────────────────────────────────────────
-        self._workers = []
-        for wid in range(worker_count):
-            worker = TranscriptionWorker(
-                wid=wid, model=self._whisper_model,
-                src_whisper=src_whisper,
-                src_lang_key=src_key, tgt_lang_key=tgt_key,
-                phrase_queue=self.phrase_queue,
-                result_queue=self.result_queue,
-                status_cb=lambda m: self.result_queue.put(("status", m)),
-                partial_slot=self._partial_slot,
+        try:
+            self.session_controller.start(
+                config,
+                model=self._whisper_model,
+                model_loader=self._model_loader,
+                speaker=self.speaker,
+                on_level=self._on_level,
                 preview_model=self._preview_model,
-                run_id=self._run_id,
-                record_audio=bool(load_settings().get("record_audio", True)),
-                translator=self._translator_for(src_whisper,
-                                                LANGUAGES.get(tgt_key, ("en", "en"))[0]),
-                early_slot=self._early_slot,
-                session_id=self.session_id,
-                config=session_config)
-            worker.music_scene = self._ensure_music_scene()
-            # Automatic language detection: "auto_language" in the settings
-            # (the Fluent window's "Detect other languages" box)
-            worker.auto_language = bool(load_settings().get("auto_language", True))
-            worker.translator_for = self._translator_for
-            # Languages of both modes (e.g. Russian and English): likely
-            # candidates when Auto-detect is unsure about a short phrase
-            for _device, *names in getattr(self, "_mode_state", []):
-                for name in names:
-                    code = LANGUAGES.get(name, ("auto",))[0]
-                    if code != "auto" and code not in worker._recent_langs:
-                        worker._recent_langs.append(code)
-            worker.start()
-            self._workers.append(worker)
-
-        log_event(logging.INFO, "session_config", run_id=self._run_id,
-                  session_id=self.session_id, device_label=self.device_var.get(),
-                  output_label=self.out_device_var.get(), **session_config,
-                  # the tuning values from the top of the file, in case they change
-                  tuning={"silence_sec": SILENCE_SEC, "max_phrase_sec": MAX_PHRASE_SEC,
-                          "preview_interval_sec": PARTIAL_INTERVAL_SEC,
-                          "preroll_sec": PREROLL_SEC, "early_final_sec": EARLY_FINAL_SEC,
-                          "context_tokens": CONTEXT_TOKENS},
-                  app_version=APP_VERSION)
-        log_event(logging.INFO, "session_started",
-                  session_id=self.session_id,
-                  device_label=self.device_var.get(), device_index=in_idx,
-                  src_lang=src_key, tgt_lang=tgt_key,
-                  model=self.model_var.get(),
-                  sensitivity=round(self.sensitivity_var.get(), 2),
-                  worker_count=len(self._workers),
-                  translation_workers=len(self._translation_workers),
-                  loopback=self.loopback_var.get(),
-                  model_device=getattr(self._model_loader, "active_device", WHISPER_DEVICE),
-                  model_compute_type=getattr(self._model_loader, "active_compute_type", COMPUTE_TYPE))
-        log_session_context(self.session_id, preview=self.preview_choice_var.get(),
-                            auto_language=bool(load_settings().get("auto_language", True)))
+                translator_for=self._translator_for,
+                music_scene=self._ensure_music_scene(),
+            )
+            self._sync_session_controller()
+        except Exception as exc:
+            self.is_listening = False
+            self.session_controller.stop_workers()
+            self._sync_session_controller()
+            self._set_live_status("START FAILED", COL_ERR)
+            self.status_var.set(f"Could not start listening: {exc}")
+            log_exception("session_start_failed", exc, device_label=device_label,
+                          model=config.model_label, run_id=config.run_id)
 
     def _retry_start_session(self):
         """Timer callback: try _start_session again (model was still loading)."""
@@ -5139,26 +5139,13 @@ class InterpreterApp(ctk.CTk):
         self._start_session()
 
     def _stop_session(self, keep_mode=False):
-        """Stop listening: tell all the session's threads to finish and reset the
-        meter. `keep_mode` is True when the stop is part of a restart.
-        """
+        """Stop the controller's workers, then reset UI state and indicators."""
         self.is_listening = False
         if self._start_retry_after_id is not None:
             self.after_cancel(self._start_retry_after_id)
             self._start_retry_after_id = None
-        if self._capture_thread:
-            self._capture_thread.stop()
-            self._stopping_capture = self._capture_thread
-            self._capture_thread = None
-        if self._loopback_out:
-            self._loopback_out.stop()
-            self._loopback_out = None
-        for worker in self._workers:
-            worker.stop()
-        self._workers = []
-        for translation_worker in self._translation_workers:
-            translation_worker.stop()
-        self._translation_workers = []
+        self.session_controller.stop_workers()
+        self._sync_session_controller()
         self.meter.reset()
         self.level_text.configure(text="-")
         self._set_live_status("IDLE", COL_WARN)
@@ -5166,7 +5153,6 @@ class InterpreterApp(ctk.CTk):
                   session_id=self.session_id, keep_mode=keep_mode)
         if not keep_mode:
             self.status_var.set("Stopped.")
-
     # ── TTS - fixed: lock prevents "run loop already started" ────────────
 
     def _toggle_tts(self):

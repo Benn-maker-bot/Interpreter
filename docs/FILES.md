@@ -6,7 +6,8 @@
 
 | File | What it is | Open it when… |
 | --- | --- | --- |
-| `interpreter.py` | **The whole app's logic** (and the old "classic" window) | you want to change how the app behaves |
+| `interpreter.py` | Shared audio/model helpers and the classic window | you want to change app services or the classic UI |
+| `session_controller.py` | Shared session configuration and worker lifecycle | you want to change how capture/transcription/translation workers start or stop |
 | `interpreter_qt.py` | **The Fluent window** you normally use | you want to change what you see or click |
 | `music.py` | Music detection and vocal separation | songs are recognised badly |
 | `simulator_qt.py` | **The simulator window** | you want to test with recordings or live audio |
@@ -17,6 +18,8 @@
 | `README.txt` | Installing and using the app | setting up a new PC |
 | `notes.md` | **Your** brain-dump file | an idea pops up mid-task |
 | `docs/` | These guides | you want to understand something |
+| [LEARNING.md](LEARNING.md) | A guided code tour and small experiments | you want to trace a phrase or learn by changing one behaviour |
+| [FLOWCHARTS.md](FLOWCHARTS.md) | Expanded Mermaid diagrams for data flow, UI design, and testing | a picture would help explain a system boundary |
 
 Files the program **writes** (don't edit by hand):
 
@@ -49,7 +52,7 @@ Use **Ctrl+Shift+O** in VS Code to jump to any class or function by name.
 | Feedback | `save_feedback` | Saves "Report a mistake" reports. |
 | Session context | `log_session_context`, `gpu_snapshot` | Logs the code version and GPU sharing. |
 | Transcription | `TranscriptionWorker` | Whisper, language choice, music, translation. |
-| Main window | `InterpreterApp` | The classic window; its logic is reused by the Fluent window. |
+| Main window | `InterpreterApp` | The classic window and compatibility callbacks for the Fluent window. |
 
 ---
 
@@ -57,7 +60,7 @@ Use **Ctrl+Shift+O** in VS Code to jump to any class or function by name.
 
 | Part | In one sentence |
 | --- | --- |
-| `QVar`, `ComboShim`, `TextShim` | Small adapters so the logic in `interpreter.py` can drive Qt widgets. |
+| `QVar`, `ComboShim`, `TextShim` | Adapters for settings and result handling shared with the classic window. |
 | `LevelMeter`, `SpeechMeter` | The input level and speech meters. |
 | `ReportDialogMistake` | The "Report a mistake" pop-up. |
 | `QtInterpreterApp` | The window: Interpreter page and Diagnostics page. |

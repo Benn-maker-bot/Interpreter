@@ -24,7 +24,7 @@ REM -- Step 1: is Python installed? (errorlevel is non-zero if the command faile
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python not found.
-    echo Install Python 3.9+ from https://python.org
+    echo Install Python 3.13 from https://python.org
     echo Tick Add Python to PATH during install.
     pause
     exit /b 1
@@ -34,7 +34,7 @@ echo.
 
 REM -- Step 2: install / update the required packages
 echo Installing core packages...
-pip install -r requirements.txt --quiet
+pip install -r requirements.txt -c constraints-win-py313.txt --quiet
 REM faster-whisper pulls in the CPU-only onnxruntime, which hides the GPU
 REM build used by music mode; swap it back.
 pip uninstall -y onnxruntime >nul 2>&1

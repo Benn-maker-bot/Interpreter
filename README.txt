@@ -19,7 +19,7 @@ QUICK START
      the packages (a virtual environment keeps them separate from other
      Python projects):
          py -3.13 -m venv .venv
-         .venv\Scripts\python -m pip install -r requirements.txt
+         .venv\Scripts\python -m pip install -r requirements.txt -c constraints-win-py313.txt
   3. Start the app (or double-click setup_and_run.bat):
          .venv\Scripts\python interpreter.py              Fluent window (default)
          .venv\Scripts\python interpreter.py --classic    old classic window
@@ -144,15 +144,16 @@ FILES IN THIS FOLDER
                                and the classic window
                                (start reading at the top: it explains how
                                everything works)
-  interpreter_qt.py            the Fluent window (PySide6); reuses all the
-                               logic in interpreter.py
+  interpreter_qt.py            the Fluent window (PySide6)
+  session_controller.py        shared capture and worker lifecycle
   music.py                     music/singing detection and vocal separation
   log_tools.py                 analysis tool for the logs (see below)
   simulate.py                  tests the app with recorded audio (see below)
   simulator_qt.py              the simulator in a window: watch and hear it
   make_testdata.py             builds the synthetic test clips
   fetch_testdata.py            downloads the simulator's test recordings
-  requirements.txt             the Python packages needed, with comments
+  requirements.txt             flexible package requirements
+  constraints-win-py313.txt    captured Windows/Python 3.13 package versions
   setup_and_run.bat            one-click install and start
   build_exe.bat                build a standalone VoiceInterpreter.exe
   interpreter.settings.json    your saved choices (created automatically)

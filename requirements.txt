@@ -41,6 +41,9 @@ deep-translator>=1.11.0     # MyMemory's list of supported language codes
 # ── Text-to-speech ───────────────────────────────────────────────────────
 comtypes>=1.4               # talks to Windows' built-in speech engine (SAPI)
 
+# ── Logging ──────────────────────────────────────────────────────────────
+loguru>=0.7.2               # writes the JSONL logs and console output (log_event)
+
 # ── Diagnostics (resource_stats log lines) ───────────────────────────────
 psutil>=5.9                 # CPU and memory use; physical core count
 pycaw>=20251023            # which apps are playing sound (logged when the source goes silent)
@@ -48,6 +51,11 @@ nvidia-ml-py>=12            # GPU load, memory, clock speed and temperature
 
 # ── Simulator test data (make_testdata.py) ───────────────────────────────
 edge-tts>=7.0               # neural voices in many languages for synthetic test clips
+sacrebleu>=2.4              # chrF translation scores (translation_score.py, simulate.py)
+# Optional second engine (make_testdata.py --piper). NOT listed as a normal
+# requirement, because it would pull in the CPU onnxruntime over the GPU one.
+# Install it on its own, without dependencies:
+#   pip install --no-deps piper-tts==1.8.0 pathvalidate
 
 # ── Building a standalone .exe (build_exe.bat) ───────────────────────────
 pyinstaller>=6.0.0

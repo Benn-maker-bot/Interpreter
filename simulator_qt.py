@@ -215,7 +215,8 @@ core.ISSUE_HELP.update({
 })
 
 # The drop-down lists' choices: dict, text shown -> value used by simulate.py.
-DATA_CHOICES = {"Synthetic clips": "synth", "Recorded clips": "real",
+DATA_CHOICES = {"Synthetic clips": "synth", "Synthetic clips (Piper)": "synth_piper",
+                "Recorded clips": "real",
                 "Your reported phrases": "feedback", "Live (Windows audio)": "live"}
 KINDS = {"Speech and songs": "speech,song", "Speech only": "speech", "Songs only": "song"}
 PREVIEWS = {"Small": "small", "Tiny": "tiny", "Main model": "main", "Off": "off"}
@@ -469,7 +470,7 @@ class SimulatorWindow(FluentWindow):
         Steps:
           1. Set up the state (empty queues, nothing running).
           2. Start collecting warnings/errors for the Issues page: an
-             IssueHandler is attached to the app's error log, so every
+             IssueHandler is added as a loguru sink (WARNING and up), so every
              warning or error written anywhere lands in self._issues.
           3. List the audio devices NOW, before simulate.build() replaces
              the sound-card library with its fake one.
@@ -489,7 +490,7 @@ class SimulatorWindow(FluentWindow):
         self._issues = deque(maxlen=200)
         self._issue_count_seen, self._issue_groups, self._watchdog_restarts = 0, {}, 0
         self._issue_handler = IssueHandler(self._issues)
-        core.ERROR_LOG.addHandler(self._issue_handler)
+        self._issue_sink_id = core.add_issue_sink(self._issue_handler)
         self._events = queue.Queue()             # simulation thread -> window
         self._level = None                       # newest meter reading (capture thread)
         self._last_level_t, self._stall_logged = None, False
@@ -1571,7 +1572,11 @@ class SimulatorWindow(FluentWindow):
         self.totals_label.setText(
             f"{len(rows)} clips  ·  language right {ok}/{len(rows)}  ·  "
             f"WER {f'{errs / words:.0%}' if words else '-'}  ·  "
-            f"pause → text median {int(np.median(lat)) if lat else '-'} ms")
+            f"pause → text median {int(np.median(lat)) if lat else '-'} ms"
+            # chrF (translation quality, 0-100) exists only once the run has
+            # finished: simulate.run() adds it just before saving.
+            + (f"  ·  translation chrF {S.TS.summary(rows).split()[0]}"
+               if any(r.get("chrf") is not None for r in rows) else ""))
 
     def _finished(self, rows, path, wall, error=None):
         """The run ended - finished, stopped, or failed.
@@ -1641,7 +1646,7 @@ class SimulatorWindow(FluentWindow):
             if running:
                 # .join(timeout=5): wait for the thread to finish, at most 5 s.
                 self._thread.join(timeout=5)        # let it stop the pipeline and save results
-            core.ERROR_LOG.removeHandler(self._issue_handler)
+            core.remove_log_sink(self._issue_sink_id)
         finally:
             super().closeEvent(event)
 

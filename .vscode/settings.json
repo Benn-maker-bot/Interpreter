@@ -15,19 +15,27 @@
     "autoDocstring.docstringFormat": "google",
     "files.associations": { "notes.md": "markdown" },
     "cSpell.words": [
+        "analyse",
         "behaviour",
-        "Consolas",
         "colours",
+        "Consolas",
         "customtkinter",
         "fiio",
         "gmtime",
         "initialised",
         "interp",
+        "LIVEPIPE",
+        "NOGT",
         "nvml",
+        "pycache",
         "qfluentwidgets",
+        "REALPIPE",
         "recognise",
+        "Recognised",
         "Segoe",
+        "testdata",
+        "unmute",
         "unticked",
-        "unmute"
+        "venv"
     ]
 }

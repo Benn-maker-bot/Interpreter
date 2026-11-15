@@ -436,7 +436,8 @@ def build_report(since: str | None = None) -> str:
                     ("system_cpu_pct", "%"), ("cpu_freq_mhz", "MHz"), ("rss_mb", "MB"),
                     ("mem_available_mb", "MB"), ("gpu_util_pct", "%"), ("gpu_mem_used_mb", "MB"),
                     ("gpu_mem_free_mb", "MB"), ("gpu_sm_clock_mhz", "MHz"), ("gpu_temp_c", "C"),
-                    ("threads", ""), ("probe_ms", "ms")):
+                    ("threads", ""), ("probe_ms", "ms"),
+                    ("process_inventory_ms", "ms"), ("gpu_snapshot_ms", "ms")):
         out.append(_row(k, column(resource_stats, k), unit))
     # Average CPU per thread of ours (% of one core) and the busiest other apps.
     # Each window holds a dict like {"audio-capture": 12.0, "transcription-worker": 31.5}.
@@ -1323,6 +1324,13 @@ def build_trend(since=None):
 # "if len(sys.argv) > 2 else None" uses None when no start time was typed.
 if __name__ == "__main__":
     import sys
+    # Reports include original transcripts, which may contain Cyrillic or
+    # other characters that the Windows console's legacy code page cannot
+    # encode. Keep the CLI useful from the default PowerShell/Command Prompt.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass  # stdout may be redirected or wrapped by an embedding application
     if len(sys.argv) > 1 and sys.argv[1] == "trend":
         print(build_trend(sys.argv[2] if len(sys.argv) > 2 else None))
     elif len(sys.argv) > 1 and sys.argv[1] == "report":

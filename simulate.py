@@ -126,6 +126,7 @@ sys.path.insert(0, str(APP_DIR))
 # the very top" (it has to come after the sys.path line).
 import interpreter as I                         # noqa: E402
 import log_tools as LT                          # noqa: E402
+import translation_score as TS                  # noqa: E402  chrF translation scores
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings
@@ -139,7 +140,8 @@ REAL_PYAUDIO = I.pyaudio
 TESTDATA = APP_DIR / "testdata"                  # Path: where all test data lives
 # DATA_SETS: dict, data-set name -> folder holding its manifest.jsonl and clips.
 DATA_SETS = {"synth": TESTDATA / "synth",        # make_testdata.py: computer voices, made-up music
-             "real": TESTDATA,                   # fetch_testdata.py: FLEURS + Jamendo recordings
+             "synth_piper": TESTDATA / "synth_piper",  # make_testdata.py --piper: Piper voices
+             "real": TESTDATA,                  # fetch_testdata.py: FLEURS + Jamendo recordings
              "feedback": TESTDATA / "feedback"}  # phrases reported with "Report a mistake"
 DATA_DIR = DATA_SETS["synth"]                    # Path: the data set in use (changed by --data)
 RATE = 16000                                     # int: samples per second of all clips (16 kHz)
@@ -885,13 +887,15 @@ def report(rows, args, wall_sec):
                 "translated": f"{sum(bool(r['translation']) for r in rs)}/{len(rs)}",
                 "latency": f"{int(np.median(lat))} ms" if lat else "-",
                 "preview": f"{int(np.median(prev))} ms" if prev else "-",
-                "music": f"{sum(r['music_mode'] for r in rs)}/{len(rs)}"}
+                "music": f"{sum(r['music_mode'] for r in rs)}/{len(rs)}",
+                # Average chrF of the translations (translation_score.py), e.g. "58".
+                "chrf": TS.summary(rs).split()[0]}
     print(f"\nSimulation: {args.src} -> {args.tgt}, model {args.model}, previews {args.preview}, "
           f"music mode {'off' if args.no_music else 'on'}, {wall_sec / 60:.1f} min")
     # PYTHON: in f-strings, {x:<7} pads x to 7 characters, left-aligned;
     # {x:>6} pads to 6, right-aligned. That's how the columns line up.
     head = f"  {'kind':<7}{'lang':<6}{'clips':>6}{'lang ok':>9}{'WER':>6}{'transl.':>9}" \
-           f"{'pause->text':>12}{'1st preview':>12}{'music':>7}"
+           f"{'pause->text':>12}{'1st preview':>12}{'music':>7}{'chrF':>7}"
     print(head)
     # One row per (kind, language), in alphabetical order.
     groups = {}
@@ -900,12 +904,12 @@ def report(rows, args, wall_sec):
     for (kind, lang), rs in sorted(groups.items()):
         s = summary(rs)
         print(f"  {kind:<7}{lang:<6}{s['clips']:>6}{s['lang_ok']:>9}{s['wer']:>6}{s['translated']:>9}"
-              f"{s['latency']:>12}{s['preview']:>12}{s['music']:>7}")
+              f"{s['latency']:>12}{s['preview']:>12}{s['music']:>7}{s['chrf']:>7}")
     # Then one total row per kind ("speech all", "song all").
     for kind in sorted({r["kind"] for r in rows}):
         s = summary([r for r in rows if r["kind"] == kind])
         print(f"  {kind + ' all':<13}{s['clips']:>6}{s['lang_ok']:>9}{s['wer']:>6}{s['translated']:>9}"
-              f"{s['latency']:>12}{s['preview']:>12}{s['music']:>7}")
+              f"{s['latency']:>12}{s['preview']:>12}{s['music']:>7}{s['chrf']:>7}")
     # The clips heard in the wrong language (at most 10).
     wrong = [r for r in rows if r["detected"] and r["detected"] != r["lang"]]
     if wrong:
@@ -1106,6 +1110,10 @@ def run(args, on_event=lambda kind, data: None, stop=None, level_cb=None):
         # (True counts as 1 in sum(), so this counts those clips.)
         played = sum(playlist.time_of(b) < time.monotonic() - 3 for _, b in playlist.spans)
         rows = rows[:played] if stop is not None and stop.is_set() else rows
+        # Score the translations against FLEURS's human translations (adds
+        # "ref_translation" and "chrf" to each row; see translation_score.py).
+        on_event("status", "Scoring translations…")
+        TS.score_rows(rows, args.tgt)
     out_dir = TESTDATA / "sim_results"
     out_dir.mkdir(exist_ok=True)                        # create the folder if needed
     # File name from the date and time, e.g. 20261101-014549.json (or …-live.json).
