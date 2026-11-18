@@ -59,6 +59,6 @@ If it's unclear which mode I want, ask.
 - Ignore `.github/instructions/codacy.instructions.md`; it is for the VS Code Codacy extension, not for Claude.
 
 ## Current position
-- Up to 2026-11-08: covered PowerShell Verb-Noun naming, `Get-Command` and aliases.
+- 2026-11-15 (development): two-channel Fluent window, log-triage fixes and Settings page, merged to `main` and pushed. Tutoring last covered PowerShell naming and aliases (2026-11-08).
 - Weak spot: `ls` = `Get-ChildItem`, not `Get-Location` (`Get-Location` = `pwd`).
 - In progress: the `LatestSlot` exercise (`learning/slot_test.py`; the `put` calls still need `slot.` in front). Next: the PowerShell pipeline (`|`).
