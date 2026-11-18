@@ -1,4 +1,7 @@
 {
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": ["tests"],
     "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
     "python.terminal.activateEnvironment": true,
     "python.analysis.typeCheckingMode": "basic",
@@ -17,9 +20,11 @@
     "cSpell.words": [
         "analyse",
         "behaviour",
+        "codacy",
         "colours",
         "Consolas",
         "customtkinter",
+        "dbfs",
         "fiio",
         "gmtime",
         "initialised",
