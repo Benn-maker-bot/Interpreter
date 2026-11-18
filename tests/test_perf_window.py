@@ -108,7 +108,10 @@ def test_summary_restarts_the_timer():
 
 def test_due_follows_the_interval_setting(monkeypatch):
     # monkeypatch changes a value for one test and puts it back afterwards.
-    monkeypatch.setattr(interpreter, "STATS_INTERVAL_SEC", 0)
+    # Patch it in interpreter.audio, the module PerfWindow reads it from:
+    # `from .config import STATS_INTERVAL_SEC` gave audio.py its own name
+    # for the value, so changing interpreter.STATS_INTERVAL_SEC does nothing.
+    monkeypatch.setattr(interpreter.audio, "STATS_INTERVAL_SEC", 0)
     assert PerfWindow().due()
 
 

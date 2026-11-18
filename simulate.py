@@ -566,11 +566,13 @@ def build(args, playlist, say=print, level_cb=None):
       4. Pre-load the translators the clips will need.
       5. Create the queues, the capture thread and the worker, and connect them.
     """
-    # Step 1. Replace the "pyaudio" name inside interpreter.py.
+    # Step 1. Replace the "pyaudio" name inside interpreter/audio.py, the
+    # module whose functions use it. (Setting I.pyaudio would only change
+    # the package's copy of the name; audio.py would never see it.)
     if playlist is None:
-        I.pyaudio = REAL_PYAUDIO                        # a real device
+        I.audio.pyaudio = REAL_PYAUDIO                  # a real device
     else:
-        I.pyaudio = FakePyAudioModule                   # the fake sound card
+        I.audio.pyaudio = FakePyAudioModule             # the fake sound card
         FakePyAudio.playlist = playlist
     # src_key/tgt_key: the language names, e.g. "Auto-detect", "English".
     src_key, tgt_key = args.src, args.tgt
