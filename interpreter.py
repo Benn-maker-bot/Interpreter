@@ -300,8 +300,15 @@ except ImportError:
 
 
 def _add_cuda_dll_dirs():
-    """Make the pip-installed NVIDIA CUDA DLLs (nvidia-cublas-cu12,
-    nvidia-cudnn-cu12) loadable by ctranslate2 on Windows."""
+    """
+    Make the pip-installed NVIDIA CUDA DLLs (nvidia-cublas-cu12,
+    nvidia-cudnn-cu12) loadable by ctranslate2 on Windows.
+    
+    This function ensures that the necessary CUDA libraries can be found
+    and loaded when running on Windows systems with NVIDIA GPUs. It's needed
+    because CTranslate2 (the engine used for Whisper models) requires these
+    specific DLL files to be accessible.
+    """
     if os.name != "nt":
         return []
     roots = [Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"]
@@ -464,11 +471,25 @@ def _gzip_rotated(path: str, base: Path = None) -> None:
 
 
 class _InterceptHandler(logging.Handler):
-    """Sends warnings from libraries that use Python's standard logging
+    """
+    Sends warnings from libraries that use Python's standard logging
     (faster_whisper, huggingface_hub, urllib3, ctranslate2 …) into loguru,
-    so they reach the log files instead of only the console."""
+    so they reach the log files instead of only the console.
+    
+    This class acts as a bridge between Python's built-in logging system and
+    the more advanced loguru library. When external libraries like Whisper or
+    Hugging Face generate log messages, this handler catches them and forwards
+    them to the loguru system so they're properly recorded in the application's
+    log files instead of just appearing on the console.
+    """
     def emit(self, record: logging.LogRecord) -> None:
-        """Called by Python's logging: forward the record as a log_event."""
+        """
+        Called by Python's logging system: forward the record as a log_event.
+        
+        This method is automatically invoked when any library using standard
+        Python logging generates a message. It takes that log record and converts
+        it into a format suitable for the application's main logging system.
+        """
         if record.name.startswith("interpreter"):
             return
         text = record.getMessage()
@@ -491,8 +512,15 @@ _LOGURU_LEVELS = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRIT
 
 
 def _setup_logging() -> None:
-    """Replace loguru's default console output with the app's sinks:
-    console (readable, coloured), the main JSONL log and the error JSONL log."""
+    """
+    Replace loguru's default console output with the app's sinks:
+    console (readable, coloured), the main JSONL log and the error JSONL log.
+    
+    This function configures the logging system to write to both the console
+    and log files in a structured format. It sets up the appropriate formatting
+    for different types of output and ensures that all application events are
+    properly recorded for debugging and analysis.
+    """
     logger.remove()
     logger.configure(patcher=_to_json_line, extra={"event": "", "fields": {}})
     if sys.stdout is not None:   # None in a windowed .exe (no console)
@@ -534,12 +562,22 @@ def _level_name(level: int | str) -> str | int:
 
 
 def log_event(level: int, event: str, **fields: Any) -> None:
-    """Write one event to the log. This is the function the whole app uses.
-
-    `level` is logging.INFO, logging.WARNING … (or a name like "DEBUG");
-    `event` is a short name such as "phrase_trace"; any keyword arguments are
-    stored as extra JSON fields. Warnings and errors also go to the error log.
-    The line records the caller's module, function and line number.
+    """
+    Write one event to the log. This is the function the whole app uses.
+    
+    This is the main logging function used throughout the application to
+    record events and activities. It writes structured JSON data to the
+    log files that can be analyzed later for performance, debugging, and
+    usage statistics.
+    
+    Args:
+        level: The logging level (logging.INFO, logging.WARNING, etc.)
+        event: A short name such as "phrase_trace"
+        **fields: Any keyword arguments are stored as extra JSON fields
+    
+    Note:
+        Warnings and errors also go to the error log. The line records the
+        caller's module, function and line number.
     """
     logger.opt(depth=1).bind(event=event, fields=fields).log(_level_name(level), event)
 
@@ -676,7 +714,14 @@ ERROR_KIND_HELP = {
 
 
 class _Blank(dict):
-    """For str.format_map: a {field} the log line doesn't have shows as '?'."""
+    """
+    For str.format_map: a {field} the log line doesn't have shows as '?'.
+    
+    This is a helper class that ensures when formatting strings with
+    placeholders, missing keys are replaced with '?' instead of raising
+    a KeyError. This prevents crashes when some log entries might not have
+    all the fields that are expected for display.
+    """
     def __missing__(self, key):
         return "?"
 
@@ -1895,10 +1940,21 @@ STATS_INTERVAL_SEC = 10   # how often each component logs its perf summary
 
 
 class PerfWindow:
-    """Collects samples per metric and summarises them as n/p50/p95/max for a
-    periodic stats log line, then resets. Cheap enough for the audio loop."""
+    """
+    Collects samples per metric and summarises them as n/p50/p95/max for a
+    periodic stats log line, then resets. Cheap enough for the audio loop.
+    
+    This class is used to collect performance metrics over time periods and
+    summarize them with statistical information (count, median, 95th percentile,
+    maximum). It's used in performance monitoring and diagnostics.
+    """
     def __init__(self):
-        """Start an empty collection of samples."""
+        """
+        Start an empty collection of samples.
+        
+        This method initializes the performance window to collect metrics
+        for performance analysis.
+        """
         # _data: metric name -> list of samples; started: when this window began.
         self._data = {}
         self.started = time.monotonic()
@@ -1929,10 +1985,20 @@ class PerfWindow:
 
 
 class LatestSlot:
-    """Single-item mailbox: put() overwrites, take() empties. Live previews
-    only matter if current, so a stale one is replaced rather than queued."""
+    """
+    Single-item mailbox: put() overwrites, take() empties. Live previews
+    only matter if current, so a stale one is replaced rather than queued.
+    
+    This class is used to manage live preview text updates. It's designed to
+    ensure that only the most recent preview is displayed, since older
+    previews would be irrelevant once new ones arrive.
+    """
     def __init__(self):
-        """Start empty."""
+        """
+        Start empty.
+        
+        This method initializes an empty slot for storing preview data.
+        """
         # _lock: lets two threads use the slot safely; _item: the stored item.
         self._lock = threading.Lock()
         self._item = None
@@ -1953,17 +2019,27 @@ class LatestSlot:
 
 
 class AudioCaptureThread(threading.Thread):
-    """Records audio from one device and turns it into phrases of speech.
-
+    """
+    Records audio from one device and turns it into phrases of speech.
+    
+    This thread is responsible for capturing raw audio data from the selected
+    input device (microphone or loopback). It processes this audio in small
+    chunks (~32 ms each) to determine when speech begins and ends, then
+    groups these chunks into meaningful phrases.
+    
     For every ~32 ms block of sound it: measures the level (for the meter),
     asks Silero VAD whether it is speech, and adds speech to the current
     phrase. Finished phrases go to `phrase_queue` (for the final, accurate
     transcription); while a phrase is still growing, a copy is put in
     `partial_slot` every PARTIAL_INTERVAL_SEC for a quick preview.
-
+    
     For "loopback" devices (what an output device is playing) it also plays
     silence to that device, because Windows delivers no loopback audio at all
     while the device is silent, which would make reading hang.
+    
+    This thread is crucial for the real-time processing of audio. It handles
+    the timing and detection of speech boundaries to ensure proper phrase
+    segmentation.
     """
     def __init__(self, device_index, phrase_queue, status_cb, level_cb,
                  loopback_out: "LoopbackOutputThread | None" = None,
@@ -1971,18 +2047,21 @@ class AudioCaptureThread(threading.Thread):
                  mute_evt: "threading.Event | None" = None,
                  early_slot: "LatestSlot | None" = None,
                  channel: str = ""):
-        """Store settings; the device is opened later, in the thread itself (run).
-
-        channel       name of the channel this device belongs to ("Me",
-                      "Friend"), when the window listens to two devices at
-                      once; added to the thread's name and its log lines.
-        device_index  which PortAudio device to record from.
-        phrase_queue  where finished phrases are sent as (seq, audio, info).
-        status_cb     function to show a status message in the window.
-        level_cb      function that receives (rms_dbfs, peak_dbfs, is_speech).
-        loopback_out  optional LoopbackOutputThread to copy audio to.
-        partial_slot  where preview audio is placed (LatestSlot).
-        mute_evt      while set, audio is replaced by silence (our own speech).
+        """
+        Store settings; the device is opened later, in the thread itself (run).
+        
+        This method initializes the audio capture thread with all necessary
+        parameters for capturing and processing audio.
+        
+        Args:
+            device_index: Which PortAudio device to record from
+            phrase_queue: Where finished phrases are sent as (seq, audio, info)
+            status_cb: Function to show a status message in the window
+            level_cb: Function that receives (rms_dbfs, peak_dbfs, is_speech)
+            loopback_out: Optional LoopbackOutputThread to copy audio to
+            partial_slot: Where preview audio is placed (LatestSlot)
+            mute_evt: While set, audio is replaced by silence (our own speech)
+            channel: Name of the channel this device belongs to ("Me", "Friend")
         """
         super().__init__(daemon=True, name=f"audio-capture-{channel}" if channel else "audio-capture")
         self.channel           = channel
@@ -2599,14 +2678,33 @@ def save_settings(**changes: Any) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WhisperModelLoader(threading.Thread):
-    """Loads a Whisper model on a background thread so the window stays usable.
-
-    Loading can take seconds (or minutes on the first download). When done,
-    `ready` is set and `model` (or `error`) is filled in. If loading on the
-    GPU fails it falls back to the Tiny model on the CPU.
+    """
+    Loads a Whisper model on a background thread so the window stays usable.
+    
+    This class handles the complex process of loading AI models in the
+    background without freezing the user interface. Loading can take seconds
+    (or minutes on the first download). When done, `ready` is set and
+    `model` (or `error`) is filled in. If loading on the GPU fails it falls
+    back to the Tiny model on the CPU.
+    
+    The Whisper models are large AI models that perform speech recognition.
+    Loading these models can take considerable time, especially the first time
+    when they need to be downloaded from the internet and converted for use.
+    
+    This threading approach allows the application to remain responsive while
+    the model is loading in the background.
     """
     def __init__(self, model_size: str, status_cb: Callable[[str], None]) -> None:
-        """Prepare to load `model_size` ("tiny", "small", "medium", "large-v3-turbo")."""
+        """
+        Prepare to load `model_size` ("tiny", "small", "medium", "large-v3-turbo").
+        
+        This method initializes the model loader with the specified model size
+        and a callback function to report progress.
+        
+        Args:
+            model_size (str): The size of the Whisper model to load
+            status_cb (Callable[[str], None]): Function to show progress messages
+        """
         super().__init__(daemon=True, name="whisper-loader")
         # model_size: which model to load; status_cb: shows progress messages.
         # model / error: the loaded model, or why loading failed; ready: set when
@@ -3085,10 +3183,16 @@ def ui_scale(widget) -> float:
 
 
 class DbMeter(ctk.CTkCanvas):
-    """Segmented LED-style level meter in dBFS, after broadcast PPMs:
+    """
+    Segmented LED-style level meter in dBFS, after broadcast PPMs:
     -60..0 dBFS, green below -18, amber to -6, red above; instant attack,
     20 dB/s fall-back, and a peak-hold marker that holds 1.5 s. Segments are
-    drawn once and only recoloured, so updating costs almost nothing."""
+    drawn once and only recoloured, so updating costs almost nothing.
+    
+    This is the audio level meter displayed in the main window that shows
+    how loud the input audio currently is. It provides visual feedback to
+    help users adjust their microphone levels for optimal performance.
+    """
     FLOOR_DB, SEG_DB = -60.0, 1.5
     FALL_DB_PER_SEC, HOLD_SEC = 20.0, 1.5
     TICKS = (-60, -48, -36, -24, -18, -12, -6, -3, 0)
@@ -3168,14 +3272,29 @@ class DbMeter(ctk.CTkCanvas):
 
 
 class LocalTranslator:
-    """Opus-MT translation model for one language pair. Text is split into
+    """
+    Opus-MT translation model for one language pair. Text is split into
     sentences (Opus-MT is trained on sentences; fragments translate badly)
-    and translated as one batch."""
+    and translated as one batch.
+    
+    This class manages the local translation models that provide fast, offline
+    translation between different languages without requiring internet connectivity.
+    It handles downloading, loading, and using the translation models.
+    """
     def __init__(self, src, tgt):
-        """Download (first time) and load the Opus-MT model for (src, tgt).
-
+        """
+        Download (first time) and load the Opus-MT model for (src, tgt).
+        
+        This method downloads and loads a specific translation model from
+        Hugging Face. The models are trained on sentence-level data, so text
+        is split into sentences before processing.
+        
         `sentencepiece` splits text into the sub-word pieces the model was trained
         on; there is one tokenizer for the source and one for the target language.
+        
+        Args:
+            src: Source language code (e.g. "ru")
+            tgt: Target language code (e.g. "en")
         """
         import ctranslate2
         import sentencepiece as spm
@@ -3241,13 +3360,20 @@ class TranslatorLoader(threading.Thread):
 
 
 class SpeechMeter(ctk.CTkCanvas):
-    """The speech detector's score (0-100 %) as a bar, with a white line at
+    """
+    The speech detector's score (0-100 %) as a bar, with a white line at
     the threshold set by the Speech sensitivity slider. While the bar passes
     the line, the audio counts as speech (bar turns green).
-
+    
     This is a different thing from the level meter above it: the level meter
     shows how LOUD the sound is; this shows how much it SOUNDS LIKE SPEECH.
-    Sensitivity moves the threshold line, never the volume."""
+    Sensitivity moves the threshold line, never the volume.
+    
+    This meter shows how confident the speech detection algorithm (Silero VAD)
+    is that the current audio contains speech. It helps users understand
+    whether their microphone is correctly detecting speech or if there's
+    interference from background noise.
+    """
     TICKS = (0, 25, 50, 75, 100)
 
     def __init__(self, master, **kw):
@@ -3292,10 +3418,17 @@ class SpeechMeter(ctk.CTkCanvas):
 
 
 class Speaker(threading.Thread):
-    """Text-to-speech via Windows SAPI, owned by one thread (COM objects are
+    """
+    Text-to-speech via Windows SAPI, owned by one thread (COM objects are
     apartment-bound). Speech is asynchronous, so stop() purges it instantly,
     unlike pyttsx3's blocking runAndWait(). `speaking` is set while audio is
-    playing so the capture thread can ignore our own voice."""
+    playing so the capture thread can ignore our own voice.
+    
+    This class handles text-to-speech functionality using Windows' built-in
+    SAPI (Speech Application Programming Interface) system. It ensures that
+    speech output is handled by a single dedicated thread to prevent conflicts
+    with COM objects and provides methods for speaking text asynchronously.
+    """
     SVSF_ASYNC, SVSF_PURGE = 1, 2
     HANGOVER_SEC = 0.4   # loopback capture lags playback slightly
 
@@ -3413,12 +3546,20 @@ class Speaker(threading.Thread):
 
 
 class TranscriptionWorker(threading.Thread):
-    """Finished phrases (phrase_queue) always take priority; live previews
+    """
+    This is the core processing thread that performs speech recognition and
+    translation on captured audio phrases.
+    
+    Finished phrases (phrase_queue) always take priority; live previews
     (partial_slot) only run when the model would otherwise sit idle.
-
+    
     When the target is English, Whisper translates directly (task="translate")
     on the GPU: no network round trip, no rate limits, and it makes live
     previews of the *translation* cheap enough to show while the friend talks.
+    
+    This worker thread processes audio data from the capture thread, runs
+    the Whisper speech recognition model, translates text when needed, and
+    sends results back to the main UI thread for display.
     """
     def __init__(self, wid, model, src_whisper, src_lang_key, tgt_lang_key,
                  phrase_queue, result_queue, status_cb,
@@ -3426,18 +3567,30 @@ class TranscriptionWorker(threading.Thread):
                  preview_model=None, run_id=0, record_audio=False, translator=None,
                  early_slot: "LatestSlot | None" = None, session_id: str = "",
                  config: "dict | None" = None, channel: str = ""):
-        """Store everything the worker needs for one listening session.
-
-        channel        name of the channel ("Me", "Friend") when the window
-                       listens to two devices; saved in every phrase_trace.
-        model          the main Whisper model (used for finished phrases).
-        src_whisper    language code of the speech, e.g. "ru".
-        phrase_queue   finished phrases from AudioCaptureThread.
-        result_queue   where results go back to the window.
-        partial_slot   preview audio (LatestSlot).
-        preview_model  smaller model for previews, or a function returning one.
-        translator     Opus-MT translator, or a function returning one (or None).
-        record_audio   save each phrase as a WAV for later accuracy checks.
+        """
+        Store everything the worker needs for one listening session.
+        
+        This method initializes a transcription worker with all necessary
+        parameters for processing audio and generating text.
+        
+        Args:
+            wid: Worker number
+            model: The main Whisper model (used for finished phrases)
+            src_whisper: Language code of the speech, e.g. "ru"
+            src_lang_key: Source language menu name
+            tgt_lang_key: Target language menu name
+            phrase_queue: Finished phrases from AudioCaptureThread
+            result_queue: Where results go back to the window
+            status_cb: Function to show status messages
+            partial_slot: Preview audio (LatestSlot)
+            preview_model: Smaller model for previews, or a function returning one
+            run_id: Session identifier
+            record_audio: Save each phrase as a WAV for later accuracy checks
+            translator: Opus-MT translator, or a function returning one (or None)
+            early_slot: Slot for early finals from capture thread
+            session_id: Unique identifier for the session
+            config: Settings in force
+            channel: Name of the channel ("Me", "Friend") when listening to two devices
         """
         super().__init__(daemon=True, name=f"transcription-worker-{channel or wid}")
         self.channel      = channel
@@ -4480,17 +4633,28 @@ def resource_warnings(fields) -> list:
 
 class InterpreterApp(ctk.CTk):
 
-    """Classic desktop view and UI adapter for the shared session controller.
-
-    It builds the controls, validates model state, turns current widget values
+    """
+    The classic desktop view and UI adapter for the shared session controller.
+    
+    This class implements the main user interface for the Voice Interpreter.
+    It builds all the controls, validates model state, turns current widget values
     into a SessionConfig, and hands worker lifecycle to SessionController.
+    
     Background threads never touch the window directly: they put messages on
     `result_queue`, and _poll_queue() reads them on the UI thread.
+    
+    This is the traditional interface that provides all the functionality of
+    the application with a simple, easy-to-use layout.
     """
     def __init__(self):
-        """Create the window: load settings, find audio devices, build all the
+        """
+        Create the window: load settings, find audio devices, build all the
         controls, place the window on screen, start loading the AI models and
         start listening.
+        
+        This method initializes the main application window and sets up all
+        components including audio device detection, UI controls, and background
+        model loading.
         """
         super().__init__()
         self.title("Voice Interpreter")
