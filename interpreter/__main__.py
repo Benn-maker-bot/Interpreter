@@ -11,8 +11,10 @@ for VS Code's F5, setup_and_run.bat and the PyInstaller build.
 import logging
 import sys
 
-from . import (APP_DIR, disable_power_throttling, install_global_exception_hooks,
-               log_event, log_exception, run_classic)
+from .config import APP_DIR
+from .gui_tk import run_classic
+from .logging_setup import install_global_exception_hooks, log_event, log_exception
+from .system import disable_power_throttling
 
 
 def acquire_single_instance():
