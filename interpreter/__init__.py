@@ -334,9 +334,10 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 # ── Paths / log config ────────────────────────────────────────────────────────
-# Where the app keeps its files. APP_DIR is the folder containing this
-# script, so logs and settings always sit next to the program.
-APP_DIR               = Path(__file__).resolve().parent
+# Where the app keeps its files. APP_DIR is the project folder: this file
+# is in interpreter\, so .parent is that folder and .parent.parent the one
+# above it. Logs and settings always sit next to the program.
+APP_DIR               = Path(__file__).resolve().parent.parent
 # LOG_PATH: the main log (every event); ERROR_LOG_PATH: warnings/errors only;
 # LOG_SUMMARY_PATH: written by Export Log Summary; SETTINGS_PATH: saved choices.
 LOG_PATH              = APP_DIR / "interpreter.log.jsonl"
@@ -755,8 +756,12 @@ def _where(exc_info):
     tb = traceback.extract_tb(exc_info[2])
     if not tb:
         return ""
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    ours = [f for f in tb if os.path.dirname(os.path.abspath(f.filename)) == app_dir]
+    # "Our" code is the interpreter\ package and the scripts beside it
+    # (interpreter_qt.py, session_controller.py ...) in the project folder.
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    app_dir = os.path.dirname(pkg_dir)
+    ours = [f for f in tb
+            if os.path.dirname(os.path.abspath(f.filename)) in (pkg_dir, app_dir)]
     last = tb[-1]
     describe = lambda f: f"{os.path.basename(f.filename)} line {f.lineno} (in {f.name})"
     if ours and ours[-1] is not last:
@@ -1032,7 +1037,7 @@ CONTEXT_RESET_SEC = 6      # forget the context after this long a *silence* betw
                            # phrases (timing it from the last finished phrase reset it
                            # mid-speech, since phrases last up to 7 s: that caused the
                            # "Спасибо." failures seen in the logs)
-RECORD_DIR       = Path(__file__).resolve().parent / "recordings"
+RECORD_DIR       = APP_DIR / "recordings"
 RECORD_KEEP      = 400     # newest phrase recordings kept for accuracy checks
 
 
@@ -5946,54 +5951,9 @@ class InterpreterApp(ctk.CTk):
             self.destroy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
-def acquire_single_instance():
-    """Allow only one copy of the app at a time. Two copies would fight over
-    the audio device and the GPU, and both write the same log file at once,
-    which corrupted a log line in testing. Returns an open lock file to keep
-    for the app's lifetime, or None if another copy already holds it."""
-    import msvcrt
-    lock = open(APP_DIR / "interpreter.lock", "a+")
-    try:
-        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        return lock
-    except OSError:
-        lock.close()
-        return None
-
-
 def run_classic():
     """Start the original customtkinter window."""
     log_event(logging.INFO, "app_main_start", gui="classic")
     app = InterpreterApp()
     app.mainloop()
     log_event(logging.INFO, "app_main_exit", gui="classic")
-
-
-if __name__ == "__main__":
-    # `python interpreter.py` opens the Fluent window (interpreter_qt.py) by
-    # default; `python interpreter.py --classic` opens the original window.
-    install_global_exception_hooks()
-    instance_lock = acquire_single_instance()
-    if instance_lock is not None:
-        disable_power_throttling()
-    if instance_lock is None:
-        log_event(logging.WARNING, "second_instance_refused")
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(
-            None, "Voice Interpreter is already running.", "Voice Interpreter", 0x40)
-        sys.exit(0)
-    if "--classic" in sys.argv:
-        run_classic()
-    else:
-        # interpreter_qt does `import interpreter`. Register this running file
-        # under that name first, so it isn't loaded (and initialised) twice.
-        sys.modules["interpreter"] = sys.modules["__main__"]
-        try:
-            import interpreter_qt
-        except ImportError as e:
-            log_exception("fluent_window_unavailable", e)
-            run_classic()     # PySide6 not installed: fall back to the classic window
-        else:
-            interpreter_qt.main()

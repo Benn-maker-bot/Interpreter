@@ -2,7 +2,7 @@
 REM ==========================================================================
 REM  build_exe.bat - turn the app into a single VoiceInterpreter.exe
 REM
-REM  PyInstaller bundles Python, interpreter.py and every package it uses into
+REM  PyInstaller bundles Python, the interpreter package and every package it uses into
 REM  one file, so the app can run on a PC without Python installed. The result
 REM  appears in the "dist" folder. AI models are NOT bundled: they download on
 REM  first use, as in the normal app.
@@ -51,7 +51,7 @@ pyinstaller ^
   --collect-binaries nvidia.cublas ^
   --collect-binaries nvidia.cudnn ^
   --hidden-import numpy ^
-  interpreter.py
+  run.py
 
 REM -- Step 3: report the result and open the output folder
 echo.
