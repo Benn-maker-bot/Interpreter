@@ -60,6 +60,22 @@ def _add_cuda_dll_dirs():
 # delay it; the logs showed one 364 ms capture stall.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def acquire_single_instance():
+    """Allow only one copy of the app at a time. Two copies would fight over
+    the audio device and the GPU, and both write the same log file at once,
+    which corrupted a log line in testing. Returns an open lock file to keep
+    for the app's lifetime, or None if another copy already holds it.
+    Used by __main__.py and by interpreter_qt.py when that is run directly."""
+    import msvcrt
+    lock = open(APP_DIR / "interpreter.lock", "a+")
+    try:
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        return lock
+    except OSError:
+        lock.close()
+        return None
+
+
 def disable_power_throttling():
     """Opt the whole process out of EcoQoS throttling (Windows 10 1709+)."""
     if sys.platform != "win32":
