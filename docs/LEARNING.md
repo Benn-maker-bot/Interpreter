@@ -23,7 +23,8 @@ does when the input is empty, late, or invalid.
 
 ## A guided code tour
 
-Open `interpreter.py` and use **Ctrl+Shift+O** to jump to these names:
+Press **Ctrl+T** in VS Code and type these names to jump to them (they are in
+the modules of the `interpreter\` package):
 
 1. **`AudioCaptureThread`** — find `run`. Follow how audio blocks are read,
    scored by voice activity detection, accumulated into a phrase, and sent for

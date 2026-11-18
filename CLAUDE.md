@@ -3,7 +3,7 @@
 Instructions for Claude Code when working in this repository.
 
 ## Who I am and what this repo is for
-- I'm Benn. This repo is my Voice Interpreter app (`interpreter.py`, `log_tools.py` and related scripts).
+- I'm Benn. This repo is my Voice Interpreter app (the `interpreter/` package, started with `run.py`; `log_tools.py` and related scripts).
 - I also use it as **teaching material**: I'm learning Python, Git, PowerShell, VS Code and software development by studying and improving this code.
 - I have an electrical and electronics engineering background and I'm a long-time hobbyist programmer, so don't over-explain simple ideas.
 - I use Windows, VS Code and PowerShell.

@@ -4,7 +4,7 @@
 # ">=" means "this version or newer".
 
 # ── Window ────────────────────────────────────────────────────────────────
-customtkinter>=5.2.0        # classic window (interpreter.py)
+customtkinter>=5.2.0        # classic window (interpreter/gui_tk.py)
 PySide6-Fluent-Widgets>=1.6  # Fluent window (interpreter_qt.py): Qt + Windows 11 style controls
 
 # ── Audio ─────────────────────────────────────────────────────────────────

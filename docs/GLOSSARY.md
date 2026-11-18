@@ -1,7 +1,7 @@
 # Glossary
 
 Words used in this project, in plain language.
-(The opening comment of `interpreter.py` has more, about Python and audio.)
+(The opening comment of `interpreter/__init__.py` has more, about Python and audio.)
 
 ---
 

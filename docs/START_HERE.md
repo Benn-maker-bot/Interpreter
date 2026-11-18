@@ -51,7 +51,7 @@ Stop after any block. Nothing breaks if you only read part of it.
 2. [MAP.md](MAP.md) – the first picture only ("The big picture").
 3. [FLOWCHARTS.md](FLOWCHARTS.md) – choose the picture that answers your question.
 4. [FILES.md](FILES.md) – just the table at the top.
-5. The opening guide in `interpreter.py`. It explains the main stages and
+5. The opening guide in `interpreter/__init__.py`. It explains the main stages and
    links them to the implementation.
 6. [LEARNING.md](LEARNING.md) – trace one phrase through those stages.
 7. [GLOSSARY.md](GLOSSARY.md) – skim; come back when a word is unclear.

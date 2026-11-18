@@ -1,6 +1,6 @@
 # The tuning numbers
 
-These values (in CAPITALS, near the top of `interpreter.py`) control how the app behaves.
+These values (in CAPITALS, in `interpreter\config.py`) control how the app behaves.
 Search for the name with **Ctrl+F** to find it.
 Change **one** at a time, and test before and after ([HOW_TO.md](HOW_TO.md) → "Check a change").
 

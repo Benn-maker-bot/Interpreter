@@ -1,6 +1,6 @@
 """Shared set-up for every test (pytest loads this file automatically).
 
-Importing interpreter.py has side effects: it sets up logging to
+Importing the interpreter package has side effects: it sets up logging to
 interpreter.log.jsonl and records an "app_module_loaded" event. Tests must not
 fill the real logs, so this file imports the module once and then removes all
 of loguru's outputs ("sinks"). One "app_module_loaded" line per test run still

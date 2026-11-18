@@ -25,12 +25,12 @@ flowchart LR
     subgraph interfaces["User interfaces"]
         direction TB
         QI["interpreter_qt.py<br/>Fluent interpreter window"]
-        CI["interpreter.py<br/>classic interpreter window"]
+        CI["interpreter/gui_tk.py<br/>classic interpreter window"]
         SQ["simulator_qt.py<br/>simulator window"]
     end
     subgraph application["Shared application and analysis"]
         direction TB
-        CORE["interpreter.py<br/>audio capture, workers, models, settings, logs"]
+        CORE["interpreter/ package<br/>audio capture, workers, models, settings, logs"]
         SESSION["session_controller.py<br/>session configuration and worker lifecycle"]
         MUSIC["music.py<br/>music detection and vocal separation"]
         SIM["simulate.py<br/>test playback and scoring"]
@@ -66,7 +66,7 @@ also uses that logic, with test audio supplied in place of a physical input.
 
 **Code trail:** start at `QtInterpreterApp` or `InterpreterApp`, follow its
 settings snapshot into `SessionController.start()` in `session_controller.py`,
-then follow the worker constructors in `interpreter.py`. For tests, start at
+then follow the worker constructors in `interpreter/audio.py` and `interpreter/transcription.py`. For tests, start at
 `run()` in `simulate.py` and follow `build()`.
 
 ---
@@ -111,7 +111,7 @@ because each one must still be processed. The window polls its result queue and
 updates the display on the UI thread.
 
 **Code trail:** search for `LatestSlot`, `phrase_queue`, `result_queue`, and
-`_poll_queue` in `interpreter.py`. Follow each message from its `.put(...)` to
+`_poll_queue` in `interpreter/gui_tk.py`. Follow each message from its `.put(...)` to
 the matching `.get...(...)`.
 
 ---

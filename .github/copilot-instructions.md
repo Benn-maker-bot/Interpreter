@@ -3,7 +3,7 @@
 The full rules live in `CLAUDE.md` at the project root. Read it and follow it. In short:
 
 ## Who I am
-- I'm Benn. This repo is my Voice Interpreter (`interpreter.py`, `interpreter_qt.py`, `log_tools.py` and related scripts).
+- I'm Benn. This repo is my Voice Interpreter (the `interpreter/` package, `interpreter_qt.py`, `log_tools.py` and related scripts).
 - I use it to learn Python, Git, PowerShell and VS Code. I have an electronics engineering background, so don't over-explain simple ideas.
 
 ## Two modes

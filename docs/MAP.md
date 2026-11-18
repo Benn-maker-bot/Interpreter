@@ -189,8 +189,8 @@ The simulator uses the **same code** as the app; only the sound card is replaced
 %%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Segoe UI, Arial, sans-serif", "lineColor": "#536273", "primaryTextColor": "#17212b"}, "flowchart": {"nodeSpacing": 52, "rankSpacing": 64, "htmlLabels": true, "curve": "basis"}}}%%
 flowchart TB
     IQ[interpreter_qt.py<br/>Fluent window] --> SC[session_controller.py<br/>shared worker lifecycle]
-    CI[interpreter.py<br/>classic window] --> SC
-    SC --> I[interpreter.py<br/>audio and model services]
+    CI[interpreter/gui_tk.py<br/>classic window] --> SC
+    SC --> I[interpreter/ package<br/>audio and model services]
     I --> M[music.py<br/>music detection,<br/>vocal separation]
     SQ[simulator_qt.py<br/>simulator window] --> S[simulate.py<br/>simulator engine]
     SQ --> IQ

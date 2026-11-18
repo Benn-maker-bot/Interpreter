@@ -119,7 +119,7 @@ import numpy as np              # fast maths on arrays of numbers (see music.py)
 APP_DIR = Path(__file__).resolve().parent
 # PYTHON: sys.path is the list of folders Python searches when you "import"
 # something. Putting the app folder first makes sure "import interpreter"
-# finds the interpreter.py next to this file.
+# finds the interpreter\ package next to this file.
 sys.path.insert(0, str(APP_DIR))
 # "as I" / "as LT" give the modules short nicknames: I.log_event(...) etc.
 # "# noqa: E402" tells code checkers "yes, this import is deliberately not at
@@ -387,7 +387,7 @@ class Playlist:
 # ─────────────────────────────────────────────────────────────────────────────
 # The fake sound card
 # ─────────────────────────────────────────────────────────────────────────────
-# The app's capture thread (AudioCaptureThread in interpreter.py) records
+# The app's capture thread (AudioCaptureThread in interpreter/audio.py) records
 # through a library called PyAudio, like this:
 #     pa = pyaudio.PyAudio()                  # start the library
 #     stream = pa.open(...)                   # open a microphone
@@ -500,7 +500,7 @@ class FakePyAudio:
 
 
 class FakePyAudioModule:
-    """Stands in for the whole pyaudio MODULE (interpreter.py uses
+    """Stands in for the whole pyaudio MODULE (interpreter/audio.py uses
     pyaudio.paInt16 and pyaudio.PyAudio).
 
     paInt16  int 8: PyAudio's code for "16-bit whole-number samples".

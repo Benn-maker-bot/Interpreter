@@ -156,7 +156,7 @@ STALL_SEC = 15          # int: no level readings for this long while playing = p
 SCORE_DELAY_SEC = 4     # int: a clip is scored this long after it ends (its last text has arrived)
 
 # Plain-language help for the simulator's own problems, shown on the Issues
-# page and in pop-ups. core.ISSUE_HELP is a dict in interpreter.py:
+# page and in pop-ups. core.ISSUE_HELP is a dict in interpreter/logging_setup.py:
 #     event name -> (title, what it means, what to do)
 # .update({...}) adds these entries to it. "{name}" in the text is filled in
 # from the details logged with the problem, e.g. {clip} -> 12.

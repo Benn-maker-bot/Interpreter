@@ -6,7 +6,8 @@
 
 | File | What it is | Open it when… |
 | --- | --- | --- |
-| `interpreter.py` | Shared audio/model helpers and the classic window | you want to change app services or the classic UI |
+| `run.py` | Starts the app (`--classic` for the old window) | you want to run it (F5 in VS Code does this) |
+| `interpreter\` | The application: audio, models, workers, logs, settings and the classic window (see below) | you want to change app services or the classic UI |
 | `session_controller.py` | Shared session configuration and worker lifecycle | you want to change how capture/transcription/translation workers start or stop |
 | `interpreter_qt.py` | **The Fluent window** you normally use | you want to change what you see or click |
 | `music.py` | Music detection and vocal separation | songs are recognised badly |
@@ -33,26 +34,29 @@ Files the program **writes** (don't edit by hand):
 
 ---
 
-## Inside `interpreter.py` (top to bottom)
+## Inside the `interpreter\` package
 
-The file is long. It is split into **sections** marked with a line of `─` characters.
-Use **Ctrl+Shift+O** in VS Code to jump to any class or function by name.
+The application code is split into modules, one per job. Each module's
+opening docstring says what it does. Press **Ctrl+T** in VS Code to jump to
+any class or function in the project by name.
 
-| Section | Main parts | In one sentence |
+| Module | Main parts | In one sentence |
 | --- | --- | --- |
-| Opening comment | — | Plain-language explanation of everything. **Read this first.** |
-| Logging | `log_event`, `log_exception` | Writes every event to the log files. |
-| Error explanations | `ISSUE_HELP`, `explain_issue` | Turns errors into plain words for the Issues page. |
-| Settings / constants | `SILENCE_SEC`, `MAX_PHRASE_SEC`… | The tuning numbers (see [TUNING.md](TUNING.md)). |
-| Online translation | `TranslationWorker` | Translates via the internet when no local model exists. |
-| Audio helpers | `get_audio_devices`… | Lists sound devices, finds the FiiO. |
-| Audio capture | `AudioCaptureThread` | Records sound, detects speech, cuts phrases. |
-| Model loading | `WhisperModelLoader` | Loads Whisper onto the graphics card. |
-| Hallucination filters | `is_hallucination`, `suspicious_reasons` | Spots text Whisper invented. |
-| Feedback | `save_feedback` | Saves "Report a mistake" reports. |
-| Session context | `log_session_context`, `gpu_snapshot` | Logs the code version and GPU sharing. |
-| Transcription | `TranscriptionWorker` | Whisper, language choice, music, translation. |
-| Main window | `InterpreterApp` | The classic window and compatibility callbacks for the Fluent window. |
+| `__init__.py` | — | Plain-language explanation of everything. **Read this first.** |
+| `config.py` | `SILENCE_SEC`, `MODELS`, `LANGUAGES`… | The tuning numbers and menus (see [TUNING.md](TUNING.md)). |
+| `logging_setup.py` | `log_event`, `explain_issue` | Writes every event to the log files; turns errors into plain words. |
+| `system.py` | `detect_device`, `gpu_snapshot` | Finds the GPU, keeps Windows from slowing the app, measures resources. |
+| `audio.py` | `AudioCaptureThread`, `get_audio_devices` | Lists sound devices, records sound, detects speech, cuts phrases. |
+| `text_filters.py` | `is_hallucination`, `continuation_join` | Spots text Whisper invented and tidies the results. |
+| `translation.py` | `LocalTranslator`, `TranslationWorker` | Translates on this PC, or via the internet when no local model exists. |
+| `speech.py` | `Speaker` | Reads the translation aloud. |
+| `settings.py` | `load_settings`, `save_settings` | Remembers your choices between runs. |
+| `transcription.py` | `WhisperModelLoader`, `TranscriptionWorker` | Whisper, language choice, music, translation. |
+| `gui_tk.py` | `InterpreterApp` | The classic window and compatibility callbacks for the Fluent window. |
+| `__main__.py` | `main` | Starts the app (`python -m interpreter`; `run.py` calls it too). |
+
+Each module imports only from the ones above it in this table, so there are
+no circular imports.
 
 ---
 

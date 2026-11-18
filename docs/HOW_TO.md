@@ -58,14 +58,14 @@ Later, the simulator can replay all your reports: Test data → **Your reported 
 
 1. Look at the **Issues** page (simulator) or **Diagnostics → Recent issues** (interpreter).
 2. Each problem says: what it means, what to do, the error, **where** in the code, and the details.
-3. "Where" gives a file and line number: **Ctrl+P**, type the file name, then `:` and the line number (for example `interpreter.py:2410`).
+3. "Where" gives a file and line number: **Ctrl+P**, type the file name, then `:` and the line number (for example `audio.py:410`).
 
 ---
 
 ## Change a tuning number
 
 1. Open [TUNING.md](TUNING.md) and find the setting.
-2. In `interpreter.py`, press **Ctrl+F** and search for its name (for example `SILENCE_SEC`).
+2. In `interpreter\config.py`, press **Ctrl+F** and search for its name (for example `SILENCE_SEC`).
 3. Change the number. Keep the comment next to it up to date.
 4. Do "Check a change" above.
 

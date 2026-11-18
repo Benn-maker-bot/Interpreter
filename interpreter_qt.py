@@ -19,7 +19,7 @@ the GPU (they take turns). Their results arrive in one queue, each message
 labelled with its channel (session_controller.TaggedQueue), and appear in one
 conversation (ConversationView), in the order the phrases were spoken.
 
-The original window (interpreter.py, built with customtkinter) still works,
+The original window (interpreter/gui_tk.py, built with customtkinter) still works,
 with one device at a time and the My Voice / Friend mode buttons. Both share
 all of the real work: recording, speech detection, Whisper, translation,
 logging.
@@ -87,7 +87,7 @@ OK, WARN, BAD, MUTED = "#2ECC71", "#F1C40F", "#E74C3C", "#9AA0A6"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Adapters that let interpreter.py's borrowed logic drive Qt widgets
+# Adapters that let the classic window's borrowed logic drive Qt widgets
 # ─────────────────────────────────────────────────────────────────────────────
 
 class QVar:
@@ -171,7 +171,7 @@ class IssueHandler:
 class LevelMeter(QWidget):
     """Segmented LED level meter in dBFS (-60..0): green below -18, amber to
     -6, red above; instant rise, 20 dB/s fall, 1.5 s peak hold. Same
-    behaviour as DbMeter in interpreter.py, drawn with Qt."""
+    behaviour as DbMeter in interpreter/gui_tk.py, drawn with Qt."""
     FLOOR_DB, SEG_DB, FALL_DB_PER_SEC, HOLD_SEC = -60.0, 1.5, 20.0, 1.5
     TICKS = (-60, -48, -36, -24, -18, -12, -6, -3, 0)
 
@@ -607,7 +607,7 @@ class Channel:
     Each channel has its own pipeline (a SessionController: capture thread,
     transcription worker, translation), its own text-to-speech Speaker and
     its own music detector. The Whisper model is shared: both workers take
-    turns on the GPU (INFERENCE_LOCK in interpreter.py).
+    turns on the GPU (INFERENCE_LOCK in interpreter/system.py).
 
     run_id changes every time the channel (re)starts. Messages from the
     channel's threads arrive labelled (index, run_id), so a late message
@@ -1414,7 +1414,7 @@ class QtInterpreterApp(FluentWindow):
         if choice not in PREVIEW_CHOICES:
             choice = "Tiny (instant)" if saved.get("fast_preview", False) else "Small (balanced)"
         _set_combo_text(self.preview_combo, choice)
-        # Automatic language detection (see LANG_SWITCH_PROB in interpreter.py)
+        # Automatic language detection (see LANG_SWITCH_PROB in interpreter/config.py)
         self.auto_lang_check = CheckBox("Detect other languages")
         self.auto_lang_check.setToolTip(
             "If a phrase is clearly in another language (e.g. a German song while\n"
@@ -2644,7 +2644,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Running this file directly: same single-copy rule as interpreter.py
+    # Running this file directly: same single-copy rule as run.py
     # Keep the lock in a variable: if it were discarded, Python would close
     # the file at once and release the lock.
     instance_lock = core.acquire_single_instance()

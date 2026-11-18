@@ -52,7 +52,7 @@ WHAT IS IN THIS FILE (top to bottom)
                    (GPU): ~250 ms per 6 seconds of audio there.
   MusicScene       class: decides once per second whether music mode is on,
                    and holds both models. The audio capture thread and the
-                   transcription worker (both in interpreter.py) use it.
+                   transcription worker (in interpreter/audio.py and transcription.py) use it.
 
 WORDS YOU WILL MEET
 -------------------
@@ -707,7 +707,7 @@ class VocalSeparator:
 
         When it is called:
             by the transcription worker after each live preview while music
-            is playing (interpreter.py: _prefetch_separation).
+            is playing (interpreter/transcription.py: _prefetch_separation).
 
         Inputs:
             audio_16k   1-D array: the phrase so far, at 16 kHz.

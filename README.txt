@@ -21,8 +21,8 @@ QUICK START
          py -3.13 -m venv .venv
          .venv\Scripts\python -m pip install -r requirements.txt -c constraints-win-py313.txt
   3. Start the app (or double-click setup_and_run.bat):
-         .venv\Scripts\python interpreter.py              Fluent window (default)
-         .venv\Scripts\python interpreter.py --classic    old classic window
+         .venv\Scripts\python run.py                      Fluent window (default)
+         .venv\Scripts\python run.py --classic            old classic window
      Only one copy can run at a time (two copies would fight over the
      audio device and the log files).
   4. The first start downloads the AI models once (Turbo ~1.6 GB, Small
@@ -143,9 +143,10 @@ UNDERSTANDING THE PROJECT
 
 FILES IN THIS FOLDER
 --------------------
-  interpreter.py               the application (start it with this file)
-                               and the classic window
-                               (start reading at the top: it explains how
+  run.py                       starts the app (or: python -m interpreter)
+  interpreter\                 the application, one module per job, and the
+                               classic window (start reading at the top of
+                               interpreter\__init__.py: it explains how
                                everything works)
   interpreter_qt.py            the Fluent window (PySide6)
   session_controller.py        shared capture and worker lifecycle
