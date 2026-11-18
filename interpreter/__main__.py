@@ -11,7 +11,6 @@ for VS Code's F5, setup_and_run.bat and the PyInstaller build.
 import logging
 import sys
 
-from .gui_tk import run_classic
 from .logging_setup import install_global_exception_hooks, log_event, log_exception
 from .system import acquire_single_instance, disable_power_throttling
 
@@ -31,7 +30,7 @@ def main():
             None, "Voice Interpreter is already running.", "Voice Interpreter", 0x40)
         sys.exit(0)
     if "--classic" in sys.argv:
-        run_classic()
+        _run_classic()
     else:
         # interpreter_qt does `import interpreter`. The package is already
         # loaded (Python imported it before running this file), so it gets
@@ -40,9 +39,16 @@ def main():
             import interpreter_qt
         except ImportError as e:
             log_exception("fluent_window_unavailable", e)
-            run_classic()     # PySide6 not installed: fall back to the classic window
+            _run_classic()    # PySide6 not installed: fall back to the classic window
         else:
             interpreter_qt.main()
+
+
+def _run_classic():
+    """Open the classic window. gui_tk (and customtkinter) is imported here,
+    not at the top, so starting the Fluent window never loads it."""
+    from .gui_tk import run_classic
+    run_classic()
 
 
 if __name__ == "__main__":

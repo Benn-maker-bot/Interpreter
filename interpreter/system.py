@@ -409,3 +409,44 @@ def resource_warnings(fields) -> list:
     if (fields.get("system_cpu_pct") or 0) > HIGH_SYSTEM_CPU_PCT:
         problems.append(f"CPU busy: {fields['system_cpu_pct']} % of the whole machine")
     return problems
+
+
+# ── Diagnostics figures and opening files (used by both windows) ────────────
+
+def new_perf_stats() -> dict:
+    """Empty running statistics for the Diagnostics page: counts, and the
+    last 200 timings of each kind (a deque drops the oldest when full)."""
+    from collections import deque
+    return {
+        "transcriptions":   0,
+        "translations":     0,
+        "transcription_ms": deque(maxlen=200),
+        "translation_ms":   deque(maxlen=200),
+        "lock_wait_ms":     deque(maxlen=200),
+    }
+
+
+def record_metric(perf_stats: dict, name: str, value: float) -> None:
+    """Add one timing from a worker's ("metric", (name, value)) message."""
+    if name == "transcription_ms":
+        perf_stats["transcriptions"] += 1
+        perf_stats["transcription_ms"].append(value)
+    elif name == "translation_ms":
+        perf_stats["translations"] += 1
+        perf_stats["translation_ms"].append(value)
+    elif name == "lock_wait_ms":
+        perf_stats["lock_wait_ms"].append(value)
+
+
+def open_path(path: Path) -> str | None:
+    """Open a file or folder in Windows Explorer / its default program (the
+    app folder if it doesn't exist yet). Returns None, or the error message
+    for the window to show."""
+    try:
+        target = path if path.exists() else APP_DIR
+        os.startfile(str(target))
+        log_event(logging.INFO, "open_path_requested", path=str(target))
+        return None
+    except Exception as e:
+        log_exception("open_path_failed", e, path=str(path))
+        return str(e)

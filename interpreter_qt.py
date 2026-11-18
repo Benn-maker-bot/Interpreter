@@ -24,11 +24,11 @@ with one device at a time and the My Voice / Friend mode buttons. Both share
 all of the real work: recording, speech detection, Whisper, translation,
 logging.
 
-BORROWED LOGIC AND ADAPTERS
----------------------------
-A few methods that only deal with the (shared) model settings are borrowed
-from the classic window's InterpreterApp class. They expect Tk-style helpers,
-so this window provides:
+SHARED LOGIC AND TK-STYLE HELPERS
+---------------------------------
+The models (Whisper, preview, Opus-MT) are handled by ModelManager in
+interpreter/model_manager.py, which the classic window uses too. This window
+also keeps two small Tk-style helpers, used throughout its own code:
 
   QVar        acts like a Tk variable (get()/set()) but reads and writes a
               Qt control, e.g. a combo box
@@ -70,15 +70,16 @@ from qfluentwidgets import (  # pyright: ignore[reportMissingTypeStubs, reportUn
                             setCustomStyleSheet, setTheme)
 
 import interpreter as core
-from interpreter import (InterpreterApp, LANGUAGES, continuation_join, trailing_marks_length, MODELS, Speaker,
+from interpreter import (ModelManager, LANGUAGES, continuation_join, trailing_marks_length, MODELS, Speaker,
                          PerfWindow, get_audio_devices, find_device_by_keywords,
                          find_best_vb_input, find_best_friend_input, find_best_output_device,
                          load_settings, log_event, log_exception, vad_threshold_for, plain_device_name,
                          NVIDIA_KEYWORDS, DEFAULT_SENS,
                          MAX_TEXT_HISTORY_CHARS, WATCHDOG_SEC, STATS_INTERVAL_SEC,
                          WHISPER_DEVICE, COMPUTE_TYPE, NUM_WORKERS,
-                         DEFAULT_MODEL_CPU, DEFAULT_MODEL_GPU)
-from session_controller import AnyEvent, SessionConfig, SessionController
+                         DEFAULT_MODEL_CPU, DEFAULT_MODEL_GPU,
+                         new_perf_stats, open_path, record_metric)
+from interpreter.session_controller import AnyEvent, SessionConfig, SessionController
 
 PREVIEW_CHOICES: dict[str, str | None] = core.PREVIEW_CHOICES
 
@@ -87,7 +88,7 @@ OK, WARN, BAD, MUTED = "#2ECC71", "#F1C40F", "#E74C3C", "#9AA0A6"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Adapters that let the classic window's borrowed logic drive Qt widgets
+# Tk-style helpers (QVar, and after() on the window) used throughout this file
 # ─────────────────────────────────────────────────────────────────────────────
 
 class QVar:
@@ -1075,15 +1076,28 @@ class QtInterpreterApp(FluentWindow):
     with the channel, and appear in one conversation.
     """
 
-    # ── Borrowed logic (see the file's opening comment) ──────────────────
-    # These only use the model settings, which both channels share.
-    _preload_model            = InterpreterApp._preload_model  # pyright: ignore[reportPrivateUsage]
-    _on_preview_choice        = InterpreterApp._on_preview_choice  # pyright: ignore[reportPrivateUsage]
-    _ensure_preview_model     = InterpreterApp._ensure_preview_model  # pyright: ignore[reportPrivateUsage]
-    _translator_for           = InterpreterApp._translator_for  # pyright: ignore[reportPrivateUsage]
-    _preview_model            = InterpreterApp._preview_model  # pyright: ignore[reportPrivateUsage]
-    _update_metric            = InterpreterApp._update_metric  # pyright: ignore[reportPrivateUsage]
-    _open_path                = InterpreterApp._open_path  # pyright: ignore[reportPrivateUsage]
+    # ── Models: both channels share them (ModelManager, model_manager.py) ──
+
+    def _preload_model(self) -> None:
+        """Start loading the Whisper model chosen in the Model menu."""
+        self.models.load_main(self.model_var.get(),
+                              status_cb=lambda m: self.result_queue.put(("status", m)))
+
+    def _ensure_preview_model(self) -> None:
+        """Load the preview model chosen in the Previews menu."""
+        self.models.choose_preview(self.preview_choice_var.get(), self.model_var.get())
+
+    def _on_preview_choice(self) -> None:
+        """The Previews menu changed: save, load that model, restart listening."""
+        core.save_settings(preview_model=self.preview_choice_var.get())
+        self._ensure_preview_model()
+        self._restart_session()
+
+    def _open_path(self, path: Any) -> None:
+        """Open a file or folder in Windows Explorer / its default program."""
+        error = open_path(path)
+        if error:
+            self.status_var.set(f"Open failed: {error}")
 
     def __init__(self) -> None:
         """Set up the state, find the audio devices, build both pages, place
@@ -1096,22 +1110,12 @@ class QtInterpreterApp(FluentWindow):
         # ── state ────────────────────────────────────────────────────────
         self.session_id = str(uuid.uuid4())
         self.result_queue: queue.Queue[Any] = queue.Queue()  # background threads -> window
-        self._perf_stats: dict[str, Any] = {
-            "transcriptions": 0, "translations": 0,
-            "transcription_ms": deque(maxlen=200),
-            "translation_ms": deque(maxlen=200),
-            "lock_wait_ms": deque(maxlen=200),
-        }
-        self._model_loader: core.WhisperModelLoader | None = None
-        self._whisper_model: Any = None
+        self._perf_stats: dict[str, Any] = new_perf_stats()
+        self.models = ModelManager()             # Whisper and Opus-MT models
         self._run_id = 0                         # counts every channel start (unique run ids)
         self._ui_stats = PerfWindow()
         self._last_poll_t: float | None = None
         self._diag_psutil_process: Any = None
-        self._preview_loader: core.WhisperModelLoader | None = None
-        self._preview_enabled = False
-        self._previews_off = False
-        self._mt_loaders: dict[tuple[str, str], core.TranslatorLoader] = {}
         self._initialised = False
         self._closing = False                    # set when the window closes
         self._start_retry_after_id: int | None = None
@@ -1563,7 +1567,6 @@ class QtInterpreterApp(FluentWindow):
             self.after(1500, lambda: self.status_var.set(
                 "Note: Tiny makes many mistakes in non-English speech; use Turbo or Medium."))
         self._stop_all()
-        self._whisper_model = None
         self._preload_model()
         self._ensure_preview_model()
         self._start_all()
@@ -1672,23 +1675,23 @@ class QtInterpreterApp(FluentWindow):
     def _model_ready(self) -> bool:
         """True when the Whisper model can be used. While it is still
         loading, says so and tries starting again shortly."""
-        loader = self._model_loader
+        loader = self.models.model_loader
         if loader is not None and not loader.ready.is_set():
             self.status_var.set("⏳ Loading Whisper model - please wait…")
             if self._start_retry_after_id is None:
                 self._start_retry_after_id = self.after(600, self._retry_start)
             return False
-        if self._whisper_model is None and loader is not None:
+        if self.models.whisper_model is None and loader is not None:
             if loader.error:
                 self.status_var.set(f"Cannot start: {loader.error}")
                 self._set_live_status("MODEL ERROR", BAD)
                 log_event(logging.ERROR, "session_start_blocked_model_error", error=loader.error)
                 return False
-            self._whisper_model = loader.model
+            self.models.whisper_model = loader.model
             if getattr(loader, "used_fallback", False):
                 self._set_live_status("CPU FALLBACK", WARN)
                 self.model_var.set(loader.default_model_key)
-        if self._whisper_model is None:
+        if self.models.whisper_model is None:
             self.status_var.set("Whisper model unavailable.")
             log_event(logging.ERROR, "session_start_blocked_model_unavailable")
             return False
@@ -1711,8 +1714,8 @@ class QtInterpreterApp(FluentWindow):
             self._stop_channel(ch)
 
     def _restart_session(self) -> None:
-        """Restart both channels (e.g. the Previews choice changed). The
-        borrowed _on_preview_choice calls this."""
+        """Restart both channels (e.g. the Previews choice changed).
+        _on_preview_choice calls this."""
         self._stop_all()
         self._start_all()
 
@@ -1782,8 +1785,8 @@ class QtInterpreterApp(FluentWindow):
             model_label=self.model_var.get(),
             sensitivity=s.sensitivity,
             preview_choice=self.preview_choice_var.get(),
-            preview_enabled=self._preview_enabled,
-            previews_off=self._previews_off,
+            preview_enabled=self.models.preview_enabled,
+            previews_off=self.models.previews_off,
             tts_on=s.speak,
             record_audio=bool(load_settings().get("record_audio", True)),
             auto_language=self.auto_lang_check.isChecked(),
@@ -1798,12 +1801,12 @@ class QtInterpreterApp(FluentWindow):
         try:
             ch.controller.start(
                 config,
-                model=self._whisper_model,
-                model_loader=self._model_loader,
+                model=self.models.whisper_model,
+                model_loader=self.models.model_loader,
                 speaker=None,
                 on_level=None,
-                preview_model=self._preview_model,
-                translator_for=self._translator_for,
+                preview_model=self.models.preview_model,
+                translator_for=self.models.translator_for,
                 music_scene=self._music_scene_for(ch),
                 mute_event=self._mute_event_for(ch),
             )
@@ -1847,7 +1850,7 @@ class QtInterpreterApp(FluentWindow):
         return AnyEvent(events) if events else None
 
     def _music_scene_for(self, ch: Channel) -> Any:
-        """The channel's music detector (music.py), created once and kept
+        """The channel's music detector (interpreter/music.py), created once and kept
         across restarts. The second channel's detector shares the first
         one's models. "music_mode": false in interpreter.settings.json turns
         it off; "vocal_separation": false keeps the detection but skips
@@ -1860,7 +1863,7 @@ class QtInterpreterApp(FluentWindow):
             def log(event: str, **fields: Any) -> None:
                 log_event(logging.INFO, event, channel=name, **fields)
             try:
-                from music import MusicScene
+                from interpreter.music import MusicScene
                 ch.music_scene = MusicScene(enabled=bool(settings.get("music_mode", True)),
                                             separate=bool(settings.get("vocal_separation", True)),
                                             log=log, models_from=shared)
@@ -1941,7 +1944,7 @@ class QtInterpreterApp(FluentWindow):
         elif kind == "level":
             self._update_meter(ch, *data)
         elif kind == "metric":
-            self._update_metric(*data)
+            record_metric(self._perf_stats, *data)
 
     def _show_final(self, ch: Channel, key: tuple[int, int, int], text: str,
                     translated: str | None, trace: dict[str, Any] | None) -> None:
@@ -2068,7 +2071,7 @@ class QtInterpreterApp(FluentWindow):
                     self._stop_channel(ch)
                     self._channel_problem(ch, f"⚠ {problem} - restarting…")
                     ch.retry_at, ch.needs_rescan = now + wait, True
-                elif now >= ch.retry_at and self._whisper_model is not None:
+                elif now >= ch.retry_at and self.models.whisper_model is not None:
                     if ch.needs_rescan or ch.settings.device not in self._input_map:
                         self._rescan_devices()
                     self._start_channel(ch)
@@ -2374,7 +2377,7 @@ class QtInterpreterApp(FluentWindow):
         """The Health card: overall state (listening, problems found), how long
         it has been listening, and which model and translator are in use."""
         h = self.health_card
-        loader = self._model_loader
+        loader = self.models.model_loader
         listening = [c for c in self.channels if c.listening]
         stuck = [c for c in self.channels if not c.settings.muted and not c.listening]
         if all(c.settings.muted for c in self.channels):
@@ -2406,8 +2409,8 @@ class QtInterpreterApp(FluentWindow):
         h.set("Main model", f"{MODELS.get(self.model_var.get())}  "
                             f"({getattr(loader, 'active_compute_type', COMPUTE_TYPE)} on "
                             f"{getattr(loader, 'active_device', WHISPER_DEVICE)})" if loader else "-")
-        pl = self._preview_loader
-        if not self._preview_enabled:
+        pl = self.models.preview_loader
+        if not self.models.preview_enabled:
             h.set("Preview model", "same as main model")
         elif pl is not None and pl.ready.is_set():
             h.set("Preview model", pl.model_size, OK)
@@ -2422,7 +2425,7 @@ class QtInterpreterApp(FluentWindow):
                 texts.append(f"{c.settings.name}: Opus-MT per detected language → {tgt}")
                 colours.append(OK)
                 continue
-            mt = self._mt_loaders.get((src, tgt))
+            mt = self.models.mt_loaders.get((src, tgt))
             if mt is None:
                 texts.append(f"{c.settings.name}: online (no local model for {src}→{tgt})")
                 colours.append(WARN)

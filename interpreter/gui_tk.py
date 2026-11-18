@@ -17,9 +17,8 @@ import logging
 import os
 import sys
 import uuid
-from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 import customtkinter as ctk
 
@@ -28,21 +27,20 @@ from .config import (
     COL_INFO, COL_MY_HOVER, COL_MY_VOICE, COL_OK, COL_STOP, COL_STOP_HOV, COL_WARN,
     DEFAULT_SENS, ERROR_LOG_PATH, LOG_PATH, LOG_SUMMARY_PATH,
     MAX_TEXT_HISTORY_CHARS, MODELS, NVIDIA_KEYWORDS, PHRASE_QUEUE_BACKLOG_WARN,
-    PREVIEW_CHOICES, PREVIEW_OFF, STATS_INTERVAL_SEC, TARGET_LANGUAGES,
+    PREVIEW_CHOICES, STATS_INTERVAL_SEC, TARGET_LANGUAGES,
     TRANSLATION_QUEUE_BACKLOG_WARN, WATCHDOG_SEC)
 from .logging_setup import build_log_summary, log_event, log_exception
 from .system import (
-    collect_resource_stats, COMPUTE_TYPE, _DEFAULT_MODEL, NUM_WORKERS,
-    resource_warnings, WHISPER_DEVICE)
+    collect_resource_stats, COMPUTE_TYPE, _DEFAULT_MODEL, new_perf_stats,
+    NUM_WORKERS, open_path, record_metric, resource_warnings, WHISPER_DEVICE)
 from .audio import (
     find_best_friend_input, find_best_output_device, find_best_vb_input,
     find_device_by_keywords, get_audio_devices, PerfWindow, plain_device_name,
     vad_threshold_for)
 from .text_filters import continuation_join, trailing_marks_length
-from .translation import LocalTranslator, _MT_LOADERS_LOCK, opus_repo, TranslatorLoader
 from .speech import Speaker
 from .settings import load_settings, save_settings
-from .transcription import WhisperModelLoader
+from .model_manager import ModelManager
 
 
 ctk.set_appearance_mode("dark")
@@ -255,30 +253,23 @@ class InterpreterApp(ctk.CTk):
         # for every listening session). _perf_stats: figures for Diagnostics.
         self.session_id = str(uuid.uuid4())
         self.result_queue = queue.Queue()
-        from session_controller import SessionController
+        from .session_controller import SessionController
         # SessionController needs the whole app ("core"): the package
         # interpreter, not just this module. __package__ is "interpreter".
         self.session_controller = SessionController(self.result_queue, sys.modules[__package__])
         self.phrase_queue = self.session_controller.phrase_queue
-        self._perf_stats  = {
-            "transcriptions":  0,
-            "translations":    0,
-            "transcription_ms": deque(maxlen=200),
-            "translation_ms":   deque(maxlen=200),
-            "lock_wait_ms":     deque(maxlen=200),
-        }
+        self._perf_stats  = new_perf_stats()
         # The current listening session's threads (None / empty when stopped).
         self._capture_thread         = None
         self._loopback_out        = None
         self._workers             = []
         self._translation_workers = []
         self._translation_queue   = self.session_controller.translation_queue
-        # _model_loader: thread loading the main model; _whisper_model: the model
-        # once loaded; is_listening: a session is running; _muted: user pressed
-        # Mute; _run_id: session counter; _last_poll_t / _psutil_process: for the
-        # diagnostics; _preview_loader / _preview_enabled: the preview model.
-        self._model_loader        = None
-        self._whisper_model       = None
+        # models: the Whisper and Opus-MT models (model_manager.py);
+        # is_listening: a session is running; _muted: user pressed Mute;
+        # _run_id: session counter; _last_poll_t / _psutil_process: for the
+        # diagnostics.
+        self.models               = ModelManager()
         self.is_listening         = False
         self._muted               = False
         self._run_id              = 0
@@ -287,10 +278,6 @@ class InterpreterApp(ctk.CTk):
         self._ui_stats            = PerfWindow()
         self._last_poll_t         = None
         self._psutil_process                = None
-        self._preview_loader      = None
-        self._preview_enabled     = False
-        self._previews_off        = False   # Previews set to "Off"
-        self._mt_loaders          = {}   # (src, tgt) -> TranslatorLoader
         self._initialised         = False
         self._active_mode         = None
         self._start_retry_after_id = None
@@ -428,14 +415,8 @@ class InterpreterApp(ctk.CTk):
 
     def _preload_model(self):
         """Start loading the selected Whisper model in the background."""
-        self._whisper_model = None
-        model_size = MODELS[self.model_var.get()]
-        log_event(logging.INFO, "whisper_model_preload_started", model_size=model_size)
-        self._model_loader = WhisperModelLoader(
-            model_size=model_size,
-            status_cb=lambda m: self.result_queue.put(("status", m)),
-        )
-        self._model_loader.start()
+        self.models.load_main(self.model_var.get(),
+                              status_cb=lambda m: self.result_queue.put(("status", m)))
 
     def _reload_model_if_changed(self):
         """Called when the Model menu changes: save the choice, load the new model
@@ -448,7 +429,6 @@ class InterpreterApp(ctk.CTk):
                 "Note: Tiny makes many mistakes in non-English speech; use Turbo or Medium."))
         if self.is_listening:
             self._stop_session(keep_mode=True)
-        self._whisper_model = None
         self._preload_model()
         self._ensure_preview_model()
         self._restart_session()
@@ -876,7 +856,8 @@ class InterpreterApp(ctk.CTk):
         """Validate the selected model and ask the shared controller to start it."""
         if self.is_listening or self._muted:
             return
-        if self._model_loader and not self._model_loader.ready.is_set():
+        loader = self.models.model_loader
+        if loader and not loader.ready.is_set():
             self.status_var.set("⏳ Loading Whisper model - please wait…")
             if self._start_retry_after_id is None:
                 self._start_retry_after_id = self.after(600, self._retry_start_session)
@@ -884,18 +865,18 @@ class InterpreterApp(ctk.CTk):
         self._start_retry_after_id = None
         self._run_id += 1
         self._traces, self._first_preview = {}, {}
-        if self._whisper_model is None and self._model_loader:
-            if self._model_loader.error:
-                self.status_var.set(f"Cannot start: {self._model_loader.error}")
+        if self.models.whisper_model is None and loader:
+            if loader.error:
+                self.status_var.set(f"Cannot start: {loader.error}")
                 self._set_live_status("MODEL ERROR", COL_ERR)
                 log_event(logging.ERROR, "session_start_blocked_model_error",
-                          error=self._model_loader.error)
+                          error=loader.error)
                 return
-            self._whisper_model = self._model_loader.model
-            if getattr(self._model_loader, "used_fallback", False):
+            self.models.whisper_model = loader.model
+            if getattr(loader, "used_fallback", False):
                 self._set_live_status("CPU FALLBACK", COL_WARN)
-                self.model_var.set(self._model_loader.default_model_key)
-        if self._whisper_model is None:
+                self.model_var.set(loader.default_model_key)
+        if self.models.whisper_model is None:
             self.status_var.set("Whisper model unavailable.")
             log_event(logging.ERROR, "session_start_blocked_model_unavailable")
             return
@@ -919,7 +900,7 @@ class InterpreterApp(ctk.CTk):
         self._set_live_status("LISTENING", COL_OK)
         self.status_var.set("Listening…")
 
-        from session_controller import SessionConfig
+        from .session_controller import SessionConfig
         settings = load_settings()
         config = SessionConfig(
             session_id=self.session_id,
@@ -934,8 +915,8 @@ class InterpreterApp(ctk.CTk):
             model_label=self.model_var.get(),
             sensitivity=round(self.sensitivity_var.get(), 2),
             preview_choice=self.preview_choice_var.get(),
-            preview_enabled=self._preview_enabled,
-            previews_off=self._previews_off,
+            preview_enabled=self.models.preview_enabled,
+            previews_off=self.models.previews_off,
             tts_on=self._tts_on,
             record_audio=bool(settings.get("record_audio", True)),
             auto_language=bool(settings.get("auto_language", True)),
@@ -944,12 +925,12 @@ class InterpreterApp(ctk.CTk):
         try:
             self.session_controller.start(
                 config,
-                model=self._whisper_model,
-                model_loader=self._model_loader,
+                model=self.models.whisper_model,
+                model_loader=self.models.model_loader,
                 speaker=self.speaker,
                 on_level=self._on_level,
-                preview_model=self._preview_model,
-                translator_for=self._translator_for,
+                preview_model=self.models.preview_model,
+                translator_for=self.models.translator_for,
                 music_scene=self._ensure_music_scene(),
             )
             self._sync_session_controller()
@@ -1047,7 +1028,7 @@ class InterpreterApp(ctk.CTk):
         self._restart_session()
 
     def _ensure_music_scene(self):
-        """The music detector (music.py), created once and kept across
+        """The music detector (interpreter/music.py), created once and kept across
         sessions so its models load only once. "music_mode": false in
         interpreter.settings.json turns it off; "vocal_separation": false
         keeps the detection but skips removing the instruments."""
@@ -1055,7 +1036,7 @@ class InterpreterApp(ctk.CTk):
         if scene is None:
             settings = load_settings()
             try:
-                from music import MusicScene
+                from .music import MusicScene
                 scene = MusicScene(enabled=bool(settings.get("music_mode", True)),
                                    separate=bool(settings.get("vocal_separation", True)),
                                    log=lambda event, **k: log_event(logging.INFO, event, **k))
@@ -1066,47 +1047,8 @@ class InterpreterApp(ctk.CTk):
         return scene if scene is not None and scene.enabled else None
 
     def _ensure_preview_model(self):
-        """Load the chosen preview model alongside the main model. Not needed
-        when it is the same as the main model."""
-        size = PREVIEW_CHOICES[self.preview_choice_var.get()]
-        # Plain mirror of the Tk settings: _preview_model() runs on the worker
-        # thread, and Tk variables may only be touched from the UI thread.
-        self._previews_off = size == PREVIEW_OFF
-        self._preview_enabled = (size not in (None, PREVIEW_OFF)
-                                 and size != MODELS[self.model_var.get()])
-        if not self._preview_enabled:
-            return
-        if self._preview_loader is None or self._preview_loader.model_size != size:
-            self._preview_loader = WhisperModelLoader(model_size=size, status_cb=lambda m: None)
-            self._preview_loader.start()
-            log_event(logging.INFO, "preview_model_load_started", model_size=size)
-
-    def _translator_for(
-        self, src: str, tgt: str
-    ) -> Callable[[], LocalTranslator | None] | None:
-        """Start loading the Opus-MT model for this pair (first use downloads
-        ~300 MB) and return a callable the worker polls; until it is ready,
-        translation falls back to Whisper/online."""
-        if opus_repo(src, tgt) is None:
-            return None
-        # Workers call this too (a phrase in a new language): one loader per pair
-        with _MT_LOADERS_LOCK:
-            loader = self._mt_loaders.get((src, tgt))
-            if loader is None:
-                loader = self._mt_loaders[(src, tgt)] = TranslatorLoader(src, tgt)
-                loader.start()
-                log_event(logging.INFO, "local_translator_load_started", pair=f"{src}-{tgt}",
-                          repo=opus_repo(src, tgt))
-        return lambda l=loader: l.translator if l.ready.is_set() else None
-
-    def _preview_model(self):
-        """Called from the transcription worker thread: no Tk access here."""
-        if not self._preview_enabled:
-            return None
-        loader = self._preview_loader
-        if loader is not None and loader.ready.is_set() and loader.model is not None:
-            return loader.model
-        return None   # still loading: previews use the main model meanwhile
+        """Load the preview model chosen in the Previews menu (model_manager.py)."""
+        self.models.choose_preview(self.preview_choice_var.get(), self.model_var.get())
 
     # ── Queue poll ────────────────────────────────────────────────────────
 
@@ -1296,7 +1238,7 @@ class InterpreterApp(ctk.CTk):
                     self._update_meter(*data)
                 # ── 'metric': a timing figure for the Diagnostics tab.
                 elif kind == "metric":
-                    self._update_metric(*data)
+                    record_metric(self._perf_stats, *data)
         except queue.Empty:
             pass
         if handled:
@@ -1304,17 +1246,6 @@ class InterpreterApp(ctk.CTk):
         # Schedule the next check in 15 ms. This is how the function repeats
         # forever without blocking the window (see self.after in the guide).
         self.after(15, self._poll_queue)
-
-    def _update_metric(self, name: str, value: float) -> None:
-        """Keep running statistics for the Diagnostics tab."""
-        if name == "transcription_ms":
-            self._perf_stats["transcriptions"] += 1
-            self._perf_stats["transcription_ms"].append(value)
-        elif name == "translation_ms":
-            self._perf_stats["translations"] += 1
-            self._perf_stats["translation_ms"].append(value)
-        elif name == "lock_wait_ms":
-            self._perf_stats["lock_wait_ms"].append(value)
 
     # ── Diagnostics ───────────────────────────────────────────────────────
 
@@ -1371,7 +1302,7 @@ class InterpreterApp(ctk.CTk):
             f"transcription workers {len(self._workers)}",
             f"translation workers   {len(self._translation_workers)}",
             f"whisper device        {WHISPER_DEVICE}",
-            f"compute type          {getattr(self._model_loader, 'active_compute_type', COMPUTE_TYPE)}",
+            f"compute type          {getattr(self.models.model_loader, 'active_compute_type', COMPUTE_TYPE)}",
             f"phrase queue backlog  {phrase_backlog}",
             f"translation Q backlog {translation_backlog}",
             f"",
@@ -1390,13 +1321,9 @@ class InterpreterApp(ctk.CTk):
 
     def _open_path(self, path: Path):
         """Open a file or folder in Windows Explorer / its default program."""
-        try:
-            target = path if path.exists() else APP_DIR
-            os.startfile(str(target))
-            log_event(logging.INFO, "open_path_requested", path=str(target))
-        except Exception as e:
-            self.status_var.set(f"Open failed: {e}")
-            log_exception("open_path_failed", e, path=str(path))
+        error = open_path(path)
+        if error:
+            self.status_var.set(f"Open failed: {error}")
 
     def _open_app_folder(self):
         """Open the folder that contains the app and its log files."""

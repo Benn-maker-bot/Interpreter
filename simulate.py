@@ -82,7 +82,7 @@ WHAT IS IN THIS FILE (top to bottom)
   FakeStream          plays the playlist like a live microphone.
   FakePyAudio,        a pretend sound-card library that the app's capture
   FakePyAudioModule   code talks to without knowing it isn't real.
-  Loaders, build()    sets up the app's pipeline without its window.
+  build()             sets up the app's pipeline without its window.
   choose_clips()      picks which clips to play.
   strip_label()       removes "[German] " labels from text.
   score()             matches results to clips and scores them.
@@ -95,7 +95,7 @@ PYTHON NOTES
 ------------
 Python ideas new to this file are explained where they first appear, marked
 "PYTHON:". The basics (variables, functions, classes, self, lists, dicts,
-NumPy arrays) are explained at the top of music.py.
+NumPy arrays) are explained at the top of interpreter/music.py.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ import uuid                     # makes random unique ids, for the session id
 import wave                     # reads .wav audio files
 from pathlib import Path        # file paths as objects: folder / "file.txt"
 
-import numpy as np              # fast maths on arrays of numbers (see music.py)
+import numpy as np              # fast maths on arrays of numbers (see interpreter/music.py)
 
 # PYTHON: __file__ is the path of this file. Path(__file__).resolve() makes it
 # a full path, and .parent is its folder, e.g.
@@ -514,28 +514,6 @@ class FakePyAudioModule:
 # Building the pipeline (what the window's _start_session does, without a window)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Loaders:
-    """Creates local translators when they are needed (stands in for the window).
-
-    In the app, the window (InterpreterApp) loads the Opus-MT translators.
-    The simulator has no window, so this tiny class borrows the window's
-    _translator_for method.
-
-    PYTHON: a method is just a function stored in a class. Assigning
-    I.InterpreterApp._translator_for here copies that function into this
-    class; it works because it only uses self._mt_loaders, which this class
-    also has.
-
-    Attributes:
-        _mt_loaders  dict: (source, target) language pair -> its translator
-                     loader, e.g. {("de", "en"): <TranslatorLoader>}
-    """
-    def __init__(self):
-        """Start with no translators loaded."""
-        self._mt_loaders = {}
-    _translator_for = I.InterpreterApp._translator_for
-
-
 def build(args, playlist, say=print, level_cb=None):
     """Set up the app's pipeline (capture thread + transcription worker),
     exactly as the window does when you start listening, but without a window.
@@ -605,10 +583,10 @@ def build(args, playlist, say=print, level_cb=None):
                            "not simulating with the CPU fallback model")
     if preview:
         preview.ready.wait()
-    # Step 3. Music detection (see music.py).
+    # Step 3. Music detection (see interpreter/music.py).
     scene = None
     if not args.no_music:
-        from music import MusicScene
+        from interpreter.music import MusicScene
         # The scene logs through the app's log: 20 is the number for "INFO" level.
         scene = MusicScene(log=lambda e, **k: I.log_event(20, e, **k))
         # Wait (up to 60 s) for its sound classifier to load, checking every 0.2 s.
@@ -617,7 +595,11 @@ def build(args, playlist, say=print, level_cb=None):
             time.sleep(0.2)
     # Step 4. Pre-load the local translators the clips will need, so the first
     # phrases aren't counted as "online" while a model downloads.
-    loaders = Loaders()
+    # ModelManager (interpreter/model_manager.py) is what the windows use to
+    # load models. The simulator uses one too, for the translators only.
+    # loaders.mt_loaders: (source, target) -> its TranslatorLoader,
+    # e.g. {("de", "en"): <TranslatorLoader>}
+    loaders = I.ModelManager()
     # PYTHON: {expression for …} with curly brackets builds a SET: like a list,
     # but each value only once. {c["lang"] for c in clips} -> {"de", "fr", "ru", …}
     # In live mode the languages aren't known in advance; only the chosen
@@ -629,8 +611,8 @@ def build(args, playlist, say=print, level_cb=None):
         # but bg -> ru may go via English: [("bg", "en"), ("en", "ru")].
         for pair in I.local_route(code, tgt_code):
             # PYTHON: *pair unpacks ("bg", "en") into two arguments: f("bg", "en").
-            loaders._translator_for(*pair)
-    for loader in loaders._mt_loaders.values():          # .values(): the dict's values
+            loaders.translator_for(*pair)
+    for loader in loaders.mt_loaders.values():          # .values(): the dict's values
         loader.ready.wait()
 
     # Step 5. Connect everything, as in the app.
@@ -662,7 +644,7 @@ def build(args, playlist, say=print, level_cb=None):
         tgt_lang_key=tgt_key, phrase_queue=phrases, result_queue=results,
         status_cb=lambda m: results.put(("status", m)), partial_slot=partial_slot,
         preview_model=(preview.model if preview else None), run_id=1, record_audio=False,
-        translator=loaders._translator_for(src_whisper, tgt_code), early_slot=early_slot,
+        translator=loaders.translator_for(src_whisper, tgt_code), early_slot=early_slot,
         session_id=session_id,
         # config: settings written into every phrase's log line, so log_tools
         # can compare runs with different settings.
@@ -670,7 +652,7 @@ def build(args, playlist, say=print, level_cb=None):
                 "sensitivity": args.sensitivity, "src_lang": src_key, "tgt_lang": tgt_key})
     worker.music_scene = scene
     worker.auto_language = True                          # translate phrases in other languages too
-    worker.translator_for = loaders._translator_for      # how the worker gets more translators
+    worker.translator_for = loaders.translator_for       # how the worker gets more translators
     return capture, worker, results, session_id
 
 

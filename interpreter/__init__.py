@@ -62,7 +62,7 @@ HOW A PIECE OF SPEECH TRAVELS THROUGH THE PROGRAM
 
 MUSIC AND LANGUAGES
 -------------------
-  MUSIC MODE  Once a second a sound classifier (YAMNet, in music.py)
+  MUSIC MODE  Once a second a sound classifier (YAMNet, in interpreter/music.py)
      decides whether music is playing. If so: phrases may be longer, the
      speech detector is more sensitive, and a second AI model (UVR) removes
      the instruments so Whisper hears only the voice.
@@ -261,13 +261,18 @@ THE MODULES (in import order: each one only imports from those above it)
   speech.py         Speaker (text-to-speech)
   settings.py       the user's saved choices (interpreter.settings.json)
   transcription.py  WhisperModelLoader, TranscriptionWorker
-  gui_tk.py         InterpreterApp, the classic window
+  model_manager.py  ModelManager: the Whisper and Opus-MT models both windows use
+  session_controller.py  starts and stops one listening pipeline (SessionController)
+  music.py          music detection and vocal separation (loaded when first used)
+  gui_tk.py         InterpreterApp, the classic window (loaded only when needed)
   __main__.py       start-up: `python -m interpreter` or `python run.py`
 
-  Importing the package (`import interpreter`) loads them all, and this
-  file re-exports their names, so interpreter.SAMPLE_RATE or
-  interpreter.AudioCaptureThread work without knowing which module they
-  are in. Inside the package, modules import from each other directly
+  Importing the package (`import interpreter`) loads the modules down to
+  model_manager.py, and this file re-exports their names, so
+  interpreter.SAMPLE_RATE or interpreter.AudioCaptureThread work without
+  knowing which module they are in. The classic window (gui_tk.py) is not
+  loaded until something asks for it, so the Fluent window never loads
+  customtkinter (see __getattr__ at the end of this file). Inside the package, modules import from each other directly
   (`from .config import SAMPLE_RATE`), which shows what each one needs.
   Values in CAPITALS (config.py) are tuning knobs, each with a comment
   saying what it does and, where it was measured, why it has that value.
@@ -282,18 +287,42 @@ from .logging_setup import *  # noqa: F401,F403
 from .system import *  # noqa: F401,F403
 from .system import _add_cuda_dll_dirs  # noqa: F401  (log_tools.py)
 from .audio import *  # noqa: F401,F403
-from .audio import _PYAUDIO_AVAILABLE  # noqa: F401  (session_controller.py)
+from .audio import _PYAUDIO_AVAILABLE  # noqa: F401  (session_controller.py uses core._PYAUDIO_AVAILABLE)
 from .text_filters import *  # noqa: F401,F403
 from .translation import *  # noqa: F401,F403
 from .translation import _translate_cached  # noqa: F401  (simulate.py)
 from .speech import *  # noqa: F401,F403
 from .settings import *  # noqa: F401,F403
 from .transcription import *  # noqa: F401,F403
-from .gui_tk import *  # noqa: F401,F403
+from .model_manager import *  # noqa: F401,F403
 
 from . import config, logging_setup, system, audio, text_filters  # noqa: F401
-from . import translation, speech, settings, transcription, gui_tk  # noqa: F401
+from . import translation, speech, settings, transcription, model_manager  # noqa: F401
 
 
 log_event(logging.INFO, "app_module_loaded",
           app_dir=str(APP_DIR), log_path=str(LOG_PATH), error_log_path=str(ERROR_LOG_PATH))  # noqa: F405
+
+
+# The classic window's names. They are not imported above, so customtkinter
+# (and Tk) only load when something actually uses the classic window.
+_GUI_TK_NAMES = ("InterpreterApp", "DbMeter", "SpeechMeter", "ui_scale", "run_classic")
+
+
+def __getattr__(name):
+    """Load the classic window on first use of one of its names.
+
+    PYTHON: a module-level __getattr__ (PEP 562, Python 3.7+) is called only
+    when a name is NOT found in the module the normal way. So
+    `interpreter.InterpreterApp` still works: the first time, this imports
+    gui_tk and returns the class; Python remembers gui_tk after that.
+    """
+    if name in _GUI_TK_NAMES:
+        from . import gui_tk
+        return getattr(gui_tk, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    """dir(interpreter) lists the classic window's names too."""
+    return sorted(set(globals()) | set(_GUI_TK_NAMES))

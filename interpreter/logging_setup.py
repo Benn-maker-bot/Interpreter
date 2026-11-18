@@ -423,7 +423,7 @@ def _where(exc_info):
     if not tb:
         return ""
     # "Our" code is the interpreter\ package and the scripts beside it
-    # (interpreter_qt.py, session_controller.py ...) in the project folder.
+    # (interpreter_qt.py, simulate.py ...) in the project folder.
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     app_dir = os.path.dirname(pkg_dir)
     ours = [f for f in tb
