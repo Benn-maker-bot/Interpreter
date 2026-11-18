@@ -21,7 +21,7 @@ ctranslate2>=4.4.0          # the engine faster-whisper and Opus-MT run on
 nvidia-cublas-cu12>=12.4    # NVIDIA CUDA libraries so CTranslate2 can use the GPU
 nvidia-cudnn-cu12>=9,<10    # (Windows; not needed when running on the CPU only)
 
-# ── Music mode (music.py): sound classifier + vocal separation ───────────
+# ── Music mode (interpreter/music.py): sound classifier + vocal separation ───────────
 # onnxruntime-gpu runs YAMNet and the UVR vocal model. 1.23 is the newest
 # build for CUDA 12 (1.24+ need CUDA 13). faster-whisper also installs the
 # CPU-only "onnxruntime", which overwrites the GPU one; after installing,

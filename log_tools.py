@@ -101,7 +101,7 @@ WHAT IS IN THIS FILE
   (bottom)                     which command to run, from what was typed.
 
 Python ideas new to this file are explained where they appear ("PYTHON:").
-The basics are explained at the top of music.py.
+The basics are explained at the top of interpreter/music.py.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,7 +526,7 @@ def build_report(since: str | None = None) -> str:
                        "switched (too short or not clear enough), e.g. "
                        + "; ".join(f"{t['lang']} {t.get('lang_prob')}: {(t.get('text') or '')[:30]!r}"
                                    for t in unsure[:3]))
-    # Music mode (music.py): how often music was detected and what it cost.
+    # Music mode (interpreter/music.py): how often music was detected and what it cost.
     music_traces = [t for t in traces if t.get("music_mode")]
     if any("sound_music" in t for t in traces):
         out.append("\nMusic and singing (sound classifier, vocal separation)")

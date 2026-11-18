@@ -8,9 +8,7 @@
 | --- | --- | --- |
 | `run.py` | Starts the app (`--classic` for the old window) | you want to run it (F5 in VS Code does this) |
 | `interpreter\` | The application: audio, models, workers, logs, settings and the classic window (see below) | you want to change app services or the classic UI |
-| `session_controller.py` | Shared session configuration and worker lifecycle | you want to change how capture/transcription/translation workers start or stop |
 | `interpreter_qt.py` | **The Fluent window** you normally use | you want to change what you see or click |
-| `music.py` | Music detection and vocal separation | songs are recognised badly |
 | `simulator_qt.py` | **The simulator window** | you want to test with recordings or live audio |
 | `simulate.py` | The simulator engine (also runs without a window) | you want to change how tests are scored |
 | `log_tools.py` | Analyses the log files | you want reports: speed, accuracy, trends |
@@ -52,7 +50,10 @@ any class or function in the project by name.
 | `speech.py` | `Speaker` | Reads the translation aloud. |
 | `settings.py` | `load_settings`, `save_settings` | Remembers your choices between runs. |
 | `transcription.py` | `WhisperModelLoader`, `TranscriptionWorker` | Whisper, language choice, music, translation. |
-| `gui_tk.py` | `InterpreterApp` | The classic window and compatibility callbacks for the Fluent window. |
+| `model_manager.py` | `ModelManager` | Loads the Whisper and Opus-MT models; both windows and the simulator use it. |
+| `session_controller.py` | `SessionController` | Starts and stops one listening pipeline (open it to change how the workers start or stop). |
+| `music.py` | `MusicScene` | Music detection and vocal separation (open it when songs are recognised badly). |
+| `gui_tk.py` | `InterpreterApp` | The classic window. Loaded only when you start it with `--classic`. |
 | `__main__.py` | `main` | Starts the app (`python -m interpreter`; `run.py` calls it too). |
 
 Each module imports only from the ones above it in this table, so there are

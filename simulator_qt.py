@@ -100,7 +100,7 @@ WHAT IS IN THIS FILE
   main()                    starts the program.
 
 Python ideas new to this file are explained where they appear ("PYTHON:").
-The basics are explained at the top of music.py.
+The basics are explained at the top of interpreter/music.py.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────

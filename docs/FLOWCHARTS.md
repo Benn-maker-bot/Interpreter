@@ -31,8 +31,8 @@ flowchart LR
     subgraph application["Shared application and analysis"]
         direction TB
         CORE["interpreter/ package<br/>audio capture, workers, models, settings, logs"]
-        SESSION["session_controller.py<br/>session configuration and worker lifecycle"]
-        MUSIC["music.py<br/>music detection and vocal separation"]
+        SESSION["interpreter/session_controller.py<br/>session configuration and worker lifecycle"]
+        MUSIC["interpreter/music.py<br/>music detection and vocal separation"]
         SIM["simulate.py<br/>test playback and scoring"]
         LOG["log_tools.py<br/>read and analyse logs"]
     end
@@ -65,7 +65,7 @@ The two interpreter windows share the same application logic. The simulator
 also uses that logic, with test audio supplied in place of a physical input.
 
 **Code trail:** start at `QtInterpreterApp` or `InterpreterApp`, follow its
-settings snapshot into `SessionController.start()` in `session_controller.py`,
+settings snapshot into `SessionController.start()` in `interpreter/session_controller.py`,
 then follow the worker constructors in `interpreter/audio.py` and `interpreter/transcription.py`. For tests, start at
 `run()` in `simulate.py` and follow `build()`.
 
@@ -201,7 +201,7 @@ widgets and display updates. A few older callbacks remain shared during the
 ongoing UI separation.
 
 **Code trail:** read the module guide at the top of `interpreter_qt.py`, then
-read `SessionController` in `session_controller.py`, then follow the view's
+read `SessionController` in `interpreter/session_controller.py`, then follow the view's
 callback bindings in each UI class.
 
 ---

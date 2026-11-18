@@ -97,7 +97,7 @@ A FEW MUSIC FACTS USED BELOW
 PYTHON NOTES
 ------------
 This file uses "async" code (explained at tts()). Other new ideas are marked
-"PYTHON:" where they appear; the basics are explained at the top of music.py.
+"PYTHON:" where they appear; the basics are explained at the top of interpreter/music.py.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────

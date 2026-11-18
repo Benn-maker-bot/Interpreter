@@ -144,13 +144,12 @@ UNDERSTANDING THE PROJECT
 FILES IN THIS FOLDER
 --------------------
   run.py                       starts the app (or: python -m interpreter)
-  interpreter\                 the application, one module per job, and the
-                               classic window (start reading at the top of
+  interpreter\                 the application, one module per job (audio,
+                               Whisper, translation, music detection, the
+                               classic window ...). Start reading at the top of
                                interpreter\__init__.py: it explains how
-                               everything works)
+                               everything works.
   interpreter_qt.py            the Fluent window (PySide6)
-  session_controller.py        shared capture and worker lifecycle
-  music.py                     music/singing detection and vocal separation
   log_tools.py                 analysis tool for the logs (see below)
   simulate.py                  tests the app with recorded audio (see below)
   simulator_qt.py              the simulator in a window: watch and hear it
