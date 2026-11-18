@@ -1,4 +1,0 @@
-# Extra packages needed only while developing (not to run the app).
-# Install them into the project's virtual environment with:
-#     .venv\Scripts\python -m pip install -r requirements-dev.txt
-pytest>=8.0                 # finds and runs the tests in tests\

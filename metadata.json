@@ -1,0 +1,7 @@
+{
+  "name": "Voice Interpreter",
+  "description": "Live two-channel speech transcription, translation, diagnostics, and audio monitoring web app.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
