@@ -60,6 +60,6 @@ If it's unclear which mode I want, ask.
 
 ## Current position
 - 2026-11-15 (development): two-channel Fluent window, log-triage fixes and Settings page, merged to `main` and pushed. Tutoring last covered PowerShell naming and aliases (2026-11-08).
-- 2026-11-18 (development): pytest suite added (on `main`). `interpreter.py` split into the `interpreter/` package (start with `run.py`) on branch `split-package`, not yet merged. Next refactor step: group the `config.py` constants into dataclasses.
+- 2026-11-18 (development): pytest suite added (on `main`). `interpreter.py` split into the `interpreter/` package (start with `run.py`), merged to `main` and pushed. Next refactor step: group the `config.py` constants into dataclasses.
 - Weak spot: `ls` = `Get-ChildItem`, not `Get-Location` (`Get-Location` = `pwd`).
 - In progress: the `LatestSlot` exercise (`learning/slot_test.py`; the `put` calls still need `slot.` in front). Next: the PowerShell pipeline (`|`).
